@@ -29,7 +29,7 @@ public:
         mpc_config.horizon = 50;
         mpc_config.dt = 1.0 / control_freq;
         
-        // Set terminal state PROPERLY - with ZERO VELOCITY!
+        // Set terminal state
         mpc_config.terminal_state = Eigen::VectorXd::Zero(13);
         mpc_config.terminal_state(0) = 0.0;  // x = 0
         mpc_config.terminal_state(1) = 0.0;  // y = 0
@@ -98,7 +98,6 @@ private:
     }
     
     void velocityCallback(const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg) {
-        // Velocity data is in msg->values array: [vx, vy, vz]
         if (msg->values.size() >= 3) {
             current_state_(3) = msg->values[0];  // vx
             current_state_(4) = msg->values[1];  // vy
@@ -109,8 +108,6 @@ private:
     }
     
     void accelerationCallback(const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg) {
-        // Store for future use if needed
-        // Acceleration data is in msg->values array: [ax, ay, az]
         if (msg->values.size() >= 3) {
             // Currently not used in MPC, but available
         }

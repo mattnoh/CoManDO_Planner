@@ -213,8 +213,6 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state) {
     try {
         // Create problem
         problem_ = std::make_shared<OptimalControlProblem<double>>(N);
-        
-        // Setup Quad6DOF dynamics (6D control: [f_B, M_B])
         auto dynamics = std::make_shared<Quad6DOF<double>>();
         dynamics->setMass(config_.mass);
         dynamics->setGravity(Eigen::Vector3d(0.0, 0.0, -9.81));
@@ -242,8 +240,8 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state) {
         // Add thrust constraint
         auto thrust_constraint = std::make_shared<MaxThrustConstraint<double>>(config_.max_thrust);
         problem_->addStageConstraint(thrust_constraint);
-        
-        // === CRITICAL: Set initial state ===
+    
+        // Set initial state
         problem_->setInitialState(0, current_state);
         
         // Create initial guess for controls (hover)
