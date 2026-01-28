@@ -2,8 +2,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <crazyflie_interfaces/msg/full_state.hpp>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/buffer.h>
+#include <crazyflie_interfaces/msg/log_data_generic.hpp>
 #include "quadrotor_mpc.hpp"
 
 #include <chrono>
@@ -18,7 +17,7 @@ public:
         // ROS parameters
         this->declare_parameter("drone_name", "cf_1");
         this->declare_parameter("world_frame", "world");
-        this->declare_parameter("control_frequency", 50.0);
+        this->declare_parameter("control_frequency", 100.0);
         
         // Get parameters
         drone_name_ = this->get_parameter("drone_name").as_string();
@@ -36,7 +35,6 @@ public:
         mpc_config.terminal_state(1) = 0.0;  // y = 0
         mpc_config.terminal_state(2) = 1.0;  // z = 1m
         mpc_config.terminal_state(6) = 1.0;  // upright quaternion (w=1)
-        // velocities (3-5, 10-12) already zero
         
         RCLCPP_INFO(this->get_logger(), "MPC Config:");
         RCLCPP_INFO(this->get_logger(), "  Horizon: %d", mpc_config.horizon);
@@ -52,18 +50,26 @@ public:
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
         
-        // Setup TF
-        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        // Subscribe to pose topic
+        pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/" + drone_name_ + "/pose", 10,
+            std::bind(&PlannerNode::poseCallback, this, std::placeholders::_1));
+        
+        // Subscribe to velocity topic
+        vel_sub_ = this->create_subscription<crazyflie_interfaces::msg::LogDataGeneric>(
+            "/" + drone_name_ + "/velocity", 10,
+            std::bind(&PlannerNode::velocityCallback, this, std::placeholders::_1));
+        
+        // Subscribe to acceleration topic (optional, for future use)
+        acc_sub_ = this->create_subscription<crazyflie_interfaces::msg::LogDataGeneric>(
+            "/" + drone_name_ + "/acceleration", 10,
+            std::bind(&PlannerNode::accelerationCallback, this, std::placeholders::_1));
         
         // Initialize state properly
         current_state_ = Eigen::VectorXd::Zero(13);
         current_state_(6) = 1.0;  // Identity quaternion
-        
-        // Set a safe initial position (0,0,0)
-        prev_position_ = Eigen::Vector3d::Zero();
-        prev_orientation_ = Eigen::Quaterniond::Identity();
-        first_iteration_ = true;
+        pose_received_ = false;
+        vel_received_ = false;
         
         // Control timer
         double period = 1.0 / control_freq;
@@ -76,74 +82,44 @@ public:
     }
 
 private:
-    bool getCurrentState() {
-        try {
-            // Try to get transform with timeout
-            auto transform = tf_buffer_->lookupTransform(
-                world_frame_,
-                drone_name_,
-                tf2::TimePointZero,
-                std::chrono::milliseconds(100));
+    void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+        // Position
+        current_state_(0) = msg->pose.position.x;
+        current_state_(1) = msg->pose.position.y;
+        current_state_(2) = msg->pose.position.z;
+        
+        // Quaternion
+        current_state_(6) = msg->pose.orientation.w;
+        current_state_(7) = msg->pose.orientation.x;
+        current_state_(8) = msg->pose.orientation.y;
+        current_state_(9) = msg->pose.orientation.z;
+        
+        pose_received_ = true;
+    }
+    
+    void velocityCallback(const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg) {
+        // Velocity data is in msg->values array: [vx, vy, vz]
+        if (msg->values.size() >= 3) {
+            current_state_(3) = msg->values[0];  // vx
+            current_state_(4) = msg->values[1];  // vy
+            current_state_(5) = msg->values[2];  // vz
             
-            // Position
-            current_state_(0) = transform.transform.translation.x;
-            current_state_(1) = transform.transform.translation.y;
-            current_state_(2) = transform.transform.translation.z;
-            
-            // Quaternion
-            current_state_(6) = transform.transform.rotation.w;
-            current_state_(7) = transform.transform.rotation.x;
-            current_state_(8) = transform.transform.rotation.y;
-            current_state_(9) = transform.transform.rotation.z;
-            
-            // Estimate velocities
-            rclcpp::Time current_time = transform.header.stamp;
-            
-            if (!first_iteration_) {
-                double dt = (current_time - prev_time_).seconds();
-                
-                if (dt > 0.001 && dt < 0.1) {
-                    // Linear velocity
-                    Eigen::Vector3d pos(current_state_(0), current_state_(1), current_state_(2));
-                    Eigen::Vector3d vel = (pos - prev_position_) / dt;
-                    current_state_.segment(3, 3) = vel;
-                    
-                    // Angular velocity
-                    Eigen::Quaterniond q_now(current_state_(6), current_state_(7), 
-                                             current_state_(8), current_state_(9));
-                    Eigen::Quaterniond delta_q = q_now * prev_orientation_.inverse();
-                    Eigen::AngleAxisd aa(delta_q);
-                    Eigen::Vector3d omega = aa.axis() * aa.angle() / dt;
-                    current_state_.segment(10, 3) = omega;
-                    
-                    RCLCPP_DEBUG(this->get_logger(), "Vel estimated: [%.2f, %.2f, %.2f] m/s", 
-                                vel.x(), vel.y(), vel.z());
-                }
-            }
-            
-            prev_time_ = current_time;
-            prev_position_ = Eigen::Vector3d(current_state_(0), current_state_(1), current_state_(2));
-            prev_orientation_ = Eigen::Quaterniond(current_state_(6), current_state_(7), 
-                                                  current_state_(8), current_state_(9));
-            first_iteration_ = false;
-            
-            RCLCPP_DEBUG(this->get_logger(), "Current state: pos=[%.3f, %.3f, %.3f], q=[%.3f, %.3f, %.3f, %.3f]",
-                        current_state_(0), current_state_(1), current_state_(2),
-                        current_state_(6), current_state_(7), current_state_(8), current_state_(9));
-            
-            return true;
-            
-        } catch (tf2::TransformException& ex) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "TF error: %s", ex.what());
-            return false;
+            vel_received_ = true;
+        }
+    }
+    
+    void accelerationCallback(const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg) {
+        // Store for future use if needed
+        // Acceleration data is in msg->values array: [ax, ay, az]
+        if (msg->values.size() >= 3) {
+            // Currently not used in MPC, but available
         }
     }
     
     void controlLoop() {
-        // Get current state
-        if (!getCurrentState()) {
-            RCLCPP_DEBUG(this->get_logger(), "Waiting for TF transform...");
+        // Check if we have received both pose and velocity
+        if (!pose_received_ || !vel_received_) {
+            RCLCPP_DEBUG(this->get_logger(), "Waiting for pose and velocity data...");
             return;
         }
         
@@ -157,10 +133,6 @@ private:
         auto result = mpc_->solve(current_state_);
 
         if (result.success) {
-            // DEBUG: Log commanded state
-            RCLCPP_DEBUG(this->get_logger(), "Commanded state: pos=[%.3f, %.3f, %.3f]", 
-                        result.next_state(0), result.next_state(1), result.next_state(2));
-            
             publishCommand(result.next_state);
             publishTrajectory(result.state_trajectory);
             
@@ -170,6 +142,7 @@ private:
                 
                 // Log current and target positions
                 Eigen::Vector3d current_pos = current_state_.segment(0, 3);
+                Eigen::Vector3d current_vel = current_state_.segment(3, 3);
                 Eigen::Vector3d target_pos = Eigen::Vector3d(0, 0, 1.0);
                 double distance = (current_pos - target_pos).norm();
                 
@@ -179,8 +152,9 @@ private:
                     Eigen::Vector3d force = first_control.segment(0, 3);
                     double thrust_norm = force.norm();
                     RCLCPP_INFO(this->get_logger(), 
-                               "Current: [%.2f, %.2f, %.2f], Dist: %.2f m, Thrust: %.3f N", 
-                               current_pos.x(), current_pos.y(), current_pos.z(), 
+                               "Pos: [%.2f, %.2f, %.2f], Vel: [%.2f, %.2f, %.2f], Dist: %.2f m, Thrust: %.3f N", 
+                               current_pos.x(), current_pos.y(), current_pos.z(),
+                               current_vel.x(), current_vel.y(), current_vel.z(),
                                distance, thrust_norm);
                 }
             }
@@ -224,11 +198,6 @@ private:
         msg.twist.angular.y = state(11);
         msg.twist.angular.z = state(12);
         
-        // Debug: Verify we're sending FullState (not Control)
-        RCLCPP_DEBUG(this->get_logger(), "Publishing FullState cmd: pos=[%.3f, %.3f, %.3f], vel=[%.2f, %.2f, %.2f]",
-                    msg.pose.position.x, msg.pose.position.y, msg.pose.position.z,
-                    msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z);
-        
         cmd_pub_->publish(msg);
     }
     
@@ -260,9 +229,9 @@ private:
     
     rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr cmd_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
-    
-    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
+    rclcpp::Subscription<crazyflie_interfaces::msg::LogDataGeneric>::SharedPtr vel_sub_;
+    rclcpp::Subscription<crazyflie_interfaces::msg::LogDataGeneric>::SharedPtr acc_sub_;
     
     rclcpp::TimerBase::SharedPtr timer_;
     
@@ -270,10 +239,8 @@ private:
     std::string world_frame_;
     
     Eigen::VectorXd current_state_;
-    Eigen::Vector3d prev_position_;
-    Eigen::Quaterniond prev_orientation_;
-    rclcpp::Time prev_time_;
-    bool first_iteration_;
+    bool pose_received_;
+    bool vel_received_;
 };
 
 int main(int argc, char** argv) {

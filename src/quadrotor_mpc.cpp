@@ -1,5 +1,6 @@
 #include "quadrotor_mpc.hpp"
 #include <iostream>
+#include <iomanip>
 
 using namespace std;
 
@@ -25,18 +26,25 @@ public:
         Eigen::Vector3d position = x.segment(0, 3);
         Eigen::Vector3d velocity = x.segment(3, 3);
         
-        // Position tracking cost (stronger at terminal stage)
-        Scalar pos_weight = is_terminal_stage_ ? 100.0 : 10.0;
+        // NO special terminal stage weighting - constant regulation
+        Scalar pos_weight = 10.0;
         Scalar pos_error = (position - goal_position_).squaredNorm();
         
         // Velocity penalty (want zero velocity at goal)
-        Scalar vel_weight = is_terminal_stage_ ? 10.0 : 1.0;
+        Scalar vel_weight = 1.0;
         Scalar vel_error = velocity.squaredNorm();
         
-        // Control effort penalty
-        Scalar control_cost = control_weight_ * u.squaredNorm();
+        // Hover thrust reference (mass * g in body frame, assuming upright)
+        Eigen::Vector3d f_hover(0.0, 0.0, 0.027 * 9.81);
+        Eigen::Vector3d f_B = u.segment(0, 3);
+        Scalar thrust_deviation = (f_B - f_hover).squaredNorm();
         
-        return pos_weight * pos_error + vel_weight * vel_error + control_cost;
+        // Moment penalty (want zero moments)
+        Eigen::Vector3d M_B = u.segment(3, 3);
+        Scalar moment_cost = control_weight_ * M_B.squaredNorm();
+        
+        return pos_weight * pos_error + vel_weight * vel_error + 
+               control_weight_ * thrust_deviation + moment_cost;
     }
 
     Vector<Scalar> qx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
@@ -60,7 +68,18 @@ public:
 
     Vector<Scalar> qu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; // Unused
-        return 2.0 * control_weight_ * u;
+        Vector<Scalar> grad = Vector<Scalar>::Zero(u.size());
+        
+        // Hover thrust reference
+        Eigen::Vector3d f_hover(0.0, 0.0, 0.027 * 9.81);
+        Eigen::Vector3d f_B = u.segment(0, 3);
+        grad.segment(0, 3) = 2.0 * control_weight_ * (f_B - f_hover);
+        
+        // Moment gradient
+        Eigen::Vector3d M_B = u.segment(3, 3);
+        grad.segment(3, 3) = 2.0 * control_weight_ * M_B;
+        
+        return grad;
     }
 
     Matrix<Scalar> qxx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
@@ -103,8 +122,9 @@ public:
         Eigen::Vector3d position = x.segment(0, 3);
         Eigen::Vector3d velocity = x.segment(3, 3);
         
-        Scalar pos_weight = 200.0;  // High weight at terminal
-        Scalar vel_weight = 20.0;
+        // SAME weights as stage cost - no special terminal behavior
+        Scalar pos_weight = 10.0;
+        Scalar vel_weight = 1.0;
         
         return pos_weight * (position - goal_position_).squaredNorm() + 
                vel_weight * velocity.squaredNorm();
@@ -116,8 +136,8 @@ public:
         Eigen::Vector3d position = x.segment(0, 3);
         Eigen::Vector3d velocity = x.segment(3, 3);
         
-        grad.segment(0, 3) = 2.0 * 200.0 * (position - goal_position_);
-        grad.segment(3, 3) = 2.0 * 20.0 * velocity;
+        grad.segment(0, 3) = 2.0 * 10.0 * (position - goal_position_);
+        grad.segment(3, 3) = 2.0 * 1.0 * velocity;
         
         return grad;
     }
@@ -125,8 +145,8 @@ public:
     Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
         Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
         
-        H.block(0, 0, 3, 3) = 2.0 * 200.0 * Matrix<Scalar>::Identity(3, 3);
-        H.block(3, 3, 3, 3) = 2.0 * 20.0 * Matrix<Scalar>::Identity(3, 3);
+        H.block(0, 0, 3, 3) = 2.0 * 10.0 * Matrix<Scalar>::Identity(3, 3);
+        H.block(3, 3, 3, 3) = 2.0 * 1.0 * Matrix<Scalar>::Identity(3, 3);
         
         return H;
     }
@@ -267,7 +287,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state) {
         solver_->solve();
         
         // Get results
-        auto X_result = solver_->getResX();
+        std::vector<Eigen::VectorXd> X_result = solver_->getResX();
         auto U_result = solver_->getResU();
         
         auto end_time = chrono::high_resolution_clock::now();
@@ -279,14 +299,11 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state) {
             result.control_trajectory = U_result;
             result.success = true;
             
-            // Debug output
-            cout << "MPC: Current=[";
-            cout << current_state(0) << "," << current_state(1) << "," << current_state(2);
-            cout << "], Commanded=[";
-            cout << result.next_state(0) << "," << result.next_state(1) << "," << result.next_state(2);
-            cout << "], Terminal=[";
-            cout << config_.terminal_state(0) << "," << config_.terminal_state(1) << "," << config_.terminal_state(2);
-            cout << "]" << endl;
+            // Print first 4 states
+            int states_to_print = std::min(4, (int)X_result.size());
+            for (int i = 0; i < states_to_print; ++i) {
+                cout << "X[" << i << "]: " << X_result[i].transpose() << endl;
+            }
             
         } else {
             cerr << "ERROR: Empty trajectory from solver" << endl;
