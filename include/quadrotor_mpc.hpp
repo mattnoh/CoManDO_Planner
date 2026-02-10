@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include <string>
 
 // ALIPDDP headers
 #include "optimal_control_problem.h"
@@ -12,29 +13,25 @@
 class QuadrotorMPC {
 public:
     struct Config {
-        int horizon = 50;
-        double dt = 0.02;  // 50 Hz
+        // OCP selection - MUST HAVE THIS
+        std::string ocp_type = "hover";
+        
+        // Other parameters (not used in new design but kept for compatibility)
+        int horizon = 30;
+        double dt = 0.02;
         double mass = 0.027;
         Eigen::Matrix3d inertia = (Eigen::Matrix3d() << 
             1.66e-5, 0.0, 0.0,
             0.0, 1.66e-5, 0.0,
             0.0, 0.0, 2.92e-5).finished();
         
-        // Terminal state (13D) - set to whatever you want
         Eigen::VectorXd terminal_state;
-        
-        // Cost weights
-        double attitude_weight = 2.0;
-        double thrust_weight = 1e-5;
-        double moment_weight = 1e-4;
-        
-        // Constraint
         double max_thrust = 0.6;
         
         Config() {
             terminal_state = Eigen::VectorXd::Zero(13);
-            terminal_state(2) = 1.0;  // z = 1m
-            terminal_state(6) = 1.0;  // upright quaternion
+            terminal_state(2) = 1.0;
+            terminal_state(6) = 1.0;
         }
     };
     
@@ -47,11 +44,9 @@ public:
     };
     
     QuadrotorMPC(const Config& config = Config());
-    ~QuadrotorMPC();
+    ~QuadrotorMPC() = default;
     
     Result solve(const Eigen::VectorXd& current_state);
-    
-    // Update terminal state if needed
     void setTerminalState(const Eigen::VectorXd& terminal);
     
 private:
@@ -60,10 +55,4 @@ private:
     std::shared_ptr<OptimalControlProblem<double>> problem_;
     std::shared_ptr<ALIPDDP<double>> solver_;
     Param solver_params_;
-    
-    // For warm start
-    std::vector<Eigen::VectorXd> prev_X_;
-    std::vector<Eigen::VectorXd> prev_U_;
-    bool first_solve_ = true;
-    bool problem_initialized_ = false;
 };

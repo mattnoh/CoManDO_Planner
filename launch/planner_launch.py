@@ -4,6 +4,16 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
+    """
+    Simplified launch file matching the example structure.
+    Parameters:
+    - drone_name: Name of the Crazyflie (default: cf_1)
+    - enable_logging: Enable CSV logging (default: true)
+    - ocp_type: Type of OCP to use (default: hover, options: hover, constrained_attitude)
+    - control_rate: Control loop frequency in Hz (default: 50)
+    - solver_rate: MPC solver frequency in Hz (default: 10)
+    """
+    
     # Declare launch arguments
     drone_name_arg = DeclareLaunchArgument(
         'drone_name',
@@ -11,16 +21,28 @@ def generate_launch_description():
         description='Name of the Crazyflie drone'
     )
     
-    world_frame_arg = DeclareLaunchArgument(
-        'world_frame',
-        default_value='world',
-        description='World/map frame name'
+    enable_logging_arg = DeclareLaunchArgument(
+        'enable_logging',
+        default_value='true',
+        description='Enable logging to CSV files'
     )
     
-    control_freq_arg = DeclareLaunchArgument(
-        'control_frequency',
-        default_value='100.0',
-        description='MPC control loop frequency in Hz'
+    ocp_type_arg = DeclareLaunchArgument(
+        'ocp_type',
+        default_value='hover',
+        description='Type of OCP to use (hover, constrained_attitude)'
+    )
+    
+    control_rate_arg = DeclareLaunchArgument(
+        'control_rate',
+        default_value='50',
+        description='Control loop frequency in Hz'
+    )
+    
+    solver_rate_arg = DeclareLaunchArgument(
+        'solver_rate',
+        default_value='10',
+        description='MPC solver frequency in Hz'
     )
         
     # Planner node
@@ -31,17 +53,18 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'drone_name': LaunchConfiguration('drone_name'),
-            'world_frame': LaunchConfiguration('world_frame'),
-            'control_frequency': LaunchConfiguration('control_frequency'),
-
-        }],
-        # Uncomment for debug logging:
-        # arguments=['--ros-args', '--log-level', 'debug']
+            'enable_logging': LaunchConfiguration('enable_logging'),
+            'ocp_type': LaunchConfiguration('ocp_type'),
+            'control_rate': LaunchConfiguration('control_rate'),
+            'solver_rate': LaunchConfiguration('solver_rate'),
+        }]
     )
     
     return LaunchDescription([
         drone_name_arg,
-        world_frame_arg,
-        control_freq_arg,
+        enable_logging_arg,
+        ocp_type_arg,
+        control_rate_arg,
+        solver_rate_arg,
         planner_node,
     ])

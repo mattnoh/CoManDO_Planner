@@ -1,0 +1,2 @@
+Invoking command in '/home/lab/projects/cf/online/ros_ws/src/CoManDO_planner/build/comando_planner': /usr/local/bin/cmake /home/lab/projects/cf/online/ros_ws/src/CoManDO_planner -DCMAKE_INSTALL_PREFIX=/home/lab/projects/cf/online/ros_ws/src/CoManDO_planner/install/comando_planner
+Invoked command in '/home/lab/projects/cf/online/ros_ws/src/CoManDO_planner/build/comando_planner' returned '1': /usr/local/bin/cmake /home/lab/projects/cf/online/ros_ws/src/CoManDO_planner -DCMAKE_INSTALL_PREFIX=/home/lab/projects/cf/online/ros_ws/src/CoManDO_planner/install/comando_planner

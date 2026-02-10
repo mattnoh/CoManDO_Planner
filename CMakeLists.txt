@@ -52,8 +52,13 @@ install(TARGETS comando_planner
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Install launch files - CORRECT WAY
+# Install launch files
 install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+
+# Install Python logger script
+install(PROGRAMS launch/logger.py
   DESTINATION share/${PROJECT_NAME}/launch
 )
 
