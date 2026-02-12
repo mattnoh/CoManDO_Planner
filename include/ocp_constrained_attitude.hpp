@@ -272,8 +272,89 @@ public:
     }
 };
 
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Factory
+// Altitude positivity constraint: z >= 0   (inequality: -z <= 0)
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Scalar>
+class AltitudePositiveConstraint : public StageConstraintBase<Scalar> {
+public:
+    AltitudePositiveConstraint() {
+        this->constraint_type = ConstraintType::NO;
+        this->dim_c = 1;                       // scalar inequality
+    }
+
+    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)u;
+        Vector<Scalar> c(1);
+        // c = -z  →  c <= 0  ⇔  z >= 0
+        c(0) = -x(2);
+        return c;
+    }
+
+    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(1, x.size());
+        J(0, 2) = -1.0;                       // derivative w.r.t z
+        return J;
+    }
+
+    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        return Matrix<Scalar>::Zero(1, u.size());
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Angular velocity bound: |ωx|≤1, |ωy|≤1, |ωz|≤1   (6 scalar inequalities)
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Scalar>
+class AngularVelocityBoundConstraint : public StageConstraintBase<Scalar> {
+public:
+    AngularVelocityBoundConstraint() {
+        this->constraint_type = ConstraintType::NO;
+        this->dim_c = 6;                       // six individual bounds
+    }
+
+    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)u;
+        Vector<Scalar> c(6);
+        // ωx ≤ 1   →   ωx - 1 ≤ 0
+        c(0) = x(10) - 1.0;
+        // -ωx ≤ 1  →  -ωx - 1 ≤ 0   (i.e., ωx ≥ -1)
+        c(1) = -x(10) - 1.0;
+        // ωy
+        c(2) = x(11) - 1.0;
+        c(3) = -x(11) - 1.0;
+        // ωz
+        c(4) = x(12) - 1.0;
+        c(5) = -x(12) - 1.0;
+        return c;
+    }
+
+    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(6, x.size());
+        // ωx entries
+        J(0, 10) =  1.0;
+        J(1, 10) = -1.0;
+        // ωy entries
+        J(2, 11) =  1.0;
+        J(3, 11) = -1.0;
+        // ωz entries
+        J(4, 12) =  1.0;
+        J(5, 12) = -1.0;
+        return J;
+    }
+
+    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        return Matrix<Scalar>::Zero(6, u.size());
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main problem creation function
 // ─────────────────────────────────────────────────────────────────────────────
 inline std::shared_ptr<OptimalControlProblem<double>> create(
     const Eigen::VectorXd& current_state)
@@ -303,11 +384,15 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     // SOC constraints
     auto glideslope = std::make_shared<GlideslopeConstraint<double>>();
     auto max_thrust = std::make_shared<MaxThrustConstraint<double>>();
+    auto alt_pos = std::make_shared<AltitudePositiveConstraint<double>>();
+    auto w_bound = std::make_shared<AngularVelocityBoundConstraint<double>>();
     
     // Add stage constraints for every time step
     for (int i = 0; i < HORIZON; ++i) {
         prob->addStageConstraint(i, glideslope);
         prob->addStageConstraint(i, max_thrust);
+        prob->addStageConstraint(i, alt_pos);   // z ≥ 0
+        prob->addStageConstraint(i, w_bound);   // |ω| ≤ 1
     }
 
     // Initial state

@@ -24,7 +24,7 @@ public:
         this->declare_parameter("drone_name",     "cf_1");
         this->declare_parameter("enable_logging", true);
         this->declare_parameter("ocp_type",       "hover");
-        this->declare_parameter("control_rate",   50);
+        this->declare_parameter("control_rate",   10);
         this->declare_parameter("solver_rate",    10);
 
         drone_name_      = this->get_parameter("drone_name").as_string();
@@ -38,7 +38,7 @@ public:
         mpc_.reset(new QuadrotorMPC(cfg));
         ocp_dt_ = mpc_->getOcpDt();
 
-        if (logging_enabled_) setupLogging();
+        // Logging will be initialized when MPC starts, not immediately
 
         cmd_pub_  = this->create_publisher<crazyflie_interfaces::msg::FullState>(
             "/" + drone_name_ + "/cmd_full_state", 10);
@@ -60,12 +60,19 @@ public:
             "/" + drone_name_ + "/angular_velocity", 10,
             std::bind(&PlannerNode::angularVelocityCallback, this, std::placeholders::_1));
 
+        acc_sub_ = this->create_subscription<crazyflie_interfaces::msg::LogDataGeneric>(
+            "/" + drone_name_ + "/acceleration", 10,
+            std::bind(&PlannerNode::accelerationCallback, this, std::placeholders::_1));
+
         // Initial state — identity quaternion, everything else zero.
         // Angular velocity fields (10-12) start at zero here and are updated
         // only by angularVelocityCallback.  They are NEVER overwritten in the
         // solver loop — doing so would corrupt the actual state log.
         current_state_ = Eigen::VectorXd::Zero(13);
         current_state_(6) = 1.0;
+        
+        // Acceleration is stored separately since it's not part of MPC state
+        current_acc_ = Eigen::Vector3d::Zero();
 
         control_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(1000 / control_rate_),
@@ -130,10 +137,36 @@ private:
     void angularVelocityCallback(
         const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg)
     {
+        static bool first_call = true;
+        static int count = 0;
+        if (first_call) {
+            RCLCPP_INFO(this->get_logger(), "Angular velocity callback FIRED - receiving data");
+            first_call = false;
+        }
+        
         if (msg->values.size() >= 3) {
             current_state_(10) = msg->values[0];
             current_state_(11) = msg->values[1];
             current_state_(12) = msg->values[2];
+            
+            if (++count % 100 == 0) {
+                RCLCPP_INFO(this->get_logger(), 
+                    "AngVel [%d]: [%.3f, %.3f, %.3f]", 
+                    count, msg->values[0], msg->values[1], msg->values[2]);
+            }
+        } else {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "AngVel message has only %zu values (expected 3)", msg->values.size());
+        }
+    }
+
+    void accelerationCallback(
+        const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg)
+    {
+        if (msg->values.size() >= 3) {
+            current_acc_(0) = msg->values[0];
+            current_acc_(1) = msg->values[1];
+            current_acc_(2) = msg->values[2];
         }
     }
 
@@ -147,6 +180,12 @@ private:
         if (!is_flying_) {
             is_flying_ = true;
             RCLCPP_INFO(this->get_logger(), "State received — starting MPC");
+            
+            // Initialize logging NOW, not in constructor
+            if (logging_enabled_ && !logging_initialized_) {
+                setupLogging();
+                logging_initialized_ = true;
+            }
         }
 
         // NOTE: angular velocity fields (10-12) are NOT zeroed here.
@@ -181,32 +220,28 @@ private:
         if (!traj_valid_ || state_traj_.empty()) return;
 
         // ── Wall-clock trajectory indexing ───────────────────────────────────
-        // elapsed is measured from solve_time_.  We add ONE ocp_dt_ before
-        // dividing so that idx starts at 1 (the first predicted future state)
-        // rather than 0 (the current/past state that was just measured).
-        //
-        // Why this matters:
-        //   idx=0 is X[0] = current_state_ at solve time — a position the
-        //   drone has already been at (or is just leaving).  Sending it as a
-        //   command causes a sawtooth jump every time the solver refreshes,
-        //   because the new X[0] is the new measured position, not a
-        //   continuation of the previous trajectory.
-        //   Starting at idx=1 means we always command the *next* predicted
-        //   state, which is a smooth continuation across solver updates.
         double elapsed_s = std::chrono::duration<double>(
             Clock::now() - solve_time_).count();
 
-        // +1 offset: start playback from the first future step, not the
-        // current measurement.
+        // +1 offset: start playback from the first future step
         int idx = static_cast<int>(elapsed_s / ocp_dt_) + 1;
 
         int max_idx = static_cast<int>(state_traj_.size()) - 1;
         idx = std::max(1, std::min(idx, max_idx));
 
         Eigen::VectorXd cmd = state_traj_[idx];
-        publishCommand(cmd);
+        
+        // Compute acceleration from trajectory: a = (v[idx] - v[idx-1]) / dt
+        Eigen::Vector3d acc_cmd = Eigen::Vector3d::Zero();
+        if (idx > 0 && idx < (int)state_traj_.size()) {
+            Eigen::Vector3d v_curr = state_traj_[idx].segment(3, 3);
+            Eigen::Vector3d v_prev = state_traj_[idx-1].segment(3, 3);
+            acc_cmd = (v_curr - v_prev) / ocp_dt_;
+        }
+        
+        publishCommand(cmd, acc_cmd);
 
-        if (logging_enabled_) {
+        if (logging_enabled_ && logging_initialized_) {
             logActualState();
             logCommandedState(cmd);
             if (!control_traj_.empty()) {
@@ -218,22 +253,40 @@ private:
 
     // ── Publishing ────────────────────────────────────────────────────────────
     void publishCommand(const Eigen::VectorXd& s) {
+        publishCommand(s, Eigen::Vector3d::Zero());
+    }
+    
+    void publishCommand(const Eigen::VectorXd& s, const Eigen::Vector3d& acc_cmd) {
         crazyflie_interfaces::msg::FullState msg;
         msg.header.stamp    = this->now();
         msg.header.frame_id = "world";
+        
+        // Position
         msg.pose.position.x    = s(0);
         msg.pose.position.y    = s(1);
         msg.pose.position.z    = s(2);
+        
+        // Linear velocity
         msg.twist.linear.x     = s(3);
         msg.twist.linear.y     = s(4);
         msg.twist.linear.z     = s(5);
-        msg.pose.orientation.w = s(6);
-        msg.pose.orientation.x = s(7);
-        msg.pose.orientation.y = s(8);
-        msg.pose.orientation.z = s(9);
+        
+        // Orientation (quaternion): solver order is qw,qx,qy,qz (indices 6-9)
+        msg.pose.orientation.w = s(6);  // qw
+        msg.pose.orientation.x = s(7);  // qx
+        msg.pose.orientation.y = s(8);  // qy
+        msg.pose.orientation.z = s(9);  // qz
+        
+        // Angular velocity
         msg.twist.angular.x    = s(10);
         msg.twist.angular.y    = s(11);
         msg.twist.angular.z    = s(12);
+        
+        // Acceleration - use commanded acceleration from MPC trajectory
+        msg.acc.x = acc_cmd(0);
+        msg.acc.y = acc_cmd(1);
+        msg.acc.z = acc_cmd(2);
+        
         cmd_pub_->publish(msg);
     }
 
@@ -319,13 +372,16 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr    pose_sub_;
     rclcpp::Subscription<crazyflie_interfaces::msg::LogDataGeneric>::SharedPtr vel_sub_;
     rclcpp::Subscription<crazyflie_interfaces::msg::LogDataGeneric>::SharedPtr ang_vel_sub_;
+    rclcpp::Subscription<crazyflie_interfaces::msg::LogDataGeneric>::SharedPtr acc_sub_;
     rclcpp::TimerBase::SharedPtr   control_timer_;
     rclcpp::TimerBase::SharedPtr   solver_timer_;
 
     Eigen::VectorXd  current_state_;
+    Eigen::Vector3d  current_acc_;    // Measured acceleration (not in MPC state)
     bool             pose_received_ = false;
     bool             vel_received_  = false;
     bool             is_flying_     = false;
+    bool             logging_initialized_ = false;
 
     std::mutex                    traj_mutex_;
     std::vector<Eigen::VectorXd>  state_traj_;
