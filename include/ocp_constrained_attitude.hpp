@@ -2,287 +2,329 @@
 
 #include <Eigen/Dense>
 #include <memory>
-#include <cmath>
 #include "optimal_control_problem.h"
 
 namespace ConstrainedAttitudeOCP {
 
-// Fixed parameters
-const int HORIZON = 30;
-const double DT = 0.02;
-const double MASS = 0.027;
-const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() << 
+// ── Fixed parameters ─────────────────────────────────────────────────────────
+const int    HORIZON = 60;      // Increased from 30 to give more time to satisfy constraints
+const double DT      = 0.02;    // 50 Hz
+const double MASS    = 0.027;
+const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
     1.66e-5, 0.0, 0.0,
     0.0, 1.66e-5, 0.0,
     0.0, 0.0, 2.92e-5).finished();
-const double ATTITUDE_WEIGHT = 2.0;
-const double FMAX = 40.0;
-const double THETA_MAX = 60.0;  // degrees
-const double GLIDESLOPE_ANGLE = 70.0;  // degrees
-const double THRUST_WEIGHT = 1e-5;
-const double MOMENT_WEIGHT = 1e-4;
 
-// Terminal state (origin, upright)
-inline Eigen::VectorXd getTerminalState() {
-    Eigen::VectorXd state = Eigen::VectorXd::Zero(13);
-    state(6) = 1.0;  // upright quaternion
-    return state;
-}
+// ── Cost weights ─────────────────────────────────────────────────────────────
+// Add position/velocity costs to keep trajectory smooth.
+// Without these, the solver can take wild paths that satisfy constraints
+// but cause numerical issues.
+const double W_POS      = 0.0;    // Keep trajectory smooth
+const double W_VEL      = 0.0;    // Penalize high velocities
+const double W_ATTITUDE = 10.0;   // Drive to upright
+const double W_THRUST   = 1e-4;   // Minimal control effort cost
+const double W_MOMENT   = 1e-4;
 
-// Cost Functions
+// ── Constraint parameters ────────────────────────────────────────────────────
+const double GLIDE_ANGLE = 70.0 * M_PI / 180.0;  // 70 degrees
+const double FMAX        = 0.6;                   // Max thrust magnitude
+
+// Reference attitude (upright)
+const Eigen::Quaterniond Q_REF(1.0, 0.0, 0.0, 0.0);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage cost - REVERTED: Only attitude + control, NO position/velocity
+// ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class Cost : public StageCostBase<Scalar> {
 public:
-    Cost() {}
+    Cost() : q_ref_(Q_REF) {}
 
     Scalar q(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        Eigen::Vector3d f_B = u.segment(0, 3);
-        Eigen::Vector3d M_B = u.segment(3, 3);
+        auto pos   = x.segment(0, 3).eval();
+        auto vel   = x.segment(3, 3).eval();
+        auto quat  = x.segment(6, 4).eval();
+        auto f     = u.segment(0, 3).eval();
+        auto m     = u.segment(3, 3).eval();
+
+        // Position cost
+        Scalar pos_cost = W_POS * pos.squaredNorm();
         
-        // Attitude cost to drive reorientation
-        Scalar q0 = x(6);
-        Eigen::Vector3d q_vec = x.segment(7, 3);
-        Scalar attitude_cost = ATTITUDE_WEIGHT * (q_vec.squaredNorm() + (1.0 - q0)*(1.0 - q0));
-        
-        return THRUST_WEIGHT * f_B.squaredNorm() + MOMENT_WEIGHT * M_B.squaredNorm() + attitude_cost;
+        // Velocity cost
+        Scalar vel_cost = W_VEL * vel.squaredNorm();
+
+        // Attitude cost: simple quadratic on q_vec and (1-q0)
+        Scalar q0 = quat(0);
+        Eigen::Vector3d q_vec = quat.segment(1, 3);
+        Scalar att_cost = W_ATTITUDE * (q_vec.squaredNorm() + (1.0 - q0)*(1.0 - q0));
+
+        return pos_cost + vel_cost + att_cost
+             + W_THRUST * f.squaredNorm()
+             + W_MOMENT * m.squaredNorm();
     }
 
     Vector<Scalar> qx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)u; // Unused parameter - suppress warning
-        Vector<Scalar> grad = Vector<Scalar>::Zero(x.size());
+        (void)u;
+        Vector<Scalar> g = Vector<Scalar>::Zero(x.size());
+        
+        // Position gradient
+        g.segment(0, 3) = 2.0 * W_POS * x.segment(0, 3);
+        
+        // Velocity gradient
+        g.segment(3, 3) = 2.0 * W_VEL * x.segment(3, 3);
+        
+        // Attitude gradient (simple quadratic form)
         Scalar q0 = x(6);
         Eigen::Vector3d q_vec = x.segment(7, 3);
+        g(6) = -2.0 * W_ATTITUDE * (1.0 - q0);
+        g.segment(7, 3) = 2.0 * W_ATTITUDE * q_vec;
         
-        grad(6) = -2.0 * ATTITUDE_WEIGHT * (1.0 - q0);
-        grad.segment(7, 3) = 2.0 * ATTITUDE_WEIGHT * q_vec;
-        return grad;
+        return g;
     }
 
     Vector<Scalar> qu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; // Unused parameter - suppress warning
-        Vector<Scalar> grad = Vector<Scalar>::Zero(u.size());
-        grad.segment(0, 3) = 2.0 * THRUST_WEIGHT * u.segment(0, 3);
-        grad.segment(3, 3) = 2.0 * MOMENT_WEIGHT * u.segment(3, 3);
-        return grad;
+        (void)x;
+        Vector<Scalar> g = Vector<Scalar>::Zero(u.size());
+        g.segment(0, 3) = 2.0 * W_THRUST * u.segment(0, 3);
+        g.segment(3, 3) = 2.0 * W_MOMENT * u.segment(3, 3);
+        return g;
     }
 
     Matrix<Scalar> qxx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; (void)u; // Unused parameters - suppress warnings
+        (void)x; (void)u;
         Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
-        H(6, 6) = 2.0 * ATTITUDE_WEIGHT;
-        H.block(7, 7, 3, 3) = 2.0 * ATTITUDE_WEIGHT * Matrix<Scalar>::Identity(3, 3);
+        H.block(0, 0, 3, 3) = 2.0 * W_POS * Matrix<Scalar>::Identity(3, 3);
+        H.block(3, 3, 3, 3) = 2.0 * W_VEL * Matrix<Scalar>::Identity(3, 3);
+        H(6, 6) = 2.0 * W_ATTITUDE;
+        H.block(7, 7, 3, 3) = 2.0 * W_ATTITUDE * Matrix<Scalar>::Identity(3, 3);
         return H;
     }
 
     Matrix<Scalar> quu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; (void)u; // Unused parameters - suppress warnings
+        (void)x; (void)u;
         Matrix<Scalar> H = Matrix<Scalar>::Zero(u.size(), u.size());
-        H.block(0, 0, 3, 3) = 2.0 * THRUST_WEIGHT * Matrix<Scalar>::Identity(3, 3);
-        H.block(3, 3, 3, 3) = 2.0 * MOMENT_WEIGHT * Matrix<Scalar>::Identity(3, 3);
+        H.block(0, 0, 3, 3) = 2.0 * W_THRUST * Matrix<Scalar>::Identity(3, 3);
+        H.block(3, 3, 3, 3) = 2.0 * W_MOMENT * Matrix<Scalar>::Identity(3, 3);
         return H;
     }
 
     Matrix<Scalar> qxu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; (void)u; // Unused parameters - suppress warnings
+        (void)x; (void)u;
         return Matrix<Scalar>::Zero(x.size(), u.size());
     }
+
+private:
+    Eigen::Quaterniond q_ref_;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Terminal cost - Simple quadratic like your working example
+// ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class TerminalCost : public TerminalCostBase<Scalar> {
 public:
-    Scalar p(const Vector<Scalar>& x) const override { 
-        (void)x; // Unused parameter - suppress warning
-        return 0.0; 
-    }
-    
-    Vector<Scalar> px(const Vector<Scalar>& x) const override { 
-        (void)x; // Unused parameter - suppress warning
-        return Vector<Scalar>::Zero(x.size()); 
-    }
-    
-    Matrix<Scalar> pxx(const Vector<Scalar>& x) const override { 
-        (void)x; // Unused parameter - suppress warning
-        return Matrix<Scalar>::Zero(x.size(), x.size()); 
-    }
-};
-
-// Constraints
-template <typename Scalar>
-class MaxThrustConstraint : public StageConstraintBase<Scalar> {
-public:
-    MaxThrustConstraint() {
-        this->constraint_type = ConstraintType::NO;
-        this->dim_c = 1;
+    Scalar p(const Vector<Scalar>& x) const override {
+        // Simple quadratic on all states toward zero
+        // The terminal equality constraint will enforce exact convergence
+        Scalar cost = 0.0;
+        
+        // Position: drive to origin
+        cost += 100.0 * x.segment(0, 3).squaredNorm();
+        
+        // Velocity: drive to zero
+        cost += 10.0 * x.segment(3, 3).squaredNorm();
+        
+        // Quaternion: keep q0 close to 1 (rest will be constrained to zero)
+        cost += 100.0 * (1.0 - x(6)) * (1.0 - x(6));
+        cost += 100.0 * x.segment(7, 3).squaredNorm();
+        
+        // Angular velocity: drive to zero
+        cost += 10.0 * x.segment(10, 3).squaredNorm();
+        
+        return cost;
     }
 
-    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; // Unused parameter - suppress warning
-        Vector<Scalar> c_n(1);
-        Eigen::Vector3d f_B = u.segment(0, 3);
-        c_n(0) = FMAX - f_B.norm();
-        return -c_n;
+    Vector<Scalar> px(const Vector<Scalar>& x) const override {
+        Vector<Scalar> g = Vector<Scalar>::Zero(x.size());
+        g.segment(0, 3) = 200.0 * x.segment(0, 3);
+        g.segment(3, 3) = 20.0 * x.segment(3, 3);
+        g(6) = -200.0 * (1.0 - x(6));
+        g.segment(7, 3) = 200.0 * x.segment(7, 3);
+        g.segment(10, 3) = 20.0 * x.segment(10, 3);
+        return g;
     }
 
-    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; (void)u; // Unused parameters - suppress warnings
-        return Matrix<Scalar>::Zero(1, x.size());
-    }
-
-    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; // Unused parameter - suppress warning
-        Matrix<Scalar> J = Matrix<Scalar>::Zero(1, u.size());
-        Eigen::Vector3d f_B = u.segment(0, 3);
-        Scalar norm_f = f_B.norm();
-        if (norm_f > 1e-8) {
-            J.block(0, 0, 1, 3) = -f_B.transpose() / norm_f;
-        }
-        return -J;
+    Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
+        Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
+        H.block(0, 0, 3, 3) = 200.0 * Matrix<Scalar>::Identity(3, 3);
+        H.block(3, 3, 3, 3) = 20.0 * Matrix<Scalar>::Identity(3, 3);
+        H(6, 6) = 200.0;
+        H.block(7, 7, 3, 3) = 200.0 * Matrix<Scalar>::Identity(3, 3);
+        H.block(10, 10, 3, 3) = 20.0 * Matrix<Scalar>::Identity(3, 3);
+        return H;
     }
 };
 
-template <typename Scalar>
-class GlideSlopeConeConstraint : public StageConstraintBase<Scalar> {
-private:
-    Scalar tan_glideslope;
-
-public:
-    GlideSlopeConeConstraint() {
-        tan_glideslope = std::tan(GLIDESLOPE_ANGLE * M_PI / 180.0);
-        this->constraint_type = ConstraintType::SOC;
-        this->dim_c = 3;
-    }
-
-    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)u; // Unused parameter - suppress warning
-        Vector<Scalar> c_n(3);
-        Eigen::Vector3d r_I = x.segment(0, 3);
-        c_n(0) = tan_glideslope * r_I(2);
-        c_n(1) = r_I(0);
-        c_n(2) = r_I(1);
-        return -c_n;
-    }
-
-    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)u; // Unused parameter - suppress warning
-        Matrix<Scalar> J = Matrix<Scalar>::Zero(3, x.size());
-        J(0, 2) = tan_glideslope;
-        J(1, 0) = 1.0;
-        J(2, 1) = 1.0;
-        return -J;
-    }
-
-    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; (void)u; // Unused parameters - suppress warnings
-        return Matrix<Scalar>::Zero(3, u.size());
-    }
-};
-
-template <typename Scalar>
-class ThrustConeConstraint : public StageConstraintBase<Scalar> {
-private:
-    Scalar tan_theta_max;
-
-public:
-    ThrustConeConstraint() {
-        tan_theta_max = std::tan(THETA_MAX * M_PI / 180.0);
-        this->constraint_type = ConstraintType::SOC;
-        this->dim_c = 3;
-    }
-
-    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; // Unused parameter - suppress warning
-        Vector<Scalar> c_n(3);
-        Eigen::Vector3d f_B = u.segment(0, 3);
-        c_n(0) = tan_theta_max * f_B(2);
-        c_n(1) = f_B(0);
-        c_n(2) = f_B(1);
-        return -c_n;
-    }
-
-    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; (void)u; // Unused parameters - suppress warnings
-        return Matrix<Scalar>::Zero(3, x.size());
-    }
-
-    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x; // Unused parameter - suppress warning
-        Matrix<Scalar> J = Matrix<Scalar>::Zero(3, u.size());
-        J(0, 2) = tan_theta_max;
-        J(1, 0) = 1.0;
-        J(2, 1) = 1.0;
-        return -J;
-    }
-};
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Terminal equality constraint - KEEP dim_cT = 13 (all states to zero)
+// ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class TerminalEqualityConstraint : public TerminalConstraintBase<Scalar> {
 public:
     TerminalEqualityConstraint() {
         this->constraint_type = ConstraintType::EQ;
-        this->dim_cT = 13;
+        this->dim_cT = 13; 
     }
 
     Vector<Scalar> cT(const Vector<Scalar>& x) const override {
         Vector<Scalar> cT_n(13);
-        Eigen::VectorXd terminal_state = getTerminalState();
-        for (int i = 0; i < 13; ++i) {
-            cT_n(i) = x(i) - terminal_state(i);
-        }
+        
+        // Target: position at origin with altitude 0m, zero velocity,
+        // upright orientation (q = [1,0,0,0]), zero angular velocity
+        cT_n(0) = x(0) - 0.0;      // r_I,x = 0
+        cT_n(1) = x(1) - 0.0;      // r_I,y = 0
+        cT_n(2) = x(2) - 0.0;      // r_I,z = 0
+        cT_n(3) = x(3) - 0.0;      // v_I,x = 0
+        cT_n(4) = x(4) - 0.0;      // v_I,y = 0
+        cT_n(5) = x(5) - 0.0;      // v_I,z = 0
+        cT_n(6) = x(6) - 1.0;      // q0 = 1 (upright)
+        cT_n(7) = x(7) - 0.0;      // q1 = 0
+        cT_n(8) = x(8) - 0.0;      // q2 = 0
+        cT_n(9) = x(9) - 0.0;      // q3 = 0
+        cT_n(10) = x(10) - 0.0;    // ω_B,x = 0
+        cT_n(11) = x(11) - 0.0;    // ω_B,y = 0
+        cT_n(12) = x(12) - 0.0;    // ω_B,z = 0
+        
         return cT_n;
     }
 
     Matrix<Scalar> cTx(const Vector<Scalar>& x) const override {
-        (void)x; // Unused parameter - suppress warning
         return Matrix<Scalar>::Identity(13, 13);
     }
 };
 
-// Create Constrained Attitude OCP
-inline std::shared_ptr<OptimalControlProblem<double>> create(const Eigen::VectorXd& current_state) {
-    auto problem = std::make_shared<OptimalControlProblem<double>>(HORIZON);
-    
-    // Setup dynamics
-    auto dynamics = std::make_shared<Quad6DOF<double>>();
-    dynamics->setMass(MASS);
-    dynamics->setGravity(Eigen::Vector3d(0.0, 0.0, -9.81));
-    dynamics->setJb(INERTIA);
-    dynamics->setDt(DT);
-    problem->setStageDynamics(dynamics);
-    
-    // Setup costs
-    for (int i = 0; i < HORIZON; ++i) {
-        problem->setStageCost(i, std::make_shared<Cost<double>>());
+// ─────────────────────────────────────────────────────────────────────────────
+// Glideslope SOC constraint (3D cone: ||[x,y]|| <= tan(angle)*z)
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Scalar>
+class GlideslopeConstraint : public StageConstraintBase<Scalar> {
+public:
+    GlideslopeConstraint() {
+        this->constraint_type = ConstraintType::SOC;
+        this->dim_c = 3;                      // cone dimension
     }
-    problem->setTerminalCost(std::make_shared<TerminalCost<double>>());
-    
-    // Setup constraints
-    for (int i = 0; i < HORIZON; ++i) {
-        problem->addStageConstraint(i, std::make_shared<MaxThrustConstraint<double>>());
-        problem->addStageConstraint(i, std::make_shared<GlideSlopeConeConstraint<double>>());
-        problem->addStageConstraint(i, std::make_shared<ThrustConeConstraint<double>>());
+
+    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)u;
+        Vector<Scalar> c(3);
+        c(0) = std::tan(GLIDE_ANGLE) * x(2);  // radial bound
+        c(1) = x(0);                          // x
+        c(2) = x(1);                          // y
+        return c;                             // constraint: norm(c[1:2]) <= c[0]
     }
+
+    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)u;
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(3, x.size());
+        J(0, 2) = std::tan(GLIDE_ANGLE);
+        J(1, 0) = 1.0;
+        J(2, 1) = 1.0;
+        return J;
+    }
+
+    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        return Matrix<Scalar>::Zero(3, u.size());
+    }
+
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Max thrust SOC constraint (4D cone: ||[f_x, f_y, f_z]|| <= FMAX)
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Scalar>
+class MaxThrustConstraint : public StageConstraintBase<Scalar> {
+public:
+    MaxThrustConstraint() {
+        this->constraint_type = ConstraintType::SOC;
+        this->dim_c = 4;                      // cone dimension
+    }
+
+    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x;
+        Vector<Scalar> c(4);
+        auto f = u.segment(0, 3).eval();
+        c(0) = FMAX;                         // radial bound
+        c.segment(1, 3) = f;                // f_x, f_y, f_z
+        return c;                            // constraint: norm(c[1:3]) <= c[0]
+    }
+
+    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        return Matrix<Scalar>::Zero(4, x.size());
+    }
+
+    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(4, u.size());
+        J.block(1, 0, 3, 3) = Matrix<Scalar>::Identity(3, 3);
+        return J;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Factory
+// ─────────────────────────────────────────────────────────────────────────────
+inline std::shared_ptr<OptimalControlProblem<double>> create(
+    const Eigen::VectorXd& current_state)
+{
+    auto prob = std::make_shared<OptimalControlProblem<double>>(HORIZON);
+
+    // Dynamics
+    auto dyn = std::make_shared<Quad6DOF<double>>();
+    dyn->setMass(MASS);
+    dyn->setGravity(Eigen::Vector3d(0.0, 0.0, -9.81));
+    dyn->setJb(INERTIA);
+    dyn->setDt(DT);
+    // Set dynamics for each stage
+    for (int i = 0; i < HORIZON; ++i)
+        prob->setStageDynamics(i, dyn);
+
+    // Stage cost
+    for (int i = 0; i < HORIZON; ++i)
+        prob->setStageCost(i, std::make_shared<Cost<double>>());
+
+    // Terminal cost (returns 0)
+    prob->setTerminalCost(std::make_shared<TerminalCost<double>>());
+
+    // Terminal equality constraint (all states = 0)
+    prob->addTerminalConstraint(std::make_shared<TerminalEqualityConstraint<double>>());
+
+    // SOC constraints
+    auto glideslope = std::make_shared<GlideslopeConstraint<double>>();
+    auto max_thrust = std::make_shared<MaxThrustConstraint<double>>();
     
-    problem->addTerminalConstraint(std::make_shared<TerminalEqualityConstraint<double>>());
-    
-    // Set initial state
-    problem->setInitialState(0, current_state);
-    
-    // Initial control guess
-    Eigen::Quaterniond q0(current_state(6), current_state(7), 
+    // Add stage constraints for every time step
+    for (int i = 0; i < HORIZON; ++i) {
+        prob->addStageConstraint(i, glideslope);
+        prob->addStageConstraint(i, max_thrust);
+    }
+
+    // Initial state
+    prob->setInitialState(0, current_state);
+
+    // Warm-start: gravity-canceling thrust (in body frame)
+    Eigen::Quaterniond q(current_state(6), current_state(7),
                          current_state(8), current_state(9));
-    q0.normalize();
-    Eigen::Vector3d g_I(0.0, 0.0, -9.81);
-    Eigen::Vector3d f_B_init = q0.inverse() * (-g_I * MASS);
-    
+    q.normalize();
+    Eigen::Vector3d f0 = q.inverse() * Eigen::Vector3d(0.0, 0.0, MASS * 9.81);
     Eigen::VectorXd u0(6);
-    u0 << f_B_init(0), f_B_init(1), f_B_init(2), 0.0, 0.0, 0.0;
+    u0 << f0(0), f0(1), f0(2), 0.0, 0.0, 0.0;
     
-    for (int i = 0; i < HORIZON; ++i) {
-        problem->setInitialControl(i, u0);
-    }
-    
-    return problem;
+    for (int i = 0; i < HORIZON; ++i)
+        prob->setInitialControl(i, u0);
+
+    return prob;
 }
 
 } // namespace ConstrainedAttitudeOCP
