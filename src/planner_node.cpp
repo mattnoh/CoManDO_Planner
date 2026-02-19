@@ -1,18 +1,15 @@
 // planner_node.cpp
 // ─────────────────────────────────────────────────────────────────────────────
 // State layout (13-dimensional, matches your OCP):
-//   [0-2]   position        x, y, z          (m)      — from /pose (MoCap)
-//   [3-5]   velocity        vx, vy, vz       (m/s)    — from /odom (Kalman)
-//   [6-9]   quaternion      qw, qx, qy, qz   (–)      — from /pose (MoCap)
-//   [10-12] angular rate    wx, wy, wz        (rad/s)  — from /odom (gyro, deg→rad)
+//   [0-2]   position        x, y, z          (m)    
+//   [3-5]   velocity        vx, vy, vz       (m/s)   
+//   [6-9]   quaternion      qw, qx, qy, qz   (–)    
+//   [10-12] angular rate    wx, wy, wz        (rad/s)
 //
 // Sources:
 //   /cf_1/pose   PoseStamped   — Motion-capture position + orientation, 100 Hz
 //   /cf_1/odom   Odometry      — Kalman velocity + gyro rates,           100 Hz
 //
-// Why two topics instead of odom alone?
-//   Motion-capture quaternion is more accurate than the Kalman/stabilizer
-//   euler-reconstructed quaternion that odom carries. We mix the best of both.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <rclcpp/rclcpp.hpp>

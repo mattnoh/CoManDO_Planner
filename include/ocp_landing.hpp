@@ -4,7 +4,7 @@
 #include <memory>
 #include "optimal_control_problem.h"
 
-namespace ConstrainedAttitudeOCP {
+namespace LandingOCP {
 
 // ── Fixed parameters ─────────────────────────────────────────────────────────
 const int    HORIZON = 60;      // Increased from 30 to give more time to satisfy constraints
@@ -16,9 +16,6 @@ const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
     0.0, 0.0, 2.92e-5).finished();
 
 // ── Cost weights ─────────────────────────────────────────────────────────────
-// Add position/velocity costs to keep trajectory smooth.
-// Without these, the solver can take wild paths that satisfy constraints
-// but cause numerical issues.
 const double W_POS      = 0.0;    // Keep trajectory smooth
 const double W_VEL      = 0.0;    // Penalize high velocities
 const double W_ATTITUDE = 10.0;   // Drive to upright
@@ -33,7 +30,7 @@ const double FMAX        = 0.6;                   // Max thrust magnitude
 const Eigen::Quaterniond Q_REF(1.0, 0.0, 0.0, 0.0);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stage cost - REVERTED: Only attitude + control, NO position/velocity
+// Stage cost
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class Cost : public StageCostBase<Scalar> {
@@ -118,7 +115,7 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Terminal cost - Simple quadratic like your working example
+// Terminal cost
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class TerminalCost : public TerminalCostBase<Scalar> {
@@ -166,7 +163,7 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Terminal equality constraint - KEEP dim_cT = 13 (all states to zero)
+// Terminal equality constraint
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class TerminalEqualityConstraint : public TerminalConstraintBase<Scalar> {
@@ -412,4 +409,4 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     return prob;
 }
 
-} // namespace ConstrainedAttitudeOCP
+} // namespace landingOCP

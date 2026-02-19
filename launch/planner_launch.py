@@ -9,7 +9,7 @@ def generate_launch_description():
     Parameters:
     - drone_name: Name of the Crazyflie (default: cf_1)
     - enable_logging: Enable CSV logging (default: true)
-    - ocp_type: Type of OCP to use (default: hover, options: hover, constrained_attitude)
+    - ocp_type: Type of OCP to use (default: hover, options: hover, landing)
     - control_rate: Control loop frequency in Hz (default: 50)
     - solver_rate: MPC solver frequency in Hz (default: 10)
     """
@@ -30,7 +30,7 @@ def generate_launch_description():
     ocp_type_arg = DeclareLaunchArgument(
         'ocp_type',
         default_value='hover',
-        description='Type of OCP to use (hover, constrained_attitude)'
+        description='Type of OCP to use (hover, landing)'
     )
     
     control_rate_arg = DeclareLaunchArgument(

@@ -1,6 +1,6 @@
 #include "quadrotor_mpc.hpp"
 #include "ocp_hover.hpp"
-#include "ocp_constrained_attitude.hpp"
+#include "ocp_landing.hpp"
 #include <iostream>
 
 using namespace std;
@@ -12,20 +12,12 @@ QuadrotorMPC::QuadrotorMPC(const Config& config) : config_(config) {
     solver_params_.rho       = 20.0;
     solver_params_.rho_mul   = 9.0;
     solver_params_.tolerance = 1e-3;
-
-    // Constrained attitude has SOC + terminal EQ constraints that need more
-    // augmented Lagrangian iterations to converge than the unconstrained hover.
-    // This is the primary tuning knob if landing still stops short.
-    if (config_.ocp_type == "constrained_attitude") {
-        solver_params_.max_iter = 30;
-    } else {
-        solver_params_.max_iter = 10;
-    }
+    solver_params_.max_iter    = 200;
 }
 
 double QuadrotorMPC::getOcpDt() const {
     if (config_.ocp_type == "hover")                return HoverOCP::DT;
-    if (config_.ocp_type == "constrained_attitude") return ConstrainedAttitudeOCP::DT;
+    if (config_.ocp_type == "landing")              return LandingOCP::DT;
     return config_.dt;
 }
 
@@ -53,9 +45,13 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state) {
     if (config_.ocp_type == "hover") {
         problem_ = HoverOCP::create(current_state, config_.terminal_state);
     }
-    else if (config_.ocp_type == "constrained_attitude") {
-        problem_ = ConstrainedAttitudeOCP::create(current_state);
+    else if (config_.ocp_type == "landing") {
+        problem_ = LandingOCP::create(current_state);
     }
+    // Add new OCP types here as else-if branches, e.g.:
+    // else if (config_.ocp_type == "landing") {
+    //     problem_ = LandingOCP::create(current_state);
+    // }
     else {
         cerr << "ERROR: Unknown OCP type: " << config_.ocp_type << "\n";
         throw runtime_error("Unknown OCP type");
@@ -126,6 +122,6 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state) {
 void QuadrotorMPC::setTerminalState(const Eigen::VectorXd& terminal) {
     if (terminal.size() == 13) {
         config_.terminal_state = terminal;
-        has_prev_solution_ = false;   // goal changed — discard warm-start
+        has_prev_solution_ = false; 
     }
 }

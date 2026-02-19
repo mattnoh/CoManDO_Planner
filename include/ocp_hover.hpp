@@ -8,7 +8,7 @@ namespace HoverOCP {
 
 // ── Fixed parameters ─────────────────────────────────────────────────────────
 const int    HORIZON = 50;
-const double DT      = 0.05;    // 20 Hz — exposed so the planner can query it
+const double DT      = 0.05;
 const double MASS    = 0.027;
 const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
     1.66e-5, 0.0, 0.0,
