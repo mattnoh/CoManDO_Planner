@@ -179,9 +179,10 @@ private:
         if (result.success) {
             {
                 std::lock_guard<std::mutex> lock(traj_mutex_);
-                state_traj_   = result.state_trajectory;
-                control_traj_ = result.control_trajectory;
-                traj_valid_   = true;
+                state_traj_      = result.state_trajectory;
+                control_traj_    = result.control_trajectory;
+                traj_valid_      = true;
+                last_solve_time_ = Clock::now();  // FIX: record when this trajectory was computed
             }
             publishTrajectory(result.state_trajectory);
 
@@ -195,17 +196,14 @@ private:
     // ─────────────────────────────────────────────────────────────────────────
     // Control loop — runs at control_rate_ Hz
     //
-    // Always commands state_traj_[1]: the first predicted future step.
+    // Walks the trajectory index forward based on elapsed time since the last
+    // solve, so Mellinger always receives the trajectory point corresponding
+    // to *now* rather than holding state[1] for the entire inter-solve window.
     //
-    // Why state[1] and not state[0]?
-    //   state[0] is the current state (where we already are — no feedforward).
-    //   state[1] is one OCP timestep ahead — exactly what Mellinger should be
-    //   driving toward right now.  By the time the message arrives at Mellinger
-    //   (~1-5ms) we are already a few ms into that step, so this is correct.
-    //
-    // If control_rate_ > solver_rate_ you can walk idx forward between solves,
-    // but for equal rates always commanding state[1] is the simplest, correct
-    // approach with no timing artefacts.
+    // idx = 1 + floor(elapsed / ocp_dt_)
+    //   at t=0ms  after solve → idx=1  (one step ahead, as before)
+    //   at t=50ms after solve → idx=2  (two steps ahead — drone has moved)
+    //   clamped to last valid index if solver is late
     // ─────────────────────────────────────────────────────────────────────────
     void controlLoop()
     {
@@ -214,15 +212,20 @@ private:
         std::lock_guard<std::mutex> lock(traj_mutex_);
         if (!traj_valid_ || state_traj_.size() < 2) return;
 
-        // ── Always command the first future predicted step ────────────────────
-        const Eigen::VectorXd& cmd = state_traj_[1];
+        // Time elapsed since the last successful solve
+        double elapsed = std::chrono::duration<double>(Clock::now() - last_solve_time_).count();
 
-        // ── Acceleration feedforward from velocity finite difference ──────────
-        // a ≈ (v[1] - v[0]) / dt
-        // This is the expected acceleration along the planned trajectory and
-        // gives Mellinger's acceleration feedforward term meaningful content.
+        // Desired index = 1 (first future step) plus how many OCP steps we have advanced
+        int idx = 1 + static_cast<int>(elapsed / ocp_dt_);
+        // Clamp to the last valid state (avoid out-of-bounds)
+        idx = std::min(idx, static_cast<int>(state_traj_.size()) - 1);
+
+        const Eigen::VectorXd& cmd = state_traj_[idx];
+
+        // Acceleration feedforward: use the next state if available, otherwise repeat current velocity
+        int next_idx = std::min(idx + 1, static_cast<int>(state_traj_.size()) - 1);
         Eigen::Vector3d acc_cmd =
-            (state_traj_[1].segment(3, 3) - state_traj_[0].segment(3, 3)) / ocp_dt_;
+            (state_traj_[next_idx].segment(3, 3) - state_traj_[idx].segment(3, 3)) / ocp_dt_;
 
         publishCommand(cmd, acc_cmd);
 
@@ -409,7 +412,8 @@ private:
     std::mutex                   traj_mutex_;
     std::vector<Eigen::VectorXd> state_traj_;
     std::vector<Eigen::VectorXd> control_traj_;
-    bool                         traj_valid_ = false;
+    bool                         traj_valid_      = false;
+    TimePoint                    last_solve_time_ = Clock::now();  // FIX: added
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

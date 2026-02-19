@@ -60,10 +60,18 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state) {
     // Apply warm-start if available
     if (has_prev_solution_) {
         shiftWarmStart();
-        for (int i = 0; i < (int)prev_X_.size(); ++i)
-            problem_->setInitialState(i, prev_X_[i]);
+        // Set real initial state
+        problem_->setInitialState(0, current_state);
+        // Set shifted controls
         for (int i = 0; i < (int)prev_U_.size(); ++i)
             problem_->setInitialControl(i, prev_U_[i]);
+        // Forward rollout to get consistent state trajectory
+        Eigen::VectorXd x = current_state;
+        for (int i = 0; i < (int)prev_U_.size(); ++i) {
+            Eigen::VectorXd x_next = problem_->getDynamics(i)->f(x, prev_U_[i]);
+            problem_->setInitialState(i + 1, x_next);
+            x = x_next;
+        }
     }
 }
 
