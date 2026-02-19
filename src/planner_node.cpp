@@ -1,8 +1,25 @@
+// planner_node.cpp
+// ─────────────────────────────────────────────────────────────────────────────
+// State layout (13-dimensional, matches your OCP):
+//   [0-2]   position        x, y, z          (m)      — from /pose (MoCap)
+//   [3-5]   velocity        vx, vy, vz       (m/s)    — from /odom (Kalman)
+//   [6-9]   quaternion      qw, qx, qy, qz   (–)      — from /pose (MoCap)
+//   [10-12] angular rate    wx, wy, wz        (rad/s)  — from /odom (gyro, deg→rad)
+//
+// Sources:
+//   /cf_1/pose   PoseStamped   — Motion-capture position + orientation, 100 Hz
+//   /cf_1/odom   Odometry      — Kalman velocity + gyro rates,           100 Hz
+//
+// Why two topics instead of odom alone?
+//   Motion-capture quaternion is more accurate than the Kalman/stabilizer
+//   euler-reconstructed quaternion that odom carries. We mix the best of both.
+// ─────────────────────────────────────────────────────────────────────────────
+
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <crazyflie_interfaces/msg/full_state.hpp>
-#include <crazyflie_interfaces/msg/log_data_generic.hpp>
 #include "quadrotor_mpc.hpp"
 
 #include <chrono>
@@ -11,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <cmath>
 #include <Eigen/Dense>
 
 using namespace std::chrono_literals;
@@ -21,6 +39,7 @@ using TimePoint = std::chrono::steady_clock::time_point;
 class PlannerNode : public rclcpp::Node {
 public:
     PlannerNode() : Node("comando_planner") {
+        // ── Parameters ────────────────────────────────────────────────────────
         this->declare_parameter("drone_name",     "cf_1");
         this->declare_parameter("enable_logging", true);
         this->declare_parameter("ocp_type",       "hover");
@@ -33,62 +52,255 @@ public:
         control_rate_    = this->get_parameter("control_rate").as_int();
         solver_rate_     = this->get_parameter("solver_rate").as_int();
 
+        // ── MPC ───────────────────────────────────────────────────────────────
         QuadrotorMPC::Config cfg;
         cfg.ocp_type = ocp;
         mpc_.reset(new QuadrotorMPC(cfg));
         ocp_dt_ = mpc_->getOcpDt();
 
-        // Logging will be initialized when MPC starts, not immediately
+        // ── Initial state — identity quaternion, everything else zero ─────────
+        current_state_ = Eigen::VectorXd::Zero(13);
+        current_state_(6) = 1.0;   // qw = 1
 
+        // ── Publishers ────────────────────────────────────────────────────────
         cmd_pub_  = this->create_publisher<crazyflie_interfaces::msg::FullState>(
             "/" + drone_name_ + "/cmd_full_state", 10);
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
 
+        // ── Subscribers ───────────────────────────────────────────────────────
+        // 1) Motion-capture pose — position + quaternion at 100 Hz
         pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "/" + drone_name_ + "/pose", 10,
             std::bind(&PlannerNode::poseCallback, this, std::placeholders::_1));
 
-        vel_sub_ = this->create_subscription<crazyflie_interfaces::msg::LogDataGeneric>(
-            "/" + drone_name_ + "/velocity", 10,
-            std::bind(&PlannerNode::velocityCallback, this, std::placeholders::_1));
+        // 2) Kalman odom — world-frame velocity + body gyro rates at 100 Hz
+        //    Requires `odom` in firmware_logging.default_topics (cflib backend).
+        //    twist.linear:  vx,vy,vz  in m/s  (Kalman, world frame)
+        //    twist.angular: wx,wy,wz  in rad/s (gyro — see unit note below)
+        //
+        //    UNIT NOTE: crazyflie_server publishes gyro.x/y/z from firmware
+        //    which logs in deg/s.  Crazyswarm2's _log_odom_data_callback does
+        //    NOT convert them before stuffing into twist.angular, so we apply
+        //    DEG2RAD here.  Verify once: print twist.angular.x while spinning
+        //    — if values are ~100-500 during fast spin they are still deg/s.
+        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/" + drone_name_ + "/odom", 10,
+            std::bind(&PlannerNode::odomCallback, this, std::placeholders::_1));
 
-        // Angular velocity topic — when this arrives the actual state will
-        // have real omega values; until then the fields stay at the zero
-        // set once in the constructor below.
-        ang_vel_sub_ = this->create_subscription<crazyflie_interfaces::msg::LogDataGeneric>(
-            "/" + drone_name_ + "/angular_velocity", 10,
-            std::bind(&PlannerNode::angularVelocityCallback, this, std::placeholders::_1));
-
-        acc_sub_ = this->create_subscription<crazyflie_interfaces::msg::LogDataGeneric>(
-            "/" + drone_name_ + "/acceleration", 10,
-            std::bind(&PlannerNode::accelerationCallback, this, std::placeholders::_1));
-
-        // Initial state — identity quaternion, everything else zero.
-        // Angular velocity fields (10-12) start at zero here and are updated
-        // only by angularVelocityCallback.  They are NEVER overwritten in the
-        // solver loop — doing so would corrupt the actual state log.
-        current_state_ = Eigen::VectorXd::Zero(13);
-        current_state_(6) = 1.0;
-        
-        // Acceleration is stored separately since it's not part of MPC state
-        current_acc_ = Eigen::Vector3d::Zero();
-
-        control_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(1000 / control_rate_),
-            std::bind(&PlannerNode::controlLoop, this));
+        // ── Timers ────────────────────────────────────────────────────────────
+        // Solver: re-solves the OCP and updates the stored trajectory.
         solver_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(1000 / solver_rate_),
             std::bind(&PlannerNode::solverLoop, this));
 
+        // Control: publishes the current reference setpoint to Mellinger.
+        // Can run faster than the solver — it just indexes into the latest
+        // stored trajectory.
+        control_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(1000 / control_rate_),
+            std::bind(&PlannerNode::controlLoop, this));
+
         RCLCPP_INFO(this->get_logger(),
             "Planner ready  drone=%s  ocp=%s  ctrl=%dHz  solver=%dHz  ocp_dt=%.3fs",
             drone_name_.c_str(), ocp.c_str(), control_rate_, solver_rate_, ocp_dt_);
+        RCLCPP_INFO(this->get_logger(),
+            "Waiting for /pose AND /odom before starting MPC...");
     }
 
 private:
-    // ── Logging ───────────────────────────────────────────────────────────────
-    void setupLogging() {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Callbacks
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // /pose — Motion-capture position + quaternion
+    void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+    {
+        current_state_(0) = msg->pose.position.x;
+        current_state_(1) = msg->pose.position.y;
+        current_state_(2) = msg->pose.position.z;
+        // Quaternion: MoCap gives the most accurate orientation
+        current_state_(6) = msg->pose.orientation.w;  // qw
+        current_state_(7) = msg->pose.orientation.x;  // qx
+        current_state_(8) = msg->pose.orientation.y;  // qy
+        current_state_(9) = msg->pose.orientation.z;  // qz
+        pose_received_ = true;
+    }
+
+    // /odom — Kalman velocity + gyro angular rates
+    void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+    {
+        // World-frame velocity from Kalman filter (kalman.statePX/Y/Z)
+        current_state_(3) = msg->twist.twist.linear.x;
+        current_state_(4) = msg->twist.twist.linear.y;
+        current_state_(5) = msg->twist.twist.linear.z;
+
+        // Body-frame angular rates from gyro (gyro.x/y/z)
+        // Crazyswarm2 publishes these in deg/s — convert to rad/s for the OCP.
+        // If you have confirmed they are already rad/s, remove DEG2RAD.
+        constexpr double DEG2RAD = M_PI / 180.0;
+        current_state_(10) = msg->twist.twist.angular.x * DEG2RAD;
+        current_state_(11) = msg->twist.twist.angular.y * DEG2RAD;
+        current_state_(12) = msg->twist.twist.angular.z * DEG2RAD;
+
+        odom_received_ = true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Solver loop — runs at solver_rate_ Hz
+    // Solves the OCP from the current state and stores the new trajectory.
+    // ─────────────────────────────────────────────────────────────────────────
+    void solverLoop()
+    {
+        if (!pose_received_ || !odom_received_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Waiting for /pose [%s] and /odom [%s]...",
+                pose_received_ ? "OK" : "MISSING",
+                odom_received_ ? "OK" : "MISSING");
+            return;
+        }
+
+        if (!is_flying_) {
+            is_flying_ = true;
+            RCLCPP_INFO(this->get_logger(), "Both topics received — starting MPC");
+            if (logging_enabled_ && !logging_initialized_) {
+                setupLogging();
+                logging_initialized_ = true;
+            }
+            // Log initial state for debugging
+            RCLCPP_INFO(this->get_logger(),
+                "Initial state: pos=[%.3f,%.3f,%.3f] vel=[%.3f,%.3f,%.3f] "
+                "q=[%.3f,%.3f,%.3f,%.3f] w=[%.3f,%.3f,%.3f]",
+                current_state_(0), current_state_(1), current_state_(2),
+                current_state_(3), current_state_(4), current_state_(5),
+                current_state_(6), current_state_(7), current_state_(8), current_state_(9),
+                current_state_(10), current_state_(11), current_state_(12));
+        }
+
+        auto result = mpc_->solve(current_state_);
+
+        if (result.success) {
+            {
+                std::lock_guard<std::mutex> lock(traj_mutex_);
+                state_traj_   = result.state_trajectory;
+                control_traj_ = result.control_trajectory;
+                traj_valid_   = true;
+            }
+            publishTrajectory(result.state_trajectory);
+
+            static int diag_count = 0;
+            if (++diag_count % 10 == 0) printDiagnostics(result);
+        } else {
+            RCLCPP_WARN(this->get_logger(), "MPC solve failed");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Control loop — runs at control_rate_ Hz
+    //
+    // Always commands state_traj_[1]: the first predicted future step.
+    //
+    // Why state[1] and not state[0]?
+    //   state[0] is the current state (where we already are — no feedforward).
+    //   state[1] is one OCP timestep ahead — exactly what Mellinger should be
+    //   driving toward right now.  By the time the message arrives at Mellinger
+    //   (~1-5ms) we are already a few ms into that step, so this is correct.
+    //
+    // If control_rate_ > solver_rate_ you can walk idx forward between solves,
+    // but for equal rates always commanding state[1] is the simplest, correct
+    // approach with no timing artefacts.
+    // ─────────────────────────────────────────────────────────────────────────
+    void controlLoop()
+    {
+        if (!is_flying_) return;
+
+        std::lock_guard<std::mutex> lock(traj_mutex_);
+        if (!traj_valid_ || state_traj_.size() < 2) return;
+
+        // ── Always command the first future predicted step ────────────────────
+        const Eigen::VectorXd& cmd = state_traj_[1];
+
+        // ── Acceleration feedforward from velocity finite difference ──────────
+        // a ≈ (v[1] - v[0]) / dt
+        // This is the expected acceleration along the planned trajectory and
+        // gives Mellinger's acceleration feedforward term meaningful content.
+        Eigen::Vector3d acc_cmd =
+            (state_traj_[1].segment(3, 3) - state_traj_[0].segment(3, 3)) / ocp_dt_;
+
+        publishCommand(cmd, acc_cmd);
+
+        if (logging_enabled_ && logging_initialized_) {
+            logActualState();
+            logCommandedState(cmd);
+            if (!control_traj_.empty()) {
+                logControl(control_traj_[0]);  // control[0] drives state[0]→state[1]
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Publishing
+    // ─────────────────────────────────────────────────────────────────────────
+    void publishCommand(const Eigen::VectorXd& s, const Eigen::Vector3d& acc_cmd)
+    {
+        crazyflie_interfaces::msg::FullState msg;
+        msg.header.stamp    = this->now();
+        msg.header.frame_id = "world";
+
+        // Position
+        msg.pose.position.x = s(0);
+        msg.pose.position.y = s(1);
+        msg.pose.position.z = s(2);
+
+        // Linear velocity
+        msg.twist.linear.x = s(3);
+        msg.twist.linear.y = s(4);
+        msg.twist.linear.z = s(5);
+
+        // Orientation — solver order: qw(6), qx(7), qy(8), qz(9)
+        msg.pose.orientation.w = s(6);
+        msg.pose.orientation.x = s(7);
+        msg.pose.orientation.y = s(8);
+        msg.pose.orientation.z = s(9);
+
+        // Angular velocity — solver output is already in rad/s
+        msg.twist.angular.x = s(10);
+        msg.twist.angular.y = s(11);
+        msg.twist.angular.z = s(12);
+
+        // Acceleration feedforward
+        msg.acc.x = acc_cmd(0);
+        msg.acc.y = acc_cmd(1);
+        msg.acc.z = acc_cmd(2);
+
+        cmd_pub_->publish(msg);
+    }
+
+    void publishTrajectory(const std::vector<Eigen::VectorXd>& traj)
+    {
+        nav_msgs::msg::Path path;
+        path.header.stamp    = this->now();
+        path.header.frame_id = "world";
+        for (const auto& s : traj) {
+            geometry_msgs::msg::PoseStamped p;
+            p.header.frame_id    = "world";
+            p.pose.position.x    = s(0);
+            p.pose.position.y    = s(1);
+            p.pose.position.z    = s(2);
+            p.pose.orientation.w = s(6);
+            p.pose.orientation.x = s(7);
+            p.pose.orientation.y = s(8);
+            p.pose.orientation.z = s(9);
+            path.poses.push_back(p);
+        }
+        traj_pub_->publish(path);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Logging
+    // ─────────────────────────────────────────────────────────────────────────
+    void setupLogging()
+    {
         auto now = std::chrono::system_clock::now();
         auto t   = std::chrono::system_clock::to_time_t(now);
         std::stringstream ts;
@@ -110,212 +322,13 @@ private:
         RCLCPP_INFO(this->get_logger(), "Logging to: %s", folder.c_str());
     }
 
-    // ── Subscribers ───────────────────────────────────────────────────────────
-    void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
-        current_state_(0) = msg->pose.position.x;
-        current_state_(1) = msg->pose.position.y;
-        current_state_(2) = msg->pose.position.z;
-        current_state_(6) = msg->pose.orientation.w;
-        current_state_(7) = msg->pose.orientation.x;
-        current_state_(8) = msg->pose.orientation.y;
-        current_state_(9) = msg->pose.orientation.z;
-        pose_received_    = true;
-    }
-
-    void velocityCallback(const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg) {
-        if (msg->values.size() >= 3) {
-            current_state_(3) = msg->values[0];
-            current_state_(4) = msg->values[1];
-            current_state_(5) = msg->values[2];
-            vel_received_     = true;
-        }
-    }
-
-    // Receives body-frame angular velocity from the Crazyflie log system.
-    // The three values map directly to omega_x, omega_y, omega_z (rad/s).
-    // Once this callback fires the actual-state log will contain real data.
-    void angularVelocityCallback(
-        const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg)
+    double wallTimeSec()
     {
-        static bool first_call = true;
-        static int count = 0;
-        if (first_call) {
-            RCLCPP_INFO(this->get_logger(), "Angular velocity callback FIRED - receiving data");
-            first_call = false;
-        }
-        
-        if (msg->values.size() >= 3) {
-            current_state_(10) = msg->values[0];
-            current_state_(11) = msg->values[1];
-            current_state_(12) = msg->values[2];
-            
-            if (++count % 100 == 0) {
-                RCLCPP_INFO(this->get_logger(), 
-                    "AngVel [%d]: [%.3f, %.3f, %.3f]", 
-                    count, msg->values[0], msg->values[1], msg->values[2]);
-            }
-        } else {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "AngVel message has only %zu values (expected 3)", msg->values.size());
-        }
+        return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
     }
 
-    void accelerationCallback(
-        const crazyflie_interfaces::msg::LogDataGeneric::SharedPtr msg)
+    void logActualState()
     {
-        if (msg->values.size() >= 3) {
-            current_acc_(0) = msg->values[0];
-            current_acc_(1) = msg->values[1];
-            current_acc_(2) = msg->values[2];
-        }
-    }
-
-    // ── Solver loop ───────────────────────────────────────────────────────────
-    void solverLoop() {
-        if (!pose_received_ || !vel_received_) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "Waiting for pose and velocity...");
-            return;
-        }
-        if (!is_flying_) {
-            is_flying_ = true;
-            RCLCPP_INFO(this->get_logger(), "State received — starting MPC");
-            
-            // Initialize logging NOW, not in constructor
-            if (logging_enabled_ && !logging_initialized_) {
-                setupLogging();
-                logging_initialized_ = true;
-            }
-        }
-
-        // NOTE: angular velocity fields (10-12) are NOT zeroed here.
-        // They hold whatever angularVelocityCallback last wrote (or the
-        // constructor zero if that subscriber hasn't fired yet).
-        // Zeroing them here would corrupt both the MPC input and the log.
-
-        auto result = mpc_->solve(current_state_);
-
-        if (result.success) {
-            {
-                std::lock_guard<std::mutex> lock(traj_mutex_);
-                state_traj_   = result.state_trajectory;
-                control_traj_ = result.control_trajectory;
-                solve_time_   = result.solve_timestamp;
-                traj_valid_   = true;
-            }
-            publishTrajectory(result.state_trajectory);
-
-            static int count = 0;
-            if (++count % 10 == 0) printDiagnostics(result);
-        } else {
-            RCLCPP_WARN(this->get_logger(), "MPC solve failed");
-        }
-    }
-
-    // ── Control loop ──────────────────────────────────────────────────────────
-    void controlLoop() {
-        if (!is_flying_) return;
-
-        std::lock_guard<std::mutex> lock(traj_mutex_);
-        if (!traj_valid_ || state_traj_.empty()) return;
-
-        // ── Wall-clock trajectory indexing ───────────────────────────────────
-        double elapsed_s = std::chrono::duration<double>(
-            Clock::now() - solve_time_).count();
-
-        // +1 offset: start playback from the first future step
-        int idx = static_cast<int>(elapsed_s / ocp_dt_) + 1;
-
-        int max_idx = static_cast<int>(state_traj_.size()) - 1;
-        idx = std::max(1, std::min(idx, max_idx));
-
-        Eigen::VectorXd cmd = state_traj_[idx];
-        
-        // Compute acceleration from trajectory: a = (v[idx] - v[idx-1]) / dt
-        Eigen::Vector3d acc_cmd = Eigen::Vector3d::Zero();
-        if (idx > 0 && idx < (int)state_traj_.size()) {
-            Eigen::Vector3d v_curr = state_traj_[idx].segment(3, 3);
-            Eigen::Vector3d v_prev = state_traj_[idx-1].segment(3, 3);
-            acc_cmd = (v_curr - v_prev) / ocp_dt_;
-        }
-        
-        publishCommand(cmd, acc_cmd);
-
-        if (logging_enabled_ && logging_initialized_) {
-            logActualState();
-            logCommandedState(cmd);
-            if (!control_traj_.empty()) {
-                int u_idx = std::min(idx - 1, (int)control_traj_.size() - 1);
-                logControl(control_traj_[u_idx]);
-            }
-        }
-    }
-
-    // ── Publishing ────────────────────────────────────────────────────────────
-    void publishCommand(const Eigen::VectorXd& s) {
-        publishCommand(s, Eigen::Vector3d::Zero());
-    }
-    
-    void publishCommand(const Eigen::VectorXd& s, const Eigen::Vector3d& acc_cmd) {
-        crazyflie_interfaces::msg::FullState msg;
-        msg.header.stamp    = this->now();
-        msg.header.frame_id = "world";
-        
-        // Position
-        msg.pose.position.x    = s(0);
-        msg.pose.position.y    = s(1);
-        msg.pose.position.z    = s(2);
-        
-        // Linear velocity
-        msg.twist.linear.x     = s(3);
-        msg.twist.linear.y     = s(4);
-        msg.twist.linear.z     = s(5);
-        
-        // Orientation (quaternion): solver order is qw,qx,qy,qz (indices 6-9)
-        msg.pose.orientation.w = s(6);  // qw
-        msg.pose.orientation.x = s(7);  // qx
-        msg.pose.orientation.y = s(8);  // qy
-        msg.pose.orientation.z = s(9);  // qz
-        
-        // Angular velocity
-        msg.twist.angular.x    = s(10);
-        msg.twist.angular.y    = s(11);
-        msg.twist.angular.z    = s(12);
-        
-        // Acceleration - use commanded acceleration from MPC trajectory
-        msg.acc.x = acc_cmd(0);
-        msg.acc.y = acc_cmd(1);
-        msg.acc.z = acc_cmd(2);
-        
-        cmd_pub_->publish(msg);
-    }
-
-    void publishTrajectory(const std::vector<Eigen::VectorXd>& traj) {
-        nav_msgs::msg::Path path;
-        path.header.stamp    = this->now();
-        path.header.frame_id = "world";
-        for (const auto& s : traj) {
-            geometry_msgs::msg::PoseStamped p;
-            p.header.frame_id    = "world";
-            p.pose.position.x    = s(0);
-            p.pose.position.y    = s(1);
-            p.pose.position.z    = s(2);
-            p.pose.orientation.w = s(6);
-            p.pose.orientation.x = s(7);
-            p.pose.orientation.y = s(8);
-            p.pose.orientation.z = s(9);
-            path.poses.push_back(p);
-        }
-        traj_pub_->publish(path);
-    }
-
-    // ── Logging ───────────────────────────────────────────────────────────────
-    double wallTimeSec() {
-        return std::chrono::duration<double>(
-            Clock::now().time_since_epoch()).count();
-    }
-
-    void logActualState() {
         if (!actual_state_log_.is_open()) return;
         actual_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
         for (int i = 0; i < 13; ++i) actual_state_log_ << "," << current_state_(i);
@@ -323,7 +336,8 @@ private:
         actual_state_log_.flush();
     }
 
-    void logCommandedState(const Eigen::VectorXd& s) {
+    void logCommandedState(const Eigen::VectorXd& s)
+    {
         if (!commanded_state_log_.is_open() || s.size() < 13) return;
         commanded_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
         for (int i = 0; i < 13; ++i) commanded_state_log_ << "," << s(i);
@@ -331,7 +345,8 @@ private:
         commanded_state_log_.flush();
     }
 
-    void logControl(const Eigen::VectorXd& u) {
+    void logControl(const Eigen::VectorXd& u)
+    {
         if (!control_log_.is_open() || u.size() < 6) return;
         Eigen::Vector3d f = u.segment(0, 3);
         Eigen::Vector3d m = u.segment(3, 3);
@@ -342,60 +357,67 @@ private:
         control_log_.flush();
     }
 
-    void printDiagnostics(const QuadrotorMPC::Result& result) {
+    void printDiagnostics(const QuadrotorMPC::Result& result)
+    {
         Eigen::Vector3d pos = current_state_.segment(0, 3);
         Eigen::Vector3d vel = current_state_.segment(3, 3);
+        Eigen::Vector3d ww  = current_state_.segment(10, 3);
         double thrust = result.control_trajectory.empty() ? 0.0
             : result.control_trajectory[0].segment(0, 3).norm();
-        double elapsed = std::chrono::duration<double>(
-            Clock::now() - result.solve_timestamp).count();
         RCLCPP_INFO(this->get_logger(),
-            "MPC %.1fms | Pos[%.3f,%.3f,%.3f] Vel[%.3f,%.3f,%.3f] | T=%.3fN idx~%d/%zu",
+            "MPC %.1fms | pos[%.3f,%.3f,%.3f] vel[%.3f,%.3f,%.3f] "
+            "w[%.3f,%.3f,%.3f]rad/s | T=%.3fN",
             result.solve_time_ms,
             pos.x(), pos.y(), pos.z(),
             vel.x(), vel.y(), vel.z(),
-            thrust,
-            (int)(elapsed / ocp_dt_) + 1,
-            result.state_trajectory.size());
+            ww.x(), ww.y(), ww.z(),
+            thrust);
     }
 
-    // ── Members ───────────────────────────────────────────────────────────────
-    std::unique_ptr<QuadrotorMPC>  mpc_;
-    std::string                    drone_name_;
-    bool                           logging_enabled_;
-    int                            control_rate_;
-    int                            solver_rate_;
-    double                         ocp_dt_ = 0.05;
+    // ─────────────────────────────────────────────────────────────────────────
+    // Members
+    // ─────────────────────────────────────────────────────────────────────────
+    std::unique_ptr<QuadrotorMPC> mpc_;
+    std::string                   drone_name_;
+    bool                          logging_enabled_;
+    int                           control_rate_;
+    int                           solver_rate_;
+    double                        ocp_dt_ = 0.05;
 
-    rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr  cmd_pub_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                   traj_pub_;
-    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr    pose_sub_;
-    rclcpp::Subscription<crazyflie_interfaces::msg::LogDataGeneric>::SharedPtr vel_sub_;
-    rclcpp::Subscription<crazyflie_interfaces::msg::LogDataGeneric>::SharedPtr ang_vel_sub_;
-    rclcpp::Subscription<crazyflie_interfaces::msg::LogDataGeneric>::SharedPtr acc_sub_;
-    rclcpp::TimerBase::SharedPtr   control_timer_;
-    rclcpp::TimerBase::SharedPtr   solver_timer_;
+    // Publishers
+    rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr cmd_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                  traj_pub_;
 
-    Eigen::VectorXd  current_state_;
-    Eigen::Vector3d  current_acc_;    // Measured acceleration (not in MPC state)
-    bool             pose_received_ = false;
-    bool             vel_received_  = false;
-    bool             is_flying_     = false;
-    bool             logging_initialized_ = false;
+    // Subscribers — only pose (MoCap) and odom (Kalman vel + gyro)
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr  pose_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr          odom_sub_;
 
-    std::mutex                    traj_mutex_;
-    std::vector<Eigen::VectorXd>  state_traj_;
-    std::vector<Eigen::VectorXd>  control_traj_;
-    TimePoint                     solve_time_;
-    bool                          traj_valid_ = false;
+    // Timers
+    rclcpp::TimerBase::SharedPtr solver_timer_;
+    rclcpp::TimerBase::SharedPtr control_timer_;
 
-    std::ofstream  commanded_state_log_;
-    std::ofstream  actual_state_log_;
-    std::ofstream  control_log_;
+    // State
+    Eigen::VectorXd current_state_;   // 13-dim: pos, vel, quat, omega
+    bool pose_received_ = false;
+    bool odom_received_ = false;
+    bool is_flying_     = false;
+
+    // Logging
+    bool logging_initialized_ = false;
+    std::ofstream commanded_state_log_;
+    std::ofstream actual_state_log_;
+    std::ofstream control_log_;
+
+    // Trajectory (written by solver, read by control loop)
+    std::mutex                   traj_mutex_;
+    std::vector<Eigen::VectorXd> state_traj_;
+    std::vector<Eigen::VectorXd> control_traj_;
+    bool                         traj_valid_ = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     rclcpp::init(argc, argv);
     rclcpp::spin(std::make_shared<PlannerNode>());
     rclcpp::shutdown();
