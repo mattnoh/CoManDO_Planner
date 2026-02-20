@@ -193,8 +193,8 @@ private:
             //   a_ff = ( x[2][3:5] - x[1][3:5] ) / dt
             // If x[1] is the last node, a_ff is zero (safe fallback).
             Eigen::Vector3d acc_ff = Eigen::Vector3d::Zero();
-            if (X.size() > 2)
-                acc_ff = (X[2].segment(3, 3) - X[1].segment(3, 3)) / ocp_dt_;
+            // if (X.size() > 2)
+            //     acc_ff = (X[2].segment(3, 3) - X[1].segment(3, 3)) / ocp_dt_;
 
             publishCommand(X[1], acc_ff);
 
