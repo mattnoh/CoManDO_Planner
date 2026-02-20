@@ -1,149 +1,183 @@
 # Chapter 3: How the MPC Works
 
-This chapter describes the internals of `QuadrotorMPC`: how the OCP is formulated in terms of `x[]` and `u[]`, how the initial trajectories are set, how warm-starting works, and how the solver is called and parameterised.
+This chapter describes the internals of `QuadrotorMPC`: how the OCP is structured in terms of x[] and u[], how initial guesses are set, how warm-starting works, and the reasoning behind each design decision.
 
 ---
 
 ## 1. Problem Structure
 
-The MPC solves an **Optimal Control Problem (OCP)** over a finite horizon of `N` steps. At each call it produces:
+The MPC solves an Optimal Control Problem over a finite horizon of N steps, producing:
 
 ```
-X = [ x[0], x[1], x[2], ..., x[N] ]       ← state trajectory  (N+1 nodes)
-U = [ u[0], u[1], u[2], ..., u[N-1] ]     ← control trajectory (N nodes)
+X = [ x[0], x[1], ..., x[N] ]       state trajectory   (N+1 nodes)
+U = [ u[0], u[1], ..., u[N-1] ]     control trajectory (N nodes)
 ```
 
-Each `x[k]` is the 13-dimensional state at step `k`:
+Each x[k] is the 13-dimensional state:
 
 ```
-x[k] = [ px, py, pz,          ← position       (0:2)
-          vx, vy, vz,          ← velocity        (3:5)
-          qw, qx, qy, qz,      ← quaternion      (6:9)
-          wx, wy, wz ]         ← angular rate    (10:12)
+x[k] = [ px, py, pz,           position       (0:2)
+          vx, vy, vz,           velocity        (3:5)
+          qw, qx, qy, qz,       quaternion      (6:9)
+          wx, wy, wz ]          angular rate    (10:12)
 ```
 
-Each `u[k]` is the 6-dimensional control input at step `k`:
+Each u[k] is the 6-dimensional control:
 
 ```
-u[k] = [ fx, fy, fz,          ← body-frame force    (0:2)
-          mx, my, mz ]         ← body-frame torque   (3:5)
+u[k] = [ fx, fy, fz,           body-frame force   (0:2)
+          mx, my, mz ]          body-frame torque  (3:5)
 ```
 
-The dynamics at each step enforce:
+The dynamics constraint at every step is:
 
 ```
 x[k+1] = f( x[k], u[k] )
 ```
 
-where `f` is the quadrotor rigid-body dynamics integrated over one OCP time step `dt`.
+where f is the quadrotor rigid-body dynamics integrated over one OCP time step dt.
 
 ---
 
 ## 2. OCP Types
 
-The OCP formulation is selected by the `ocp_type` parameter. Each type defines its own cost function, constraints, horizon length `N`, and time step `dt`.
+The OCP formulation is selected by the `ocp_type` parameter. Each type defines its own cost, constraints, horizon length N, and time step dt as static constants.
 
 | `ocp_type` | Class | Terminal condition |
 |---|---|---|
 | `"hover"` | `HoverOCP` | Tracks a user-supplied 13-dim `terminal_state` |
-| `"landing"` | `LandingOCP` | Terminal state is embedded in the OCP |
+| `"landing"` | `LandingOCP` | Terminal state embedded in the OCP |
 
-The time step `dt` is a constant defined inside each OCP class and retrieved via:
+Both N and dt are accessed from these constants directly — no runtime query of the problem object is needed.
+
+---
+
+## 3. What DDP Actually Reads
+
+This is the most important thing to understand about how we set up the problem. DDP (Differential Dynamic Programming) has a specific contract with the caller:
+
+- **x[0]** — you provide the fixed initial condition (the current measured state)
+- **U = [u[0]..u[N-1]]** — you provide an initial guess for the control sequence
+- **x[1..N]** — the solver computes these itself via a forward rollout before every backward pass
+
+x[1..N] are never read from outside. Giving the solver pre-rolled states would have no effect — the first thing ALIPDDP does internally is recompute the entire state trajectory from x[0] and U.
+
+---
+
+## 4. Setting Up the Problem — `setupProblem(x_current)`
+
+#### x[0] — always set to the real measured state
 
 ```cpp
-ocp_dt_ = mpc_->getOcpDt();
+problem_->setInitialState(0, current_state);
 ```
 
-This `dt` is then used by the control loop for trajectory indexing (see Chapter 2).
+This is set unconditionally, every solve, before the warm/cold branching. It is the only state the solver reads from outside.
+
+#### Warm start path
+
+On every call after the first successful solve, `has_prev_solution_ = true`. We shift the previous control sequence forward by one step and pass it as the initial U:
+
+```
+U_warm[k]   = U_prev[k+1]    for k = 0, ..., N-2
+U_warm[N-1] = U_prev[N-1]    (hold last control)
+```
+
+Then:
+
+```cpp
+for i in 0..N-1:
+    problem_->setInitialControl(i, U_warm[i])
+```
+
+The solver's forward sweep will then compute x[1..N] from this U_warm and x[0].
+
+**What was removed and why.** The original code also ran a manual forward rollout here:
+
+```cpp
+// OLD — removed:
+Eigen::VectorXd x = current_state;
+for (int i = 0; i < N; ++i) {
+    x_next = problem_->getDynamics(i)->f(x, prev_U_[i]);
+    problem_->setInitialState(i + 1, x_next);
+    x = x_next;
+}
+```
+
+This was redundant. DDP overwrites x[1..N] in its own forward sweep on every iteration before any backward pass runs. The manually set states had zero effect on the solution and were wasted computation. Removed.
+
+#### Cold start path — explicit hover seed
+
+**What we had before.** The OCP was created and nothing was explicitly set for U. Whatever `OCP::create()` left in the control slots — typically zeros — became the initial guess. Zero force means zero thrust, which means the solver's first forward rollout sends the drone through the floor.
+
+**What we do now.** We explicitly fill every u[k] with a gravity-compensating hover equilibrium before handing the problem to the solver:
+
+```
+u_hover = [ 0, 0, m*g, 0, 0, 0 ]   (body fz = weight, no torques)
+
+for i in 0..N-1:
+    problem_->setInitialControl(i, u_hover)
+```
+
+N is read directly from the OCP class constant:
+
+```cpp
+const int N = (config_.ocp_type == "hover")   ? HoverOCP::N   :
+              (config_.ocp_type == "landing") ? LandingOCP::N : 0;
+```
+
+This inlines the lookup at the call site rather than adding a `getOcpN()` method to the class — which would have required a header change and caused a compile error when the declaration was missing.
 
 ---
 
-## 3. Setting Up the Problem — `setupProblem(x_current)`
+## 5. The prev_X_ Shift — Kept but Not Used by the Solver
 
-Every solver call begins by constructing a fresh OCP instance from the current state.
+`shiftWarmStart()` shifts both `prev_X_` and `prev_U_` forward by one step.
 
-### 3.1 Cold Start (No Prior Solution)
+`prev_X_` is shifted but is not passed to the solver. As explained above, DDP does not accept an X seed — it always recomputes x[1..N] from U and x[0]. The shifted X is therefore kept in memory but has no effect on the current solution.
 
-On the first call, `has_prev_solution_ = false`. The OCP is created with `x_current` as the boundary condition. The solver initialises `X` and `U` internally (typically a zero or hover guess).
-
-```
-problem = OCP::create( x_current, terminal_state )
-    → x[0] fixed to x_current
-    → X[1..N], U[0..N-1] initialised by the OCP
-```
-
-### 3.2 Warm Start (Subsequent Calls)
-
-When a prior solution exists, we shift it forward by one step to give the solver a good initial guess. This is done in two stages.
-
-**Stage 1 — Shift `X` and `U` forward by one:**
-
-```
-X_warm[k]   = X_prev[k+1]    for k = 0, 1, ..., N-1
-X_warm[N]   = X_prev[N]      ← hold last node
-
-U_warm[k]   = U_prev[k+1]    for k = 0, 1, ..., N-2
-U_warm[N-1] = U_prev[N-1]    ← hold last control
-```
-
-**Stage 2 — Correct the initial condition and rollout:**
-
-The shifted trajectory still has `X_warm[0] = X_prev[1]`, which may no longer match the real drone state. We overwrite it and roll the dynamics forward to produce a dynamically consistent initial guess:
-
-```
-x[0]   = x_current                        ← real measured state
-
-for k = 0 to N-1:
-    x[k+1] = f( x[k], U_warm[k] )         ← forward rollout under shifted controls
-```
-
-This gives the solver a warm start where every state is physically reachable from the current position, rather than a trajectory that starts from a stale estimate.
+It is kept intentionally: if we later extend the solver backend or add a custom initialiser that does accept an X seed, the infrastructure to provide one is already in place.
 
 ---
 
-## 4. Calling the Solver
+## 6. Calling the Solver
 
-After the problem is set up, the solver is instantiated and run:
+```cpp
+solver_.reset();
+solver_ = make_shared<ALIPDDP<double>>(*problem_);
+solver_->init(solver_params_);
+solver_->solve();
 
+X_result = solver_->getResX();   // [ x[0], x[1], ..., x[N] ]
+U_result = solver_->getResU();   // [ u[0], u[1], ..., u[N-1] ]
 ```
-solver = ALIPDDP( problem )
-solver.init( solver_params )
-solver.solve()
 
-X_result = solver.getResX()   → [ x[0], x[1], ..., x[N] ]
-U_result = solver.getResU()   → [ u[0], u[1], ..., u[N-1] ]
-```
-
-The solver is **recreated on every call**. There is no state carried over inside the solver object itself — all warm-start information is injected through the initial `X` and `U` set on the `problem` before `solve()` is called.
+The solver is recreated on every call. All warm-start information is injected through the initial U set on the problem object before `solve()` is called — no state is carried inside the solver itself between calls.
 
 ---
 
-## 5. Using the Solution
+## 7. Caching the Result
 
-On a successful solve, the result is stored for the control loop and for the next warm start:
-
-```
-X_prev ← X_result
-U_prev ← U_result
-has_prev_solution_ ← true
+```cpp
+prev_X_ = X_result;   // kept for future use — not read by solver
+prev_U_ = U_result;   // used as warm-start seed for the next solve
+has_prev_solution_ = true;
 ```
 
-The control loop then indexes into `X_result` (see Chapter 2, Section 4.1). The first useful command point is `x[1]`, since `x[0]` is the initial condition (the current measured state).
+The planner node uses X_result[1] as the published reference for Mellinger (see Chapter 2).
 
-If the solve fails, `has_prev_solution_` is set to `false` and the next call will run cold.
+---
 
+## 8. Terminal State Update
 
-## 6. What the Solver Returns in Practice
+For the hover OCP, the terminal reference can be changed at runtime:
 
-For diagnostic purposes, the first four nodes of the state trajectory are printed after each solve:
-
-```
-X[0]: x_current          ← initial condition (what we measured)
-X[1]: x predicted at t+dt
-X[2]: x predicted at t+2·dt
-X[3]: x predicted at t+3·dt
+```cpp
+mpc_->setTerminalState(new_terminal_13dim);
 ```
 
-`X[0]` should always match `x_current` exactly, since it is set as a hard constraint. Any deviation in `X[1]` onward reflects the OCP's planned manoeuvre.
+This resets `has_prev_solution_ = false` so the next solve runs cold from the hover seed toward the new target.
+
+---
 
 [Back to Chapter 2: Planner Node Setup](02_planner_node_setup.md)
