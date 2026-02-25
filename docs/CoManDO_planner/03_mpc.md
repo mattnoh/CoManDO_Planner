@@ -106,27 +106,18 @@ for (int i = 0; i < N; ++i) {
 
 This was redundant. DDP overwrites x[1..N] in its own forward sweep on every iteration before any backward pass runs. The manually set states had zero effect on the solution and were wasted computation. Removed.
 
-#### Cold start path — explicit hover seed
+#### Cold start path — rely on OCP defaults
 
-**What we had before.** The OCP was created and nothing was explicitly set for U. Whatever `OCP::create()` left in the control slots — typically zeros — became the initial guess. Zero force means zero thrust, which means the solver's first forward rollout sends the drone through the floor.
+On a cold start (`has_prev_solution_ == false`), `setupProblem()` does **not** overwrite controls.
 
-**What we do now.** We explicitly fill every u[k] with a gravity-compensating hover equilibrium before handing the problem to the solver:
+This is intentional: both `HoverOCP::create()` and `LandingOCP::create()` already seed the initial control sequence with a gravity-compensating hover force based on the current quaternion, and that seed is better than a generic zero-force guess.
 
-```
-u_hover = [ 0, 0, m*g, 0, 0, 0 ]   (body fz = weight, no torques)
+So the current flow is:
 
-for i in 0..N-1:
-    problem_->setInitialControl(i, u_hover)
-```
-
-N is read directly from the OCP class constant:
-
-```cpp
-const int N = (config_.ocp_type == "hover")   ? HoverOCP::N   :
-              (config_.ocp_type == "landing") ? LandingOCP::N : 0;
-```
-
-This inlines the lookup at the call site rather than adding a `getOcpN()` method to the class — which would have required a header change and caused a compile error when the declaration was missing.
+- create the OCP (`HoverOCP::create` or `LandingOCP::create`)
+- set `x[0]` to the measured state
+- only if warm-start is available, overwrite U with shifted `prev_U_`
+- otherwise keep the OCP-provided control initialization
 
 ---
 

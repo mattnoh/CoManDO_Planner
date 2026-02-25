@@ -220,26 +220,16 @@ msg.twist.angular     ← x[k][10–12] (angular rates, rad/s)
 msg.acc               ← a_ff        (feedforward acceleration, see below)
 ```
 
-### 3.2 Feedforward Acceleration Calculation
+### 3.2 Feedforward Acceleration (Current Behavior)
 
-The Mellinger controller accepts an acceleration feedforward term that improves tracking. We compute it as a finite-difference of consecutive velocity states from the MPC trajectory:
-
-```
-a_ff = ( x[k+1][3–5] − x[k][3–5] ) / dt
-```
-
-where `dt` is the OCP time step. This gives the rate of change of velocity between two consecutive trajectory nodes, which approximates the desired acceleration at node `k`.
-
-In code:
+The current planner publishes a **zero acceleration feedforward** vector:
 
 ```cpp
-int next_idx = min(idx + 1, N - 1);
-
-acc_cmd = (state_traj_[next_idx].segment(3, 3)
-         - state_traj_[idx   ].segment(3, 3)) / ocp_dt_;
+Eigen::Vector3d acc_ff = Eigen::Vector3d::Zero();
+publishCommand(X[1], acc_ff);
 ```
 
-If `idx` is already the last node (solver was late), both `idx` and `next_idx` point to the same node and `acc_cmd` is zero — a safe fallback.
+The finite-difference formula is still documented in comments in the node source as an optional future improvement, but it is intentionally disabled right now.
 
 ---
 
@@ -247,7 +237,7 @@ If `idx` is already the last node (solver was late), both `idx` and `next_idx` p
  - The `cmd_full_state` topic implements a **feedforward** controller – you provide the full desired state and the firmware tries to track it.
  - The orientation is represented as a quaternion (`x,y,z,w`).
  - Position and orientation come from MoCap via `/pose`; velocity and angular rates come from the Kalman filter and gyroscope via `/odom`.
- - The acceleration feedforward is not measured — it is derived from the MPC solution by finite-differencing consecutive velocity nodes.
+ - The acceleration feedforward currently sent to `cmd_full_state` is zero.
 
 ---
 

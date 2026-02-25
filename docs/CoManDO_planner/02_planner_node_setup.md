@@ -63,13 +63,15 @@ result = mpc_->solve(x_current)
 
 **Step 3 — Publish x[1] immediately**
 
-x[0] is the initial condition — the current measured state. x[1] is the first planned future state. We publish x[1] directly as the reference for Mellinger. The acceleration feedforward is the finite difference of velocity between x[1] and x[2]:
+x[0] is the initial condition — the current measured state. x[1] is the first planned future state. We publish x[1] directly as the reference for Mellinger.
+
+The acceleration feedforward is currently set to zero in `solverLoop()`:
 
 ```
-a_ff = ( x[2][3:5] − x[1][3:5] ) / dt_ocp
+a_ff = [0, 0, 0]
 ```
 
-If x[1] is the last node, a_ff is zero. The command is published once per solver tick.
+There is a commented finite-difference implementation in the source for future re-enablement, but it is intentionally disabled in the current code path. The command is published once per solver tick.
 
 **Step 4 — Visualisation and logging**
 
