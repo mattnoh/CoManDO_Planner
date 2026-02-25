@@ -1,6 +1,6 @@
 // planner_node.cpp
 // ─────────────────────────────────────────────────────────────────────────────
-// State layout (13-dimensional, matches your OCP):
+// State layout (13-dimensional, matches the OCP):
 //   [0-2]   position        x, y, z          (m)
 //   [3-5]   velocity        vx, vy, vz       (m/s)
 //   [6-9]   quaternion      qw, qx, qy, qz   (–)
@@ -38,18 +38,79 @@ public:
         this->declare_parameter("drone_name",     "cf_1");
         this->declare_parameter("enable_logging", true);
         this->declare_parameter("ocp_type",       "hover");
-        this->declare_parameter("solver_rate",    10);
+        // PX4 MPC PATTERN: set solver_rate = 1/ocp_dt so that the solver fires
+        // exactly once per OCP step. This makes n_shift = 1 always — the cleanest
+        // receding-horizon design with no timing drift or rounding.
+        //
+        // HoverOCP::DT = LandingOCP::DT = 0.05 s  →  default 20 Hz.
+        //
+        // If you change this to a different rate, n_shift = round(period/ocp_dt)
+        // compensates, but any mismatch between the solve time and the OCP step
+        // means x[1] you publish is no longer "one step ahead of now" — it is
+        // either behind (n_shift too small) or ahead (n_shift too large).
+        this->declare_parameter("solver_rate",    20);
+
+        // Hover target — used only when ocp_type == "hover".
+        // The terminal state is a valid hover at this position with:
+        //   vel = 0, qw = 1 (identity), angular rates = 0.
+        // If not set by the user, defaults to z=1.0m directly above origin.
+        // Without a valid terminal_state the cost has no target and the
+        // solver produces a "stay in place" solution (drone does not move).
+        this->declare_parameter("hover_target_x", 0.0);
+        this->declare_parameter("hover_target_y", 0.0);
+        this->declare_parameter("hover_target_z", 1.0);
 
         drone_name_      = this->get_parameter("drone_name").as_string();
         logging_enabled_ = this->get_parameter("enable_logging").as_bool();
         std::string ocp  = this->get_parameter("ocp_type").as_string();
         solver_rate_     = this->get_parameter("solver_rate").as_int();
 
+        double tx = this->get_parameter("hover_target_x").as_double();
+        double ty = this->get_parameter("hover_target_y").as_double();
+        double tz = this->get_parameter("hover_target_z").as_double();
+
         // ── MPC ───────────────────────────────────────────────────────────────
         QuadrotorMPC::Config cfg;
         cfg.ocp_type = ocp;
+
+        // Build a valid 13-dim terminal state for the hover OCP.
+        // qw=1 (identity quaternion), everything else zero except position.
+        // An uninitialized or all-zero terminal_state has qw=0 (invalid
+        // quaternion) — HoverOCP receives a degenerate target and produces
+        // a zero-effort "stay in place" solution.
+        cfg.terminal_state = Eigen::VectorXd::Zero(13);
+        cfg.terminal_state(0) = tx;   // px
+        cfg.terminal_state(1) = ty;   // py
+        cfg.terminal_state(2) = tz;   // pz
+        // vel (3-5) = 0
+        cfg.terminal_state(6) = 1.0;  // qw = 1  (identity, upright hover)
+        // qx qy qz (7-9) = 0
+        // angular rates (10-12) = 0
+
+        // ── Shift count ───────────────────────────────────────────────────────
+        // PX4 pattern: set solver_rate = 1/ocp_dt so n_shift = 1 always.
+        // n_shift is stored in the MPC config — not passed per solve call.
+        // We compute it from the OCP's DT constant before constructing the MPC.
+        const double ocp_dt_temp    = (ocp == "hover") ? 0.05 : 0.05; // HoverOCP::DT = LandingOCP::DT
+        const double solver_period  = 1.0 / static_cast<double>(solver_rate_);
+        n_shift_ = std::max(1, static_cast<int>(std::round(solver_period / ocp_dt_temp)));
+        cfg.n_shift = n_shift_;
+
         mpc_.reset(new QuadrotorMPC(cfg));
         ocp_dt_ = mpc_->getOcpDt();
+
+        // ── Alignment check ───────────────────────────────────────────────────
+        // PX4 MPC runs at exactly 1/ocp_dt Hz so n_shift=1 always. Warn if we
+        // deviate — a mismatch means x[1] is not exactly "one ocp_dt step ahead
+        // of the current moment" and accumulated drift will cause the reference
+        // to lag or lead the real trajectory.
+        const double ideal_rate = 1.0 / ocp_dt_;
+        if (std::abs(solver_period - ocp_dt_) > 1e-4) {
+            RCLCPP_WARN(this->get_logger(),
+                "solver_rate (%d Hz, period=%.4fs) != 1/ocp_dt (%.1f Hz, ocp_dt=%.4fs). "
+                "n_shift=%d. Best practice: set solver_rate=%.0f to match ocp_dt.",
+                solver_rate_, solver_period, ideal_rate, ocp_dt_, n_shift_, ideal_rate);
+        }
 
         // ── Initial state — identity quaternion, everything else zero ─────────
         current_state_ = Eigen::VectorXd::Zero(13);
@@ -72,39 +133,35 @@ public:
         //    twist.angular: wx,wy,wz  in deg/s (gyro — converted to rad/s below)
         //
         //    UNIT NOTE: crazyflie_server publishes gyro.x/y/z from firmware
-        //    which logs in deg/s.  Crazyswarm2's _log_odom_data_callback does
+        //    which logs in deg/s. Crazyswarm2's _log_odom_data_callback does
         //    NOT convert them before stuffing into twist.angular, so we apply
-        //    DEG2RAD here.  Verify once: print twist.angular.x while spinning
-        //    — if values are ~100-500 during fast spin they are still deg/s.
+        //    DEG2RAD here. Verify: print twist.angular.x while spinning —
+        //    if values are ~100-500 during fast spin they are still deg/s.
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/" + drone_name_ + "/odom", 10,
             std::bind(&PlannerNode::odomCallback, this, std::placeholders::_1));
 
         // ── Solver timer ──────────────────────────────────────────────────────
-        // This is the only timer.  On every tick it solves the OCP, then
+        // This is the only timer. On every tick it solves the OCP, then
         // immediately publishes x[1] as the new reference for Mellinger.
         //
         // PREVIOUSLY there was also a separate control_timer_ that walked the
         // trajectory index forward between solves using:
         //   idx = 1 + floor(elapsed_since_last_solve / ocp_dt)
-        // The intent was to give Mellinger a "fresh" setpoint between solves
-        // rather than holding x[1] for the entire inter-solve window.
-        //
         // WHY WE REMOVED IT:
-        //   Mellinger is a full-state feedback controller running at ~500 Hz
-        //   on the firmware.  It does not hold a single setpoint — it
-        //   continuously corrects toward whatever reference we give it.  There
-        //   is no benefit in us walking the trajectory index; Mellinger is
-        //   already doing the inner-loop interpolation.  The second timer added
-        //   thread-safety complexity (traj_mutex_, last_solve_time_) with no
-        //   practical gain, so it was removed.
+        //   Mellinger is a full-state feedback controller at ~500 Hz on the
+        //   firmware — it continuously corrects toward whatever reference we
+        //   give it. Walking the index from our side added mutex/thread
+        //   complexity with no practical gain.
         solver_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(1000 / solver_rate_),
             std::bind(&PlannerNode::solverLoop, this));
 
         RCLCPP_INFO(this->get_logger(),
-            "Planner ready  drone=%s  ocp=%s  solver=%dHz  ocp_dt=%.3fs",
-            drone_name_.c_str(), ocp.c_str(), solver_rate_, ocp_dt_);
+            "Planner ready  drone=%s  ocp=%s  solver=%dHz  ocp_dt=%.3fs  n_shift=%d",
+            drone_name_.c_str(), ocp.c_str(), solver_rate_, ocp_dt_, n_shift_);
+        RCLCPP_INFO(this->get_logger(),
+            "Hover target: [%.3f, %.3f, %.3f]", tx, ty, tz);
         RCLCPP_INFO(this->get_logger(),
             "Waiting for /pose AND /odom before starting MPC...");
     }
@@ -146,10 +203,6 @@ private:
 
     // ─────────────────────────────────────────────────────────────────────────
     // Solver loop — runs at solver_rate_ Hz
-    //
-    // Solves the OCP from the current state, then immediately publishes x[1]
-    // as the reference setpoint for Mellinger.  Mellinger's inner loop on the
-    // firmware runs at ~500 Hz and handles tracking between our updates.
     // ─────────────────────────────────────────────────────────────────────────
     void solverLoop()
     {
@@ -177,6 +230,7 @@ private:
                 current_state_(10), current_state_(11), current_state_(12));
         }
 
+        // n_shift_ is baked into config_.n_shift at construction — no per-call arg needed.
         auto result = mpc_->solve(current_state_);
 
         if (result.success) {
@@ -184,14 +238,17 @@ private:
             const auto& U = result.control_trajectory;
 
             // ── Publish x[1] as the reference setpoint ────────────────────────
-            // x[0] is the current measured state (initial condition).
-            // x[1] is the first planned future state — what we want Mellinger
-            // to drive toward before the next solve fires.
+            // x[0] = current measured state (initial condition, not commanded).
+            // x[1] = first planned future state — Mellinger tracks this until
+            //        the next solve fires.
             //
-            // Acceleration feedforward: finite difference of velocity between
-            // x[1] and x[2], divided by the OCP time step.
-            //   a_ff = ( x[2][3:5] - x[1][3:5] ) / dt
-            // If x[1] is the last node, a_ff is zero (safe fallback).
+            // Acceleration feedforward:
+            //   a_ff = ( x[2][3:5] - x[1][3:5] ) / ocp_dt
+            // This is the planned net world-frame acceleration at node 1.
+            // NOTE: currently disabled (zero) because the finite-difference
+            // gives the net acceleration INCLUDING gravity, which double-counts
+            // gravity in Mellinger's thrust computation. Re-enable only after
+            // verifying the frame convention with the firmware.
             Eigen::Vector3d acc_ff = Eigen::Vector3d::Zero();
             // if (X.size() > 2)
             //     acc_ff = (X[2].segment(3, 3) - X[1].segment(3, 3)) / ocp_dt_;
@@ -357,6 +414,7 @@ private:
     bool                          logging_enabled_;
     int                           solver_rate_;
     double                        ocp_dt_ = 0.05;
+    int                           n_shift_ = 1;   // steps to shift warm-start per tick
 
     // Publishers
     rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr cmd_pub_;

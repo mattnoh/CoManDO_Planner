@@ -22,86 +22,129 @@ double QuadrotorMPC::getOcpDt() const {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shift the previous solution one step forward for warm-starting.
+// Shift the warm-start solution forward by n_shift steps.
 //
-// WHAT THE SOLVER ACTUALLY USES:
-//   DDP only reads U as its initial guess. x[0] is the fixed measured state
-//   and x[1..N] are always recomputed by the solver's own forward rollout —
-//   they are overwritten on the very first forward sweep of every iteration.
+// WHY n_shift AND NOT ALWAYS 1:
+//   The solver fires every (1/solver_rate) seconds. The OCP time step is ocp_dt.
+//   Between two solver ticks the drone has consumed:
+//
+//     n_shift = round( solver_period / ocp_dt )
+//
+//   steps of the trajectory. If solver_rate=10Hz and ocp_dt=0.05s, n_shift=2.
+//   Shifting by only 1 leaves the warm-start one step behind where the drone
+//   actually is — after a few solves the reference drifts, the solver has to
+//   work harder each time to reconcile, and the published path looks jagged
+//   as if solving from cold each time.
 //
 // WHAT WE DO WITH prev_X_:
-//   We shift it anyway and keep it in memory. It is NOT passed to the solver
-//   right now. Kept intentionally for future use if we extend the solver backend
-//   to accept an X seed (e.g. a custom initialiser).
+//   Shifted but NOT passed to the solver. DDP always recomputes x[1..N] from
+//   x[0] and U in its own forward rollout — x[1..N] set from outside are
+//   immediately overwritten. Kept for future use if we add an X-seed API.
 //
 // WHAT WE DO WITH prev_U_:
-//   This IS the actual warm-start seed. We shift it forward one step so that
-//   the previous optimal controls initialise the next solve window:
-//     u_warm[k] ← u_prev[k+1]   for k = 0, ..., N-2
-//     u_warm[N-1] ← u_prev[N-1]  (hold last control)
+//   This IS the warm-start seed. After shifting by n_shift:
+//     u_warm[k] = u_prev[k + n_shift]   for k = 0 .. N-1-n_shift
+//     u_warm[k] = u_prev[N-1]           for k = N-n_shift .. N-1  (hold last)
 // ─────────────────────────────────────────────────────────────────────────────
 void QuadrotorMPC::shiftWarmStart() {
     if (prev_X_.size() < 2 || prev_U_.empty()) return;
+    const int Nx = (int)prev_X_.size();
+    const int Nu = (int)prev_U_.size();
+    const int n_shift = std::max(1, std::min(config_.n_shift, Nu - 1));
 
     // Shift X — NOT sent to the solver, kept for future use only.
-    vector<Eigen::VectorXd> sx(prev_X_.size());
-    for (size_t i = 0; i + 1 < prev_X_.size(); ++i) sx[i] = prev_X_[i + 1];
-    sx.back() = prev_X_.back();
-    prev_X_ = move(sx);
+    {
+        vector<Eigen::VectorXd> sx(Nx);
+        for (int i = 0; i < Nx; ++i)
+            sx[i] = prev_X_[std::min(i + n_shift, Nx - 1)];
+        prev_X_ = move(sx);
+    }
 
     // Shift U — this IS the DDP warm-start seed.
-    vector<Eigen::VectorXd> su(prev_U_.size());
-    for (size_t i = 0; i + 1 < prev_U_.size(); ++i) su[i] = prev_U_[i + 1];
-    su.back() = prev_U_.back();
-    prev_U_ = move(su);
+    {
+        vector<Eigen::VectorXd> su(Nu);
+        for (int i = 0; i < Nu; ++i)
+            su[i] = prev_U_[std::min(i + n_shift, Nu - 1)];
+        prev_U_ = move(su);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state) {
-    if (config_.ocp_type == "hover") {
-        problem_ = HoverOCP::create(current_state, config_.terminal_state);
-    }
-    else if (config_.ocp_type == "landing") {
-        problem_ = LandingOCP::create(current_state);
-    }
-    else {
-        cerr << "ERROR: Unknown OCP type: " << config_.ocp_type << "\n";
-        throw runtime_error("Unknown OCP type");
+// Set up (or refresh) the OCP problem and inject the warm-start.
+//
+// KEY DESIGN: when should we call create() vs reuse the existing problem_?
+//
+//   create() builds the entire OCP: dynamics, cost structure, constraints,
+//   and possibly a reference trajectory interpolated from current_state to
+//   terminal_state (depending on the OCP implementation).
+//
+//   If create() re-interpolates a reference trajectory from current_state,
+//   calling it on every solve changes the cost landscape every tick. The
+//   warm-start U from the previous solve is optimal for the OLD landscape —
+//   so the solver ignores it and cold-starts, producing jagged paths.
+//
+//   The fix: call create() ONLY when the problem genuinely changes:
+//     - First solve (cold start)
+//     - Terminal state changed (setTerminalState() called)
+//     - OCP type changed
+//
+//   On subsequent solves we reuse problem_ and only update x[0] and U.
+//   The cost landscape is identical to the previous solve, so the warm-start
+//   U is a valid and good initial guess.
+//
+// NOTE: After reusing problem_, we still recreate the solver object because
+//   ALIPDDP stores internal workspace tied to one problem instance. Recreating
+//   the solver but reusing the problem_ pointer is safe as long as the problem
+//   object outlives the solver.
+// ─────────────────────────────────────────────────────────────────────────────
+void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
+{
+    // ── Rebuild the problem only when necessary ───────────────────────────────
+    if (!problem_ || need_problem_rebuild_) {
+        if (config_.ocp_type == "hover") {
+            problem_ = HoverOCP::create(current_state, config_.terminal_state);
+        }
+        else if (config_.ocp_type == "landing") {
+            problem_ = LandingOCP::create(current_state);
+        }
+        else {
+            cerr << "ERROR: Unknown OCP type: " << config_.ocp_type << "\n";
+            throw runtime_error("Unknown OCP type");
+        }
+        need_problem_rebuild_ = false;
+        // create() already seeded U with a gravity-compensating hover from the
+        // current quaternion and called setInitialState(0, current_state).
+        // On a cold start we leave that seed as-is.
+        return;
     }
 
-    // ── x[0]: always the real measured state ─────────────────────────────────
-    // DDP reads only x[0] from outside. x[1..N] are computed by the solver's
-    // own forward rollout — setting them here would be immediately overwritten.
+    // ── Reuse existing problem — only update x[0] and U ──────────────────────
+    //
+    // DDP reads only x[0] from outside. x[1..N] are always recomputed by the
+    // solver's own forward rollout before the first backward pass.
     problem_->setInitialState(0, current_state);
 
     if (has_prev_solution_) {
-        // ── Warm start ────────────────────────────────────────────────────────
-        // Shift U one step forward and pass it as the initial control sequence.
-        // This overrides whatever create() set for U, which is what we want —
-        // the previous optimal solution is a much better starting point than
-        // the generic gravity-hover seed that create() provides.
+        // Shift U forward by n_shift steps (one step per ocp_dt elapsed).
+        // This overrides whatever the problem currently holds, which is what
+        // we want — the previous optimal solution is a much better seed than
+        // the generic hover create() provided on cold start.
         //
-        // REMOVED: the old code also ran a manual forward rollout here:
-        //   x_next = f(x, u)  →  setInitialState(i+1, x_next)
-        // That was redundant — DDP overwrites x[1..N] in its forward sweep
-        // before any backward pass, so those states had no effect on the solve.
+        // REMOVED (old code): manual forward rollout setting x[1..N] via
+        //   getDynamics(i)->f(x, u) → setInitialState(i+1, ...).
+        // DDP overwrites all of those in its first forward sweep anyway.
         shiftWarmStart();
 
         for (int i = 0; i < (int)prev_U_.size(); ++i)
             problem_->setInitialControl(i, prev_U_[i]);
-
     }
-    // ── Cold start ────────────────────────────────────────────────────────────
-    // No else branch needed. Both HoverOCP::create() and LandingOCP::create()
-    // already seed U with a gravity-compensating hover computed from the actual
-    // current quaternion:
-    //   f0 = q^{-1} * [0, 0, m*g]   (body-frame thrust to cancel gravity)
-    //   u0 = [f0, 0, 0, 0]
-    // This is correct and better than anything we could add here, so we leave it.
+    // If !has_prev_solution_ here, the problem still holds the create() hover
+    // seed from the first call — which is a valid cold-start U.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state) {
+QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
+{
     Result result;
     result.success = false;
     auto t0 = chrono::high_resolution_clock::now();
@@ -134,7 +177,8 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state) {
 
             // Cache full solution for the next warm start.
             // prev_X_ is not read by the solver — stored for future use only.
-            // prev_U_ is the actual warm-start seed passed to the next solve.
+            // prev_U_ is the actual warm-start seed shifted and passed to the
+            // next setupProblem() call.
             prev_X_            = X_result;
             prev_U_            = U_result;
             has_prev_solution_ = true;
@@ -158,6 +202,9 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state) {
 void QuadrotorMPC::setTerminalState(const Eigen::VectorXd& terminal) {
     if (terminal.size() == 13) {
         config_.terminal_state = terminal;
-        has_prev_solution_ = false;
+        has_prev_solution_    = false;
+        // Force create() to be called on the next solve so the new terminal
+        // is reflected in the cost function.
+        need_problem_rebuild_ = true;
     }
 }

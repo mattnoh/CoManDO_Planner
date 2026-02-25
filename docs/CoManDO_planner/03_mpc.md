@@ -1,6 +1,6 @@
 # Chapter 3: How the MPC Works
 
-This chapter describes the internals of `QuadrotorMPC`: how the OCP is structured in terms of x[] and u[], how initial guesses are set, how warm-starting works, and the reasoning behind each design decision.
+This chapter describes the internals of `QuadrotorMPC`: state/control layout, how the receding horizon warm-start works, why the problem is reused rather than recreated, and the reasoning behind each design decision.
 
 ---
 
@@ -13,7 +13,7 @@ X = [ x[0], x[1], ..., x[N] ]       state trajectory   (N+1 nodes)
 U = [ u[0], u[1], ..., u[N-1] ]     control trajectory (N nodes)
 ```
 
-Each x[k] is the 13-dimensional state:
+Each `x[k]` is the 13-dimensional state:
 
 ```
 x[k] = [ px, py, pz,           position       (0:2)
@@ -22,161 +22,187 @@ x[k] = [ px, py, pz,           position       (0:2)
           wx, wy, wz ]          angular rate    (10:12)
 ```
 
-Each u[k] is the 6-dimensional control:
+Each `u[k]` is the 6-dimensional control:
 
 ```
 u[k] = [ fx, fy, fz,           body-frame force   (0:2)
           mx, my, mz ]          body-frame torque  (3:5)
 ```
 
-The dynamics constraint at every step is:
+The dynamics constraint at every step:
 
 ```
 x[k+1] = f( x[k], u[k] )
 ```
 
-where f is the quadrotor rigid-body dynamics integrated over one OCP time step dt.
+where `f` is the quadrotor rigid-body dynamics integrated over one OCP time step `dt`.
 
 ---
 
 ## 2. OCP Types
 
-The OCP formulation is selected by the `ocp_type` parameter. Each type defines its own cost, constraints, horizon length N, and time step dt as static constants.
-
 | `ocp_type` | Class | Terminal condition |
 |---|---|---|
 | `"hover"` | `HoverOCP` | Tracks a user-supplied 13-dim `terminal_state` |
-| `"landing"` | `LandingOCP` | Terminal state embedded in the OCP |
+| `"landing"` | `LandingOCP` | Terminal constraint embedded in the OCP |
 
-Both N and dt are accessed from these constants directly — no runtime query of the problem object is needed.
+`dt` and `HORIZON` are static constants on each class (e.g. `HoverOCP::DT`, `HoverOCP::HORIZON`).
 
 ---
 
 ## 3. What DDP Actually Reads
 
-This is the most important thing to understand about how we set up the problem. DDP (Differential Dynamic Programming) has a specific contract with the caller:
+DDP's contract with the caller:
 
-- **x[0]** — you provide the fixed initial condition (the current measured state)
-- **U = [u[0]..u[N-1]]** — you provide an initial guess for the control sequence
-- **x[1..N]** — the solver computes these itself via a forward rollout before every backward pass
+- **x[0]** — fixed initial condition (current measured state). You provide this.
+- **U = [u[0]..u[N-1]]** — initial guess for the control sequence. You provide this.
+- **x[1..N]** — computed by the solver's own forward rollout. These are always overwritten before the first backward pass regardless of what you set.
 
-x[1..N] are never read from outside. Giving the solver pre-rolled states would have no effect — the first thing ALIPDDP does internally is recompute the entire state trajectory from x[0] and U.
-
----
-
-## 4. Setting Up the Problem — `setupProblem(x_current)`
-
-#### x[0] — always set to the real measured state
-
-```cpp
-problem_->setInitialState(0, current_state);
-```
-
-This is set unconditionally, every solve, before the warm/cold branching. It is the only state the solver reads from outside.
-
-#### Warm start path
-
-On every call after the first successful solve, `has_prev_solution_ = true`. We shift the previous control sequence forward by one step and pass it as the initial U:
-
-```
-U_warm[k]   = U_prev[k+1]    for k = 0, ..., N-2
-U_warm[N-1] = U_prev[N-1]    (hold last control)
-```
-
-Then:
-
-```cpp
-for i in 0..N-1:
-    problem_->setInitialControl(i, U_warm[i])
-```
-
-The solver's forward sweep will then compute x[1..N] from this U_warm and x[0].
-
-**What was removed and why.** The original code also ran a manual forward rollout here:
-
-```cpp
-// OLD — removed:
-Eigen::VectorXd x = current_state;
-for (int i = 0; i < N; ++i) {
-    x_next = problem_->getDynamics(i)->f(x, prev_U_[i]);
-    problem_->setInitialState(i + 1, x_next);
-    x = x_next;
-}
-```
-
-This was redundant. DDP overwrites x[1..N] in its own forward sweep on every iteration before any backward pass runs. The manually set states had zero effect on the solution and were wasted computation. Removed.
-
-#### Cold start path — explicit hover seed
-
-**What we had before.** The OCP was created and nothing was explicitly set for U. Whatever `OCP::create()` left in the control slots — typically zeros — became the initial guess. Zero force means zero thrust, which means the solver's first forward rollout sends the drone through the floor.
-
-**What we do now.** We explicitly fill every u[k] with a gravity-compensating hover equilibrium before handing the problem to the solver:
-
-```
-u_hover = [ 0, 0, m*g, 0, 0, 0 ]   (body fz = weight, no torques)
-
-for i in 0..N-1:
-    problem_->setInitialControl(i, u_hover)
-```
-
-N is read directly from the OCP class constant:
-
-```cpp
-const int N = (config_.ocp_type == "hover")   ? HoverOCP::N   :
-              (config_.ocp_type == "landing") ? LandingOCP::N : 0;
-```
-
-This inlines the lookup at the call site rather than adding a `getOcpN()` method to the class — which would have required a header change and caused a compile error when the declaration was missing.
+x[1..N] passed from outside have no effect. The first thing ALIPDDP does is recompute the entire state trajectory from x[0] and U.
 
 ---
 
-## 5. The prev_X_ Shift — Kept but Not Used by the Solver
+## 4. Receding Horizon: The Shift Count
 
-`shiftWarmStart()` shifts both `prev_X_` and `prev_U_` forward by one step.
+At time `t`, the solver returns the optimal U for the window `[t, t+N*dt]`. The solver fires again at `t + solver_period`. Between those two ticks, the drone has consumed:
 
-`prev_X_` is shifted but is not passed to the solver. As explained above, DDP does not accept an X seed — it always recomputes x[1..N] from U and x[0]. The shifted X is therefore kept in memory but has no effect on the current solution.
+```
+n_shift = round( solver_period / ocp_dt )
+```
 
-It is kept intentionally: if we later extend the solver backend or add a custom initialiser that does accept an X seed, the infrastructure to provide one is already in place.
+steps of the trajectory. The correct warm-start for the new window `[t+solver_period, t+solver_period+N*dt]` is U shifted forward by `n_shift`:
+
+```
+U_warm[k] = U_prev[k + n_shift]    for k = 0 .. N-1-n_shift
+U_warm[k] = U_prev[N-1]            for k = N-n_shift .. N-1   (hold last)
+```
+
+**What went wrong before.** `shiftWarmStart()` always shifted by exactly 1 regardless of `solver_period`. If `solver_period = 100ms` and `ocp_dt = 50ms`, the correct shift is 2. Shifting by 1 left the warm-start one step behind the drone's actual position in the trajectory. After a few solves the reference drifted away from reality, forcing the solver to work increasingly hard to close the gap — and the published trajectory appeared jagged, as if solving from cold each time.
 
 ---
 
-## 6. Calling the Solver
+## 5. Problem Reuse vs Recreation
+
+### What `create()` does
+
+`HoverOCP::create(current_state, terminal_state)` and `LandingOCP::create(current_state)` both accept `current_state` as an argument. Inside, they:
+
+1. Set `x[0] = current_state` on the problem
+2. Seed U with a gravity-compensating hover from the current quaternion: `u0 = [q^{-1} * [0,0,m*g], 0,0,0]`
+3. Possibly build a reference trajectory interpolated from `current_state` to `terminal_state` for running costs
+
+Point 3 is the critical one. If `create()` re-interpolates the reference from the current measured state on every call, calling it every solve creates a **different cost landscape every tick**. The warm-start U that was optimal for the previous landscape is a poor (or irrelevant) seed for the new one. The solver effectively cold-starts every tick — which is exactly the "jagged path" symptom.
+
+### What we do now
+
+`create()` is called **only when the problem genuinely needs to change**:
+
+- First solve ever (cold start, `problem_ == nullptr`)
+- Terminal state changed (`setTerminalState()` sets `need_problem_rebuild_ = true`)
+
+On all other solves we **reuse `problem_`** and only update:
+1. `x[0]` via `setInitialState(0, current_state)` — the solver's initial condition
+2. `U` via `setInitialControl(i, prev_U_[i])` after shifting — the warm-start seed
+
+The cost landscape is identical to the previous solve, so the warm-start U is a valid and strong initial guess.
+
+```
+cold start (first call or terminal changed):
+    problem_ = create(current_state, terminal_state)
+    → U seeded by create() with gravity hover
+    → x[0] set by create()
+
+warm start (all subsequent calls):
+    problem_->setInitialState(0, current_state)
+    shift prev_U_ forward by n_shift
+    problem_->setInitialControl(i, prev_U_[i]) for i in 0..N-1
+    → cost landscape unchanged from previous solve
+    → warm-start U is a good initial guess
+```
+
+### Solver recreation
+
+Even though `problem_` is reused, the solver is still recreated on every call:
 
 ```cpp
 solver_.reset();
 solver_ = make_shared<ALIPDDP<double>>(*problem_);
 solver_->init(solver_params_);
 solver_->solve();
-
-X_result = solver_->getResX();   // [ x[0], x[1], ..., x[N] ]
-U_result = solver_->getResU();   // [ u[0], u[1], ..., u[N-1] ]
 ```
 
-The solver is recreated on every call. All warm-start information is injected through the initial U set on the problem object before `solve()` is called — no state is carried inside the solver itself between calls.
+This is because ALIPDDP stores internal workspace allocated in its constructor. Recreating the solver but passing it the same (updated) `problem_` object is safe and ensures no stale workspace state from the previous iteration.
 
 ---
 
-## 7. Caching the Result
+## 6. The `prev_X_` Shift — Kept, Not Used by Solver
 
-```cpp
-prev_X_ = X_result;   // kept for future use — not read by solver
-prev_U_ = U_result;   // used as warm-start seed for the next solve
-has_prev_solution_ = true;
-```
+`shiftWarmStart()` shifts both `prev_X_` and `prev_U_` forward by `n_shift` steps.
 
-The planner node uses X_result[1] as the published reference for Mellinger (see Chapter 2).
+`prev_X_` is shifted but is **not passed to the solver**. DDP recomputes x[1..N] in its own forward rollout — any states set from outside are immediately overwritten. `prev_X_` is kept in memory for potential future use (e.g. a custom initialiser that does accept an X seed). It has no effect on the current solution.
 
 ---
 
-## 8. Terminal State Update
+## 7. Cold Start Path
 
-For the hover OCP, the terminal reference can be changed at runtime:
+On the first solve (or after `setTerminalState()`), `create()` seeds U with the gravity-compensating hover:
+
+```
+f0 = q_current^{-1} * [0, 0, m*g]   (rotate gravity to body frame)
+u0 = [f0, 0, 0, 0]                   (no torques)
+U = [u0, u0, ..., u0]                (N copies)
+```
+
+This is correct and already uses the real current quaternion — better than any seed we could construct externally. No explicit cold-start code is needed in `setupProblem()`.
+
+---
+
+## 8. Calling the Solver
+
+```
+solve(current_state, n_shift):
+    1. setupProblem(current_state, n_shift)
+       - if cold start: create() → problem_ set, U seeded by create()
+       - if warm start: setInitialState(0, x_current)
+                        shiftWarmStart(n_shift) → prev_U_ shifted
+                        setInitialControl(i, prev_U_[i])
+    2. solver_.reset()
+       solver_ = ALIPDDP(*problem_)
+       solver_.init(params)
+       solver_.solve()
+    3. X_result = solver_.getResX()   → [x[0], x[1], ..., x[N]]
+       U_result = solver_.getResU()   → [u[0], u[1], ..., u[N-1]]
+    4. cache prev_X_ = X_result  (for future use, not read by solver)
+              prev_U_ = U_result  (warm-start seed for next solve)
+              has_prev_solution_ = true
+    5. return X_result[1] as next_state, full X and U in result
+```
+
+---
+
+## 9. Terminal State Update
 
 ```cpp
 mpc_->setTerminalState(new_terminal_13dim);
 ```
 
-This resets `has_prev_solution_ = false` so the next solve runs cold from the hover seed toward the new target.
+This sets `has_prev_solution_ = false` and `need_problem_rebuild_ = true`. The next solve calls `create()` with the new terminal, rebuilding the cost, then runs cold from the hover seed. Subsequent solves reuse the new problem.
+
+---
+
+## 10. Required Header Changes
+
+`quadrotor_mpc.hpp` needs these additions:
+
+```cpp
+// In public:
+Result solve(const Eigen::VectorXd& current_state, int n_shift = 1);
+
+// In private:
+void shiftWarmStart(int n_shift);
+void setupProblem(const Eigen::VectorXd& current_state, int n_shift);
+bool need_problem_rebuild_ = true;
+```
 
 ---
 

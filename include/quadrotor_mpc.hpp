@@ -26,6 +26,12 @@ public:
         Eigen::VectorXd  terminal_state;
         double           max_thrust = 0.6;
 
+        // How many OCP steps to shift the warm-start forward on each solve.
+        // Should equal round( solver_period / ocp_dt ).
+        // When solver_rate == 1/ocp_dt (the recommended setting), this is 1.
+        // Set via PlannerNode at construction time — not changed per-call.
+        int n_shift = 1;
+
         Config() {
             terminal_state = Eigen::VectorXd::Zero(13);
             terminal_state(2) = 1.0;   // hover at z=1 m
@@ -39,33 +45,34 @@ public:
         std::vector<Eigen::VectorXd>  state_trajectory;
         std::vector<Eigen::VectorXd>  control_trajectory;
         double                        solve_time_ms = 0.0;
-        // Wall-clock time at which this result was produced.
-        // The control loop uses this to index into the trajectory correctly.
         std::chrono::steady_clock::time_point solve_timestamp;
     };
 
     explicit QuadrotorMPC(const Config& config = Config());
     ~QuadrotorMPC() = default;
 
+    // solve() signature is unchanged — n_shift is read from config_.n_shift.
+    // PX4 pattern: the caller sets n_shift once at construction via Config,
+    // not on every solve call.
     Result solve(const Eigen::VectorXd& current_state);
-    void   setTerminalState(const Eigen::VectorXd& terminal);
 
-    // Returns the integration DT of the currently selected OCP so the
-    // control loop can compute wall-clock trajectory indices without
-    // hard-coding the value in two places.
+    void   setTerminalState(const Eigen::VectorXd& terminal);
     double getOcpDt() const;
 
 private:
     void setupProblem(const Eigen::VectorXd& current_state);
-    void shiftWarmStart();   // slide previous solution forward by one step
+    void shiftWarmStart();
 
-    Config                                    config_;
+    Config                                         config_;
     std::shared_ptr<OptimalControlProblem<double>> problem_;
-    std::shared_ptr<ALIPDDP<double>>           solver_;
-    Param                                     solver_params_;
+    std::shared_ptr<ALIPDDP<double>>               solver_;
+    Param                                          solver_params_;
 
-    // Warm-start storage: the previous solution shifted one step forward
     std::vector<Eigen::VectorXd>  prev_X_;
     std::vector<Eigen::VectorXd>  prev_U_;
-    bool                          has_prev_solution_ = false;
+    bool                          has_prev_solution_   = false;
+    // Rebuilt on the first solve and whenever setTerminalState() is called.
+    // Avoids re-running create() on every tick — the cost landscape is
+    // identical between solves for the same target.
+    bool                          need_problem_rebuild_ = true;
 };
