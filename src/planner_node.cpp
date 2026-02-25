@@ -261,8 +261,12 @@ private:
             // ── Logging ───────────────────────────────────────────────────────
             if (logging_enabled_ && logging_initialized_) {
                 logActualState();
-                logCommandedState(X[1]);
-                if (!U.empty()) logControl(U[0]);
+                const Eigen::VectorXd& u0 = U.empty() ? Eigen::VectorXd::Zero(6) : U[0];
+                logCommandedState(X[1], u0);
+                if (!first_solve_logged_) {
+                    logFirstTrajectory(X, U);
+                    first_solve_logged_ = true;
+                }
             }
 
             static int diag_count = 0;
@@ -340,16 +344,21 @@ private:
         std::string folder = "./logs/" + drone_name_ + "_flight_" + ts.str();
         std::filesystem::create_directories(folder);
 
-        commanded_state_log_.open(folder + "/commanded_state.csv");
-        actual_state_log_.open(folder    + "/actual_state.csv");
-        control_log_.open(folder         + "/control.csv");
+        commanded_state_log_.open(folder  + "/commanded_state.csv");
+        actual_state_log_.open(folder     + "/actual_state.csv");
+        first_trajectory_log_.open(folder + "/first_solve_trajectory.csv");
 
+        // commanded_state: state + corresponding control at each MPC tick
         if (commanded_state_log_.is_open())
-            commanded_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
+            commanded_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
+                                    "fx,fy,fz,mx,my,mz,thrust_norm\n";
+        // actual_state: sensor data only — no paired control
         if (actual_state_log_.is_open())
             actual_state_log_    << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
-        if (control_log_.is_open())
-            control_log_         << "timestamp,fx,fy,fz,mx,my,mz,thrust_norm\n";
+        // first_solve_trajectory: full X[0..N] and U[0..N-1] from the cold-start solve
+        if (first_trajectory_log_.is_open())
+            first_trajectory_log_ << "node,t,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
+                                     "fx,fy,fz,mx,my,mz,thrust_norm\n";
 
         RCLCPP_INFO(this->get_logger(), "Logging to: %s", folder.c_str());
     }
@@ -357,6 +366,38 @@ private:
     double wallTimeSec()
     {
         return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+    }
+
+    void logFirstTrajectory(const std::vector<Eigen::VectorXd>& traj,
+                            const std::vector<Eigen::VectorXd>& ctrls)
+    {
+        if (!first_trajectory_log_.is_open()) return;
+        // Each row: node index, time along horizon, full 13-dim state, 6-dim control + thrust_norm.
+        // The terminal node (i == N) has no paired control — write zeros for the control columns.
+        for (int i = 0; i < (int)traj.size(); ++i) {
+            const auto& s = traj[i];
+            if (s.size() < 13) continue;
+            double t = i * ocp_dt_;
+            first_trajectory_log_ << std::fixed << std::setprecision(6)
+                << i << "," << t;
+            for (int j = 0; j < 13; ++j)
+                first_trajectory_log_ << "," << s(j);
+            // Control: use U[i] if available, otherwise zeros for terminal node
+            if (i < (int)ctrls.size() && ctrls[i].size() >= 6) {
+                const auto& u = ctrls[i];
+                Eigen::Vector3d f = u.segment(0, 3);
+                first_trajectory_log_ << "," << f(0) << "," << f(1) << "," << f(2)
+                                      << "," << u(3) << "," << u(4) << "," << u(5)
+                                      << "," << f.norm();
+            } else {
+                first_trajectory_log_ << ",0,0,0,0,0,0,0";
+            }
+            first_trajectory_log_ << "\n";
+        }
+        first_trajectory_log_.flush();
+        RCLCPP_INFO(this->get_logger(),
+            "First solve trajectory saved (%zu nodes, %.2fs horizon)",
+            traj.size(), (traj.size() - 1) * ocp_dt_);
     }
 
     void logActualState()
@@ -368,25 +409,22 @@ private:
         actual_state_log_.flush();
     }
 
-    void logCommandedState(const Eigen::VectorXd& s)
+    void logCommandedState(const Eigen::VectorXd& s, const Eigen::VectorXd& u)
     {
         if (!commanded_state_log_.is_open() || s.size() < 13) return;
         commanded_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
         for (int i = 0; i < 13; ++i) commanded_state_log_ << "," << s(i);
+        // Append paired control (U[0] — the control applied at this tick)
+        if (u.size() >= 6) {
+            Eigen::Vector3d f = u.segment(0, 3);
+            commanded_state_log_ << "," << f(0) << "," << f(1) << "," << f(2)
+                                 << "," << u(3) << "," << u(4) << "," << u(5)
+                                 << "," << f.norm();
+        } else {
+            commanded_state_log_ << ",0,0,0,0,0,0,0";
+        }
         commanded_state_log_ << "\n";
         commanded_state_log_.flush();
-    }
-
-    void logControl(const Eigen::VectorXd& u)
-    {
-        if (!control_log_.is_open() || u.size() < 6) return;
-        Eigen::Vector3d f = u.segment(0, 3);
-        Eigen::Vector3d m = u.segment(3, 3);
-        control_log_ << std::fixed << std::setprecision(6) << wallTimeSec()
-                     << "," << f(0) << "," << f(1) << "," << f(2)
-                     << "," << m(0) << "," << m(1) << "," << m(2)
-                     << "," << f.norm() << "\n";
-        control_log_.flush();
     }
 
     void printDiagnostics(const QuadrotorMPC::Result& result)
@@ -435,9 +473,10 @@ private:
 
     // Logging
     bool logging_initialized_ = false;
-    std::ofstream commanded_state_log_;
-    std::ofstream actual_state_log_;
-    std::ofstream control_log_;
+    std::ofstream commanded_state_log_;   // state[1..] + paired U[0] per tick
+    std::ofstream actual_state_log_;      // sensor state only — no paired control
+    std::ofstream first_trajectory_log_;  // full X[0..N] + U[0..N-1] from first solve
+    bool          first_solve_logged_ = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

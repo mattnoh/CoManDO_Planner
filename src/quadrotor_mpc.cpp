@@ -6,13 +6,36 @@
 using namespace std;
 
 QuadrotorMPC::QuadrotorMPC(const Config& config) : config_(config) {
-    solver_params_.reg1_min  = 1e-6;
-    solver_params_.reg2_min  = 1.0;
-    solver_params_.mu_mul    = 0.1;
-    solver_params_.rho       = 20.0;
-    solver_params_.rho_mul   = 9.0;
-    solver_params_.tolerance = 1e-3;
-    solver_params_.max_iter  = 200;
+    // Solver parameters are defined per-OCP in the header files.
+    // Each OCP tunes these independently: hover needs fewer iterations and
+    // lower rho (simple quadratic, one inequality), landing needs higher rho
+    // and more iterations (SOC constraints + soft terminal cost).
+    if (config_.ocp_type == "hover") {
+        solver_params_.reg1_min  = HoverOCP::SOLVER_REG1_MIN;
+        solver_params_.reg2_min  = HoverOCP::SOLVER_REG2_MIN;
+        solver_params_.mu_mul    = HoverOCP::SOLVER_MU_MUL;
+        solver_params_.rho       = HoverOCP::SOLVER_RHO;
+        solver_params_.rho_mul   = HoverOCP::SOLVER_RHO_MUL;
+        solver_params_.tolerance = HoverOCP::SOLVER_TOLERANCE;
+        solver_params_.max_iter  = HoverOCP::SOLVER_MAX_ITER;
+    } else if (config_.ocp_type == "landing") {
+        solver_params_.reg1_min  = LandingOCP::SOLVER_REG1_MIN;
+        solver_params_.reg2_min  = LandingOCP::SOLVER_REG2_MIN;
+        solver_params_.mu_mul    = LandingOCP::SOLVER_MU_MUL;
+        solver_params_.rho       = LandingOCP::SOLVER_RHO;
+        solver_params_.rho_mul   = LandingOCP::SOLVER_RHO_MUL;
+        solver_params_.tolerance = LandingOCP::SOLVER_TOLERANCE;
+        solver_params_.max_iter  = LandingOCP::SOLVER_MAX_ITER;
+    } else {
+        // Fallback defaults
+        solver_params_.reg1_min  = 1e-6;
+        solver_params_.reg2_min  = 1.0;
+        solver_params_.mu_mul    = 0.1;
+        solver_params_.rho       = 20.0;
+        solver_params_.rho_mul   = 9.0;
+        solver_params_.tolerance = 1e-3;
+        solver_params_.max_iter  = 200;
+    }
 }
 
 double QuadrotorMPC::getOcpDt() const {

@@ -25,6 +25,17 @@ const double FMAX        = 1.2;                   // N (standalone used 1.2)
 const double GLIDESLOPE  = 70.0;                  // degrees (unchanged)
 const double THRUST_CONE = 60.0;                   // degrees (standalone used 60°)
 
+// ── Solver parameters ────────────────────────────────────────────────────────
+// Tuned for landing: SOC constraints + soft terminal cost need higher rho
+// and more iterations than hover to fully converge the descent trajectory.
+const double SOLVER_REG1_MIN  = 1e-6;
+const double SOLVER_REG2_MIN  = 1.0;
+const double SOLVER_MU_MUL    = 0.1;
+const double SOLVER_RHO       = 50.0;
+const double SOLVER_RHO_MUL   = 9.0;
+const double SOLVER_TOLERANCE = 1e-3;
+const int    SOLVER_MAX_ITER  = 300;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage cost (mirroring standalone solve)
 // ─────────────────────────────────────────────────────────────────────────────

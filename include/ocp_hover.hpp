@@ -29,6 +29,17 @@ const double W_VEL_TERM   = 50.0;
 
 const double FMAX         = 1.2;
 
+// ── Solver parameters ────────────────────────────────────────────────────────
+// Tuned for hover: simple quadratic costs, one inequality constraint.
+// Converges quickly — rho and max_iter are kept conservative.
+const double SOLVER_REG1_MIN  = 1e-6;
+const double SOLVER_REG2_MIN  = 1.0;
+const double SOLVER_MU_MUL    = 0.1;
+const double SOLVER_RHO       = 10.0;
+const double SOLVER_RHO_MUL   = 5.0;
+const double SOLVER_TOLERANCE = 1e-3;
+const int    SOLVER_MAX_ITER  = 100;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage cost — runtime target
 //
