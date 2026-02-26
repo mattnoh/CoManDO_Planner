@@ -135,6 +135,7 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
             throw runtime_error("Unknown OCP type");
         }
         need_problem_rebuild_ = false;
+        solver_.reset();  // force solver re-init on next solve() call since problem changed
         // create() already seeded U with a gravity-compensating hover from the
         // current quaternion and called setInitialState(0, current_state).
         // On a cold start we leave that seed as-is.
@@ -156,10 +157,10 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
         // REMOVED (old code): manual forward rollout setting x[1..N] via
         //   getDynamics(i)->f(x, u) → setInitialState(i+1, ...).
         // DDP overwrites all of those in its first forward sweep anyway.
-        shiftWarmStart();
+        // shiftWarmStart();
 
-        for (int i = 0; i < (int)prev_U_.size(); ++i)
-            problem_->setInitialControl(i, prev_U_[i]);
+        // for (int i = 0; i < (int)prev_U_.size(); ++i)
+        //     problem_->setInitialControl(i, prev_U_[i]);
     }
     // If !has_prev_solution_ here, the problem still holds the create() hover
     // seed from the first call — which is a valid cold-start U.
@@ -180,9 +181,26 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
             return result;
         }
 
-        solver_.reset();
-        solver_ = make_shared<ALIPDDP<double>>(*problem_);
-        solver_->init(solver_params_);
+        // ── Create and init solver ONCE per problem lifetime ──────────────────
+        // Recreating the solver every tick resets AL multipliers (lambda, Y, S,
+        // Z, R) to zero, forcing a cold start every iteration even with a good
+        // U warm-start. Persisting the solver lets the multipliers carry over
+        // so subsequent solves start near the previous solution.
+        //
+        // NOTE: the solver's internal ocp is a copy made at construction time —
+        // calling problem_->setInitialState/Control() after construction has no
+        // effect on the solver. We must use warmStart() to inject x[0] and U
+        // directly into the solver's internal X[0] and U arrays.
+        if (!solver_) {
+            solver_ = make_shared<ALIPDDP<double>>(*problem_);
+            solver_->init(solver_params_);
+        } else {
+            // Shift warm-start U forward by n_shift steps, then inject
+            // x[0] and U directly into the solver without touching multipliers.
+            shiftWarmStart();
+            solver_->warmStart(current_state, prev_U_);
+        }
+
         solver_->solve();
 
         auto X_result = solver_->getResX();

@@ -34,7 +34,7 @@ const double SOLVER_MU_MUL    = 0.1;
 const double SOLVER_RHO       = 50.0;
 const double SOLVER_RHO_MUL   = 9.0;
 const double SOLVER_TOLERANCE = 1e-3;
-const int    SOLVER_MAX_ITER  = 300;
+const int    SOLVER_MAX_ITER  = 500;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage cost (mirroring standalone solve)
@@ -135,12 +135,26 @@ public:
 template <typename Scalar>
 class TerminalCost : public TerminalCostBase<Scalar> {
 public:
-    Scalar p(const Vector<Scalar>& x) const override { (void)x; return 0.0; }
-    Vector<Scalar> px(const Vector<Scalar>& x) const override {
-        return Vector<Scalar>::Zero(x.size());
+Scalar p(const Vector<Scalar>& x) const override {
+    Scalar pos_cost = 500.0 * (x(0)*x(0) + x(1)*x(1) + x(2)*x(2));
+    Scalar vel_cost = 100.0 * x.template segment<3>(3).squaredNorm();
+    return pos_cost + vel_cost;
+}
+Vector<Scalar> px(const Vector<Scalar>& x) const override {
+        Vector<Scalar> grad = Vector<Scalar>::Zero(x.size());
+        grad(0) = 1000.0 * x(0);
+        grad(1) = 1000.0 * x(1);
+        grad(2) = 1000.0 * x(2);
+        grad.template segment<3>(3) = 200.0 * x.template segment<3>(3);
+        return grad;
     }
     Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
-        return Matrix<Scalar>::Zero(x.size(), x.size());
+        Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
+        H(0, 0) = 1000.0;
+        H(1, 1) = 1000.0;
+        H(2, 2) = 1000.0;
+        H.template block<3,3>(3, 3) = 200.0 * Matrix<Scalar>::Identity(3, 3);
+        return H;
     }
 };
 
