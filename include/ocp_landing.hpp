@@ -1,3 +1,6 @@
+/// @file ocp_landing.hpp
+/// @brief OCP formulation for landing problem (for online replanning)
+
 #pragma once
 
 #include <Eigen/Dense>
@@ -10,7 +13,7 @@ namespace LandingOCP {
 const int    HORIZON = 100;                     // 10 s horizon (dt=0.05 → 5 s? Wait: 100*0.05=5s) 
                                                  // Standalone said "10 s horizon (dt=0.05)" but 100*0.05=5s. 
                                                  // Keep as given: HORIZON=100, DT=0.05 → 5s horizon.
-const double DT      = 0.05;                     // seconds
+const double DT      = 0.07;                      // seconds
 const double MASS    = 0.027;                    // kg
 
 // Scale inertia so that the diagonal entries become ~O(1)
@@ -21,6 +24,7 @@ const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
     0.0, 0.0, 2.92e-5 * J_SCALE).finished();
 
 // ── Constraint parameters (standalone values) ─────────────────────────────────
+const double FMIN        = 0.08;                  // N — 30% hover thrust
 const double FMAX        = 1.2;                   // N (standalone used 1.2)
 const double GLIDESLOPE  = 70.0;                  // degrees (unchanged)
 const double THRUST_CONE = 60.0;                   // degrees (standalone used 60°)
@@ -29,12 +33,13 @@ const double THRUST_CONE = 60.0;                   // degrees (standalone used 6
 // Tuned for landing: SOC constraints + soft terminal cost need higher rho
 // and more iterations than hover to fully converge the descent trajectory.
 const double SOLVER_REG1_MIN  = 1e-6;
-const double SOLVER_REG2_MIN  = 1.0;
+const double SOLVER_REG2_MIN  = 1e-4;
 const double SOLVER_MU_MUL    = 0.1;
 const double SOLVER_RHO       = 50.0;
 const double SOLVER_RHO_MUL   = 9.0;
 const double SOLVER_TOLERANCE = 1e-3;
-const int    SOLVER_MAX_ITER  = 500;
+const int    SOLVER_MAX_ITER  = 100;
+const double SOLVER_RHOT = 50.0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage cost (mirroring standalone solve)
@@ -135,25 +140,21 @@ public:
 template <typename Scalar>
 class TerminalCost : public TerminalCostBase<Scalar> {
 public:
-Scalar p(const Vector<Scalar>& x) const override {
-    Scalar pos_cost = 500.0 * (x(0)*x(0) + x(1)*x(1) + x(2)*x(2));
-    Scalar vel_cost = 100.0 * x.template segment<3>(3).squaredNorm();
-    return pos_cost + vel_cost;
-}
-Vector<Scalar> px(const Vector<Scalar>& x) const override {
-        Vector<Scalar> grad = Vector<Scalar>::Zero(x.size());
-        grad(0) = 1000.0 * x(0);
-        grad(1) = 1000.0 * x(1);
-        grad(2) = 1000.0 * x(2);
-        grad.template segment<3>(3) = 200.0 * x.template segment<3>(3);
-        return grad;
+    Scalar p(const Vector<Scalar>& x) const override {
+        return 200.0 * x.template segment<3>(0).squaredNorm()
+             +  50.0 * x.template segment<3>(3).squaredNorm();
+    }
+    Vector<Scalar> px(const Vector<Scalar>& x) const override {
+        Vector<Scalar> g = Vector<Scalar>::Zero(x.size());
+        g.template segment<3>(0) = 400.0 * x.template segment<3>(0);
+        g.template segment<3>(3) = 100.0 * x.template segment<3>(3);
+        return g;
     }
     Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
+        (void)x;
         Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
-        H(0, 0) = 1000.0;
-        H(1, 1) = 1000.0;
-        H(2, 2) = 1000.0;
-        H.template block<3,3>(3, 3) = 200.0 * Matrix<Scalar>::Identity(3, 3);
+        H.template block<3,3>(0,0) = 400.0 * Matrix<Scalar>::Identity(3,3);
+        H.template block<3,3>(3,3) = 100.0 * Matrix<Scalar>::Identity(3,3);
         return H;
     }
 };
@@ -191,6 +192,34 @@ public:
         if (nf > 1e-8)
             J.template block<1,3>(0, 0) = -f.transpose() / nf;
         return -J;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Min thrust constraint (nonnegative orthant)
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Scalar>
+class MinThrustConstraint : public StageConstraintBase<Scalar> {
+public:
+    MinThrustConstraint() {
+        this->constraint_type = ConstraintType::NO;
+        this->dim_c = 1;
+    }
+    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x;
+        Vector<Scalar> c_n(1);
+        c_n(0) = FMIN - u(2);
+        return c_n;
+    }
+    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        return Matrix<Scalar>::Zero(1, x.size());
+    }
+    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        (void)x; (void)u;
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(1, u.size());
+        J(0, 2) = -1.0;
+        return J;
     }
 };
 
@@ -324,8 +353,8 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     // Stage cost: weights exactly as in standalone
     for (int i = 0; i < HORIZON; ++i)
         prob->setStageCost(i, std::make_shared<StageCost<double>>(
-            1e-5,    // thrust_weight
-            1e-4,    // moment_weight
+            1e-9,    // thrust_weight
+            1e-9,    // moment_weight
             2.0,     // attitude_weight
             0.0      // pos_weight (no running position cost)
         ));
@@ -339,10 +368,12 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     auto gs = std::make_shared<GlideslopeConstraint<double>>(GLIDESLOPE);
     auto tc = std::make_shared<ThrustConeConstraint<double>>(THRUST_CONE);
     auto mt = std::make_shared<MaxThrustConstraint<double>>(FMAX);
+    auto fmin = std::make_shared<MinThrustConstraint<double>>();
     for (int i = 0; i < HORIZON; ++i) {
         prob->addStageConstraint(i, gs);
         prob->addStageConstraint(i, tc);
         prob->addStageConstraint(i, mt);
+        prob->addStageConstraint(i, fmin);
     }
 
     // Initial state

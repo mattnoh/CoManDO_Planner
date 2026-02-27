@@ -18,6 +18,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <crazyflie_interfaces/msg/full_state.hpp>
 #include "quadrotor_mpc.hpp"
+#include "ocp_registry.hpp"
 
 #include <chrono>
 #include <memory>
@@ -34,35 +35,26 @@ using Clock     = std::chrono::steady_clock;
 class PlannerNode : public rclcpp::Node {
 public:
     PlannerNode() : Node("comando_planner") {
-        // ── Parameters ────────────────────────────────────────────────────────
-        this->declare_parameter("drone_name",     "cf_1");
-        this->declare_parameter("enable_logging", true);
-        this->declare_parameter("ocp_type",       "hover");
-        // PX4 MPC PATTERN: set solver_rate = 1/ocp_dt so that the solver fires
-        // exactly once per OCP step. This makes n_shift = 1 always — the cleanest
-        // receding-horizon design with no timing drift or rounding.
-        //
-        // HoverOCP::DT = LandingOCP::DT = 0.05 s  →  default 20 Hz.
-        //
-        // If you change this to a different rate, n_shift = round(period/ocp_dt)
-        // compensates, but any mismatch between the solve time and the OCP step
-        // means x[1] you publish is no longer "one step ahead of now" — it is
-        // either behind (n_shift too small) or ahead (n_shift too large).
-        this->declare_parameter("solver_rate",    20);
+        // ── Parameters (ROS2 ordering: declare ALL before getting ANY) ────────
+        // Step 1: Declare ocp_type first, get it immediately
+        this->declare_parameter("ocp_type", std::string("hover"));
+        std::string ocp = this->get_parameter("ocp_type").as_string();
 
-        // Hover target — used only when ocp_type == "hover".
-        // The terminal state is a valid hover at this position with:
-        //   vel = 0, qw = 1 (identity), angular rates = 0.
-        // If not set by the user, defaults to z=1.0m directly above origin.
-        // Without a valid terminal_state the cost has no target and the
-        // solver produces a "stay in place" solution (drone does not move).
+        // Step 2: Now compute default_solver_rate from the known ocp
+        const double ocp_dt_temp = OCPRegistry::getDT(ocp);
+        const int default_solver_rate = static_cast<int>(std::round(1.0 / ocp_dt_temp));
+
+        // Step 3: Declare remaining params (solver_rate default is now correct)
+        this->declare_parameter("drone_name",     std::string("cf_1"));
+        this->declare_parameter("enable_logging", true);
+        this->declare_parameter("solver_rate",    default_solver_rate);
         this->declare_parameter("hover_target_x", 0.0);
         this->declare_parameter("hover_target_y", 0.0);
         this->declare_parameter("hover_target_z", 1.0);
 
+        // Step 4: Get all parameters
         drone_name_      = this->get_parameter("drone_name").as_string();
         logging_enabled_ = this->get_parameter("enable_logging").as_bool();
-        std::string ocp  = this->get_parameter("ocp_type").as_string();
         solver_rate_     = this->get_parameter("solver_rate").as_int();
 
         double tx = this->get_parameter("hover_target_x").as_double();
@@ -90,9 +82,7 @@ public:
         // ── Shift count ───────────────────────────────────────────────────────
         // PX4 pattern: set solver_rate = 1/ocp_dt so n_shift = 1 always.
         // n_shift is stored in the MPC config — not passed per solve call.
-        // We compute it from the OCP's DT constant before constructing the MPC.
-        const double ocp_dt_temp    = (ocp == "hover") ? 0.05 : 0.05; // HoverOCP::DT = LandingOCP::DT
-        const double solver_period  = 1.0 / static_cast<double>(solver_rate_);
+        const double solver_period = 1.0 / static_cast<double>(solver_rate_);
         n_shift_ = std::max(1, static_cast<int>(std::round(solver_period / ocp_dt_temp)));
         cfg.n_shift = n_shift_;
 

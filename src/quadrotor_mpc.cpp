@@ -1,47 +1,29 @@
 #include "quadrotor_mpc.hpp"
-#include "ocp_hover.hpp"
-#include "ocp_landing.hpp"
+#include "ocp_registry.hpp"
 #include <iostream>
 
 using namespace std;
 
 QuadrotorMPC::QuadrotorMPC(const Config& config) : config_(config) {
-    // Solver parameters are defined per-OCP in the header files.
+    // Solver parameters are defined per-OCP in ocp_registry.hpp.
     // Each OCP tunes these independently: hover needs fewer iterations and
     // lower rho (simple quadratic, one inequality), landing needs higher rho
     // and more iterations (SOC constraints + soft terminal cost).
-    if (config_.ocp_type == "hover") {
-        solver_params_.reg1_min  = HoverOCP::SOLVER_REG1_MIN;
-        solver_params_.reg2_min  = HoverOCP::SOLVER_REG2_MIN;
-        solver_params_.mu_mul    = HoverOCP::SOLVER_MU_MUL;
-        solver_params_.rho       = HoverOCP::SOLVER_RHO;
-        solver_params_.rho_mul   = HoverOCP::SOLVER_RHO_MUL;
-        solver_params_.tolerance = HoverOCP::SOLVER_TOLERANCE;
-        solver_params_.max_iter  = HoverOCP::SOLVER_MAX_ITER;
-    } else if (config_.ocp_type == "landing") {
-        solver_params_.reg1_min  = LandingOCP::SOLVER_REG1_MIN;
-        solver_params_.reg2_min  = LandingOCP::SOLVER_REG2_MIN;
-        solver_params_.mu_mul    = LandingOCP::SOLVER_MU_MUL;
-        solver_params_.rho       = LandingOCP::SOLVER_RHO;
-        solver_params_.rho_mul   = LandingOCP::SOLVER_RHO_MUL;
-        solver_params_.tolerance = LandingOCP::SOLVER_TOLERANCE;
-        solver_params_.max_iter  = LandingOCP::SOLVER_MAX_ITER;
-    } else {
-        // Fallback defaults
-        solver_params_.reg1_min  = 1e-6;
-        solver_params_.reg2_min  = 1.0;
-        solver_params_.mu_mul    = 0.1;
-        solver_params_.rho       = 20.0;
-        solver_params_.rho_mul   = 9.0;
-        solver_params_.tolerance = 1e-3;
-        solver_params_.max_iter  = 200;
+    try {
+        solver_params_ = OCPRegistry::getSolverParams(config_.ocp_type);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "ERROR: " << e.what() << "\n";
+        throw;
     }
 }
 
 double QuadrotorMPC::getOcpDt() const {
-    if (config_.ocp_type == "hover")   return HoverOCP::DT;
-    if (config_.ocp_type == "landing") return LandingOCP::DT;
-    return config_.dt;
+    try {
+        return OCPRegistry::getDT(config_.ocp_type);
+    } catch (const std::runtime_error& e) {
+        std::cerr << "ERROR: " << e.what() << "\n";
+        return config_.dt;  // fallback
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,15 +106,11 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
 {
     // ── Rebuild the problem only when necessary ───────────────────────────────
     if (!problem_ || need_problem_rebuild_) {
-        if (config_.ocp_type == "hover") {
-            problem_ = HoverOCP::create(current_state, config_.terminal_state);
-        }
-        else if (config_.ocp_type == "landing") {
-            problem_ = LandingOCP::create(current_state);
-        }
-        else {
-            cerr << "ERROR: Unknown OCP type: " << config_.ocp_type << "\n";
-            throw runtime_error("Unknown OCP type");
+        try {
+            problem_ = OCPRegistry::create(config_.ocp_type, current_state, config_.terminal_state);
+        } catch (const std::runtime_error& e) {
+            std::cerr << "ERROR: " << e.what() << "\n";
+            throw;
         }
         need_problem_rebuild_ = false;
         solver_.reset();  // force solver re-init on next solve() call since problem changed

@@ -1,0 +1,63 @@
+/// @file ocp_registry.hpp
+/// @brief Centralized OCP lookup and factory — reduces duplication and eases adding new OCPs
+
+#pragma once
+
+#include "ocp_hover.hpp"
+#include "ocp_landing.hpp"
+// future: #include "ocp_tracking.hpp"
+// future: #include "ocp_avoid.hpp"
+
+#include <string>
+#include <stdexcept>
+#include <memory>
+#include "optimal_control_problem.h"
+#include "alipddp/alipddp.h"
+
+namespace OCPRegistry {
+
+// ── Per-OCP DT lookup — add one line per new OCP ─────────────────────────────
+inline double getDT(const std::string& ocp_type) {
+    if (ocp_type == "hover")   return HoverOCP::DT;
+    if (ocp_type == "landing") return LandingOCP::DT;
+    throw std::runtime_error("Unknown OCP type: " + ocp_type);
+}
+
+// ── Per-OCP solver params lookup ──────────────────────────────────────────────
+inline Param getSolverParams(const std::string& ocp_type) {
+    Param p;
+    if (ocp_type == "hover") {
+        p.reg1_min  = HoverOCP::SOLVER_REG1_MIN;
+        p.reg2_min  = HoverOCP::SOLVER_REG2_MIN;
+        p.mu_mul    = HoverOCP::SOLVER_MU_MUL;
+        p.rho       = HoverOCP::SOLVER_RHO;
+        p.rho_mul   = HoverOCP::SOLVER_RHO_MUL;
+        p.tolerance = HoverOCP::SOLVER_TOLERANCE;
+        p.max_iter  = HoverOCP::SOLVER_MAX_ITER;
+    } else if (ocp_type == "landing") {
+        p.reg1_min  = LandingOCP::SOLVER_REG1_MIN;
+        p.reg2_min  = LandingOCP::SOLVER_REG2_MIN;
+        p.mu_mul    = LandingOCP::SOLVER_MU_MUL;
+        p.rho       = LandingOCP::SOLVER_RHO;
+        p.rho_mul   = LandingOCP::SOLVER_RHO_MUL;
+        p.tolerance = LandingOCP::SOLVER_TOLERANCE;
+        p.max_iter  = LandingOCP::SOLVER_MAX_ITER;
+        p.rhoT      = LandingOCP::SOLVER_RHOT;
+    } else {
+        throw std::runtime_error("Unknown OCP type: " + ocp_type);
+    }
+    return p;
+}
+
+// ── Factory — returns a ready-to-solve problem ────────────────────────────────
+inline std::shared_ptr<OptimalControlProblem<double>> create(
+    const std::string& ocp_type,
+    const Eigen::VectorXd& current_state,
+    const Eigen::VectorXd& terminal_state = Eigen::VectorXd())
+{
+    if (ocp_type == "hover")   return HoverOCP::create(current_state, terminal_state);
+    if (ocp_type == "landing") return LandingOCP::create(current_state);
+    throw std::runtime_error("Unknown OCP type: " + ocp_type);
+}
+
+} // namespace OCPRegistry
