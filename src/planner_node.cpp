@@ -262,73 +262,30 @@ private:
 
     void cfPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
     {
-        // Fallback: only used until the first /odom arrives.
-        // Once odom_received_ is true, /odom is the authoritative source
-        // for ALL 13 states (temporally consistent).
-        if (!odom_received_) {
-            current_state_(0) = msg->pose.position.x;
-            current_state_(1) = msg->pose.position.y;
-            current_state_(2) = msg->pose.position.z;
-            current_state_(6) = msg->pose.orientation.w;
-            current_state_(7) = msg->pose.orientation.x;
-            current_state_(8) = msg->pose.orientation.y;
-            current_state_(9) = msg->pose.orientation.z;
-        }
+        // Motion-capture position + quaternion — always authoritative
+        current_state_(0) = msg->pose.position.x;
+        current_state_(1) = msg->pose.position.y;
+        current_state_(2) = msg->pose.position.z;
+        current_state_(6) = msg->pose.orientation.w;  // qw
+        current_state_(7) = msg->pose.orientation.x;  // qx
+        current_state_(8) = msg->pose.orientation.y;  // qy
+        current_state_(9) = msg->pose.orientation.z;  // qz
         pose_received_ = true;
     }
 
     void cfOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
-        // ── Read ALL 13 state components from the single odom message ─────
-        // The /odom topic's pose and twist come from the SAME firmware log
-        // sample, so they are temporally consistent.  Previously, position
-        // + quaternion came from /pose and velocity + angular rate from
-        // /odom — two independent log configs that fire at different times.
-        // During aggressive maneuvering this created physically impossible
-        // states (e.g. identity quaternion + 191 deg/s angular rate) that
-        // caused the solver to diverge on the second solve.
-        //
-        // NOTE on pitch sign: The Crazyswarm2 Python server's /pose callback
-        // negates pitch (line 615: pitch = -1*stabilizer.pitch) while the
-        // /odom callback does NOT (line 663).  This is a known inconsistency
-        // in crazyswarm2.  We use the odom quaternion directly here.  For a
-        // drone near hover the difference is negligible; both converge to
-        // identity.  For large pitch angles we may revisit with an explicit
-        // correction, but temporal consistency is far more important.
-
-        // Position (world frame, m)
-        current_state_(0) = msg->pose.pose.position.x;
-        current_state_(1) = msg->pose.pose.position.y;
-        current_state_(2) = msg->pose.pose.position.z;
-
-        // Velocity (world frame, m/s — from Kalman filter statePX/PY/PZ)
+        // World-frame velocity from Kalman filter (m/s)
         current_state_(3) = msg->twist.twist.linear.x;
         current_state_(4) = msg->twist.twist.linear.y;
         current_state_(5) = msg->twist.twist.linear.z;
 
-        // Quaternion (FRD→FLU frame correction)
-        // Crazyflie firmware uses FRD (front-right-down), but MPC is in FLU (front-left-up).
-        // Qx stays the same; Qy and Qz flip sign.
-        current_state_(6) = msg->pose.pose.orientation.w;
-        current_state_(7) = msg->pose.pose.orientation.x;      // qx unchanged
-        current_state_(8) = -msg->pose.pose.orientation.y;     // qy flips sign (FRD→FLU)
-        current_state_(9) = -msg->pose.pose.orientation.z;     // qz flips sign (FRD→FLU)
-
-        // Angular rate (body frame, gyro.x/y/z — in deg/s → rad/s)
-        // Apply same FRD→FLU correction to angular rates
+        // Body-frame angular rates from gyro — firmware logs in deg/s
         constexpr double DEG2RAD = M_PI / 180.0;
-        Eigen::Vector3d raw_omega;
-        raw_omega(0) = msg->twist.twist.angular.x * DEG2RAD;
-        raw_omega(1) = -msg->twist.twist.angular.y * DEG2RAD;
-        raw_omega(2) = -msg->twist.twist.angular.z * DEG2RAD;
+        current_state_(10) = msg->twist.twist.angular.x * DEG2RAD;
+        current_state_(11) = msg->twist.twist.angular.y * DEG2RAD;
+        current_state_(12) = msg->twist.twist.angular.z * DEG2RAD;
 
-        // EMA filter on angular rates: attenuates IMU noise/transients from Mellinger's inner loop
-        filtered_omega_ = OMEGA_FILTER_ALPHA * raw_omega + (1.0 - OMEGA_FILTER_ALPHA) * filtered_omega_;
-        current_state_(10) = filtered_omega_(0);
-        current_state_(11) = filtered_omega_(1);
-        current_state_(12) = filtered_omega_(2);
-
-        pose_received_ = true;
         odom_received_ = true;
     }
 
@@ -477,27 +434,7 @@ private:
             const auto& X = result.state_trajectory;
             const auto& U = result.control_trajectory;
 
-            // ── Feedforward acceleration from MPC's body-frame forces ────────
-            // The Mellinger controller computes desired thrust as:
-            //   F.x = mass * acc_ff.x + Kp * ep.x + Kd * ev.x
-            //   F.y = mass * acc_ff.y + Kp * ep.y + Kd * ev.y
-            //   F.z = mass * (acc_ff.z + g) + Kp * ep.z + Kd * ev.z
-            //
-            // Without feedforward (acc_ff=0), the PD loop must generate ALL
-            // acceleration, causing aggressive tilting (27° for 0.7 m/s vel
-            // error) and huge angular rates (>190 deg/s) that the MPC never
-            // predicted, leading to divergence on the next solve.
-            // u = [fz_B, Mx, My, Mz] — only thrust (u(0)) contributes to acceleration
             Eigen::Vector3d acc_ff = Eigen::Vector3d::Zero();
-            if (!U.empty() && U[0].size() >= 1) {
-                constexpr double CF_MASS = 0.027;  // kg (Crazyflie mass)
-                Eigen::Quaterniond q_cur(current_state_(6), current_state_(7),
-                                         current_state_(8), current_state_(9));
-                q_cur.normalize();
-                Eigen::Vector3d f_body(0.0, 0.0, U[0](0));  // thrust along body-z only
-                acc_ff = q_cur.toRotationMatrix() * f_body / CF_MASS;
-                acc_ff.z() -= 9.81;  // Mellinger adds GRAVITY_MAGNITUDE back
-            }
 
             // ── Platform-specific command publishing ──────────────────────────
             if (platform_ == "crazyflie") {
@@ -543,13 +480,13 @@ private:
         msg.twist.linear.x    = s(3);
         msg.twist.linear.y    = s(4);
         msg.twist.linear.z    = s(5);
-        msg.pose.orientation.w =  s(6);      // qw unchanged
-        msg.pose.orientation.x =  s(7);      // qx unchanged
-        msg.pose.orientation.y = -s(8);      // qy: FLU→FRD flip
-        msg.pose.orientation.z = -s(9);      // qz: FLU→FRD flip
-        msg.twist.angular.x   =  s(10);      // wx unchanged
-        msg.twist.angular.y   = -s(11);      // wy: FLU→FRD flip
-        msg.twist.angular.z   = -s(12);      // wz: FLU→FRD flip
+        msg.pose.orientation.w = s(6);
+        msg.pose.orientation.x = s(7);
+        msg.pose.orientation.y = s(8);
+        msg.pose.orientation.z = s(9);
+        msg.twist.angular.x   = s(10);
+        msg.twist.angular.y   = s(11);
+        msg.twist.angular.z   = s(12);
         msg.acc.x = acc_cmd(0);
         msg.acc.y = acc_cmd(1);
         msg.acc.z = acc_cmd(2);

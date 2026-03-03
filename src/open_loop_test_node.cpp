@@ -177,20 +177,18 @@ private:
         cf_cmd_pub_ = this->create_publisher<crazyflie_interfaces::msg::FullState>(
             "/" + drone_name_ + "/cmd_full_state", 10);
 
-        // /pose as fallback until /odom arrives
+        // /pose — motion-capture position + quaternion
         pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "/" + drone_name_ + "/pose", 10,
             [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
-                if (!odom_received_) {
-                    current_state_(0) = msg->pose.position.x;
-                    current_state_(1) = msg->pose.position.y;
-                    current_state_(2) = msg->pose.position.z;
-                    current_state_(6) = msg->pose.orientation.w;
-                    current_state_(7) = msg->pose.orientation.x;
-                    current_state_(8) = -msg->pose.orientation.y;  // FRD→FLU
-                    current_state_(9) = -msg->pose.orientation.z;  // FRD→FLU
-                    pose_received_ = true;
-                }
+                current_state_(0) = msg->pose.position.x;
+                current_state_(1) = msg->pose.position.y;
+                current_state_(2) = msg->pose.position.z;
+                current_state_(6) = msg->pose.orientation.w;
+                current_state_(7) = msg->pose.orientation.x;
+                current_state_(8) = msg->pose.orientation.y;
+                current_state_(9) = msg->pose.orientation.z;
+                pose_received_ = true;
             });
 
         // /odom: authoritative source for all 13 states
@@ -231,22 +229,17 @@ private:
 
     void cfOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
-        // All 13 states from one message — temporally consistent
-        current_state_(0) = msg->pose.pose.position.x;
-        current_state_(1) = msg->pose.pose.position.y;
-        current_state_(2) = msg->pose.pose.position.z;
+        // World-frame velocity from Kalman filter (m/s)
         current_state_(3) = msg->twist.twist.linear.x;
         current_state_(4) = msg->twist.twist.linear.y;
         current_state_(5) = msg->twist.twist.linear.z;
-        current_state_(6) = msg->pose.pose.orientation.w;
-        current_state_(7) = msg->pose.pose.orientation.x;
-        current_state_(8) = -msg->pose.pose.orientation.y;   // FRD→FLU
-        current_state_(9) = -msg->pose.pose.orientation.z;   // FRD→FLU
+
+        // Body-frame angular rates from gyro — firmware logs in deg/s
         constexpr double DEG2RAD = M_PI / 180.0;
         current_state_(10) = msg->twist.twist.angular.x * DEG2RAD;
-        current_state_(11) = -msg->twist.twist.angular.y * DEG2RAD;  // FRD→FLU
-        current_state_(12) = -msg->twist.twist.angular.z * DEG2RAD;  // FRD→FLU
-        pose_received_ = true;
+        current_state_(11) = msg->twist.twist.angular.y * DEG2RAD;
+        current_state_(12) = msg->twist.twist.angular.z * DEG2RAD;
+
         odom_received_ = true;
     }
 
@@ -351,17 +344,8 @@ private:
         // ── Commanded state at this step ──────────────────────────────────────
         const Eigen::VectorXd& x_cmd = ref_X_[step];
 
-        // Feedforward acceleration from the corresponding control
-        // u = [fz_B, Mx, My, Mz] — only thrust (u(0)) contributes to acceleration
+        // Feedforward disabled — Mellinger PD handles it fine without it
         Eigen::Vector3d acc_ff = Eigen::Vector3d::Zero();
-        if (step < static_cast<int>(ref_U_.size()) && ref_U_[step].size() >= 1) {
-            constexpr double CF_MASS = 0.027;  // kg
-            Eigen::Quaterniond q_cmd(x_cmd(6), x_cmd(7), x_cmd(8), x_cmd(9));
-            q_cmd.normalize();
-            Eigen::Vector3d f_body(0.0, 0.0, ref_U_[step](0));  // thrust along body-z only
-            acc_ff = q_cmd.toRotationMatrix() * f_body / CF_MASS;
-            acc_ff.z() -= 9.81;  // Mellinger adds gravity back
-        }
 
         // ── Publish command ───────────────────────────────────────────────────
         if (platform_ == "crazyflie") {
@@ -421,13 +405,13 @@ private:
         msg.twist.linear.x     = s(3);
         msg.twist.linear.y     = s(4);
         msg.twist.linear.z     = s(5);
-        msg.pose.orientation.w =  s(6);      // qw unchanged
-        msg.pose.orientation.x =  s(7);      // qx unchanged
-        msg.pose.orientation.y = -s(8);      // qy: FLU→FRD flip
-        msg.pose.orientation.z = -s(9);      // qz: FLU→FRD flip
-        msg.twist.angular.x    =  s(10);     // wx unchanged
-        msg.twist.angular.y    = -s(11);     // wy: FLU→FRD flip
-        msg.twist.angular.z    = -s(12);     // wz: FLU→FRD flip
+        msg.pose.orientation.w = s(6);
+        msg.pose.orientation.x = s(7);
+        msg.pose.orientation.y = s(8);
+        msg.pose.orientation.z = s(9);
+        msg.twist.angular.x    = s(10);
+        msg.twist.angular.y    = s(11);
+        msg.twist.angular.z    = s(12);
         msg.acc.x = acc_ff(0);
         msg.acc.y = acc_ff(1);
         msg.acc.z = acc_ff(2);
