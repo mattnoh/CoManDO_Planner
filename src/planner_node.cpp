@@ -1,25 +1,44 @@
 // planner_node.cpp
 // ─────────────────────────────────────────────────────────────────────────────
-// State layout (13-dimensional, matches the OCP):
+// CoManDO Planner — supports two platforms and two solvers:
+//
+//   platform:  "crazyflie"  (Crazyswarm2 topics, ENU)
+//              "px4"        (PX4 uORB-over-DDS topics, NED↔ENU conversion)
+//
+//   solver:    "alipddp"    (ALIPDDP — augmented Lagrangian IPM DDP)
+//              "acados"     (acados SQP_RTI — code-generated NLP)
+//
+// State layout (13-dim, ENU/FLU internally):
 //   [0-2]   position        x, y, z          (m)
 //   [3-5]   velocity        vx, vy, vz       (m/s)
 //   [6-9]   quaternion      qw, qx, qy, qz   (–)
 //   [10-12] angular rate    wx, wy, wz        (rad/s)
-//
-// Sources:
-//   /cf_1/pose   PoseStamped   — Motion-capture position + orientation, 100 Hz
-//   /cf_1/odom   Odometry      — Kalman velocity + gyro rates,           100 Hz
-//
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+
+// ── Crazyflie interface ──────────────────────────────────────────────────────
 #include <crazyflie_interfaces/msg/full_state.hpp>
+
+// ── PX4 interface (conditionally compiled) ───────────────────────────────────
+#ifdef HAS_PX4_MSGS
+#include <px4_msgs/msg/vehicle_odometry.hpp>
+#include <px4_msgs/msg/trajectory_setpoint.hpp>
+#include <px4_msgs/msg/offboard_control_mode.hpp>
+#include <px4_msgs/msg/vehicle_command.hpp>
+#endif
+
+// ── Solvers ──────────────────────────────────────────────────────────────────
 #include "quadrotor_mpc.hpp"
 #include "ocp_registry.hpp"
+#ifdef HAS_ACADOS
+#include "acados_solver.hpp"
+#endif
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <filesystem>
@@ -29,176 +48,375 @@
 #include <Eigen/Dense>
 
 using namespace std::chrono_literals;
-using Clock     = std::chrono::steady_clock;
+using Clock = std::chrono::steady_clock;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+//  NED ↔ ENU frame conversion helpers (for PX4 support)
+// ═══════════════════════════════════════════════════════════════════════════════
+namespace frame_conv {
+
+// Position / velocity: NED → ENU
+inline Eigen::Vector3d ned_to_enu(const Eigen::Vector3d& v_ned) {
+    return {v_ned.y(), v_ned.x(), -v_ned.z()};
+}
+// Position / velocity: ENU → NED
+inline Eigen::Vector3d enu_to_ned(const Eigen::Vector3d& v_enu) {
+    return {v_enu.y(), v_enu.x(), -v_enu.z()};
+}
+
+// Quaternion: PX4 (FRD body → NED world) → ROS (FLU body → ENU world)
+inline Eigen::Quaterniond quat_ned_to_enu(double w, double x, double y, double z) {
+    return Eigen::Quaterniond(w, y, x, -z).normalized();
+}
+
+// Quaternion: ENU → NED (same rotation, inverse mapping)
+inline Eigen::Quaterniond quat_enu_to_ned(const Eigen::Quaterniond& q_enu) {
+    return Eigen::Quaterniond(q_enu.w(), q_enu.y(), q_enu.x(), -q_enu.z()).normalized();
+}
+
+// Angular velocity: FRD body → FLU body
+inline Eigen::Vector3d omega_frd_to_flu(const Eigen::Vector3d& w_frd) {
+    return {w_frd.x(), -w_frd.y(), -w_frd.z()};
+}
+
+// Angular velocity: FLU body → FRD body
+inline Eigen::Vector3d omega_flu_to_frd(const Eigen::Vector3d& w_flu) {
+    return {w_flu.x(), -w_flu.y(), -w_flu.z()};
+}
+
+} // namespace frame_conv
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Unified Result type that both solvers produce
+// ═══════════════════════════════════════════════════════════════════════════════
+struct SolverResult {
+    bool                          success   = false;
+    Eigen::VectorXd               next_state;
+    std::vector<Eigen::VectorXd>  state_trajectory;
+    std::vector<Eigen::VectorXd>  control_trajectory;
+    double                        solve_time_ms = 0.0;
+    std::chrono::steady_clock::time_point solve_timestamp;
+};
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Planner Node
+// ═══════════════════════════════════════════════════════════════════════════════
 class PlannerNode : public rclcpp::Node {
 public:
     PlannerNode() : Node("comando_planner") {
-        // ── Parameters (ROS2 ordering: declare ALL before getting ANY) ────────
-        // Step 1: Declare ocp_type first, get it immediately
-        this->declare_parameter("ocp_type", std::string("hover"));
-        std::string ocp = this->get_parameter("ocp_type").as_string();
-
-        // Step 2: Now compute default_solver_rate from the known ocp
-        const double ocp_dt_temp = OCPRegistry::getDT(ocp);
-        const int default_solver_rate = static_cast<int>(std::round(1.0 / ocp_dt_temp));
-
-        // Step 3: Declare remaining params (solver_rate default is now correct)
+        // ── Parameters ────────────────────────────────────────────────────────
+        this->declare_parameter("ocp_type",       std::string("hover"));
         this->declare_parameter("drone_name",     std::string("cf_1"));
         this->declare_parameter("enable_logging", true);
-        this->declare_parameter("solver_rate",    default_solver_rate);
+        this->declare_parameter("platform",       std::string("crazyflie"));
+        this->declare_parameter("solver",         std::string("alipddp"));
         this->declare_parameter("hover_target_x", 0.0);
         this->declare_parameter("hover_target_y", 0.0);
         this->declare_parameter("hover_target_z", 1.0);
 
-        // Step 4: Get all parameters
+        std::string ocp = this->get_parameter("ocp_type").as_string();
         drone_name_      = this->get_parameter("drone_name").as_string();
         logging_enabled_ = this->get_parameter("enable_logging").as_bool();
-        solver_rate_     = this->get_parameter("solver_rate").as_int();
+        platform_        = this->get_parameter("platform").as_string();
+        solver_type_     = this->get_parameter("solver").as_string();
 
         double tx = this->get_parameter("hover_target_x").as_double();
         double ty = this->get_parameter("hover_target_y").as_double();
         double tz = this->get_parameter("hover_target_z").as_double();
 
-        // ── MPC ───────────────────────────────────────────────────────────────
-        QuadrotorMPC::Config cfg;
-        cfg.ocp_type = ocp;
+        // ── Validate ──────────────────────────────────────────────────────────
+        if (platform_ != "crazyflie" && platform_ != "px4") {
+            RCLCPP_ERROR(this->get_logger(), "Unknown platform '%s'. Use 'crazyflie' or 'px4'", platform_.c_str());
+            throw std::runtime_error("Invalid platform: " + platform_);
+        }
+        if (solver_type_ != "alipddp" && solver_type_ != "acados") {
+            RCLCPP_ERROR(this->get_logger(), "Unknown solver '%s'. Use 'alipddp' or 'acados'", solver_type_.c_str());
+            throw std::runtime_error("Invalid solver: " + solver_type_);
+        }
+#ifndef HAS_ACADOS
+        if (solver_type_ == "acados") {
+            RCLCPP_ERROR(this->get_logger(), "Acados not available (built without HAS_ACADOS)");
+            throw std::runtime_error("Acados not available");
+        }
+#endif
+#ifndef HAS_PX4_MSGS
+        if (platform_ == "px4") {
+            RCLCPP_ERROR(this->get_logger(), "PX4 not available (built without HAS_PX4_MSGS)");
+            throw std::runtime_error("PX4 msgs not available");
+        }
+#endif
 
-        // Build a valid 13-dim terminal state for the hover OCP.
-        // qw=1 (identity quaternion), everything else zero except position.
-        // An uninitialized or all-zero terminal_state has qw=0 (invalid
-        // quaternion) — HoverOCP receives a degenerate target and produces
-        // a zero-effort "stay in place" solution.
-        cfg.terminal_state = Eigen::VectorXd::Zero(13);
-        cfg.terminal_state(0) = tx;   // px
-        cfg.terminal_state(1) = ty;   // py
-        cfg.terminal_state(2) = tz;   // pz
-        // vel (3-5) = 0
-        cfg.terminal_state(6) = 1.0;  // qw = 1  (identity, upright hover)
-        // qx qy qz (7-9) = 0
-        // angular rates (10-12) = 0
+        // ── Terminal state ────────────────────────────────────────────────────
+        Eigen::VectorXd terminal = Eigen::VectorXd::Zero(13);
+        terminal(0) = tx;
+        terminal(1) = ty;
+        terminal(2) = tz;
+        terminal(6) = 1.0;  // qw = 1
 
-        // ── Shift count ───────────────────────────────────────────────────────
-        // PX4 pattern: set solver_rate = 1/ocp_dt so n_shift = 1 always.
-        // n_shift is stored in the MPC config — not passed per solve call.
+        // ── Solver rate: match 1/ocp_dt for n_shift=1 ────────────────────────
+        double ocp_dt_temp = OCPRegistry::getDT(ocp);
+        const int default_solver_rate = static_cast<int>(std::round(1.0 / ocp_dt_temp));
+        this->declare_parameter("solver_rate", default_solver_rate);
+        solver_rate_ = this->get_parameter("solver_rate").as_int();
+
         const double solver_period = 1.0 / static_cast<double>(solver_rate_);
         n_shift_ = std::max(1, static_cast<int>(std::round(solver_period / ocp_dt_temp)));
-        cfg.n_shift = n_shift_;
 
-        mpc_.reset(new QuadrotorMPC(cfg));
-        ocp_dt_ = mpc_->getOcpDt();
+        // ── Create solver ─────────────────────────────────────────────────────
+        if (solver_type_ == "alipddp") {
+            QuadrotorMPC::Config cfg;
+            cfg.ocp_type       = ocp;
+            cfg.terminal_state = terminal;
+            cfg.n_shift        = n_shift_;
+            alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
+            ocp_dt_ = alipddp_mpc_->getOcpDt();
+        }
+#ifdef HAS_ACADOS
+        else if (solver_type_ == "acados") {
+            AcadosMPC::Config cfg;
+            cfg.ocp_type       = ocp;
+            cfg.terminal_state = terminal;
+            cfg.dt             = ocp_dt_temp;
+            cfg.n_shift        = n_shift_;
+            acados_mpc_ = std::make_unique<AcadosMPC>(cfg);
+            ocp_dt_ = acados_mpc_->getOcpDt();
+        }
+#endif
 
-        // ── Alignment check ───────────────────────────────────────────────────
-        // PX4 MPC runs at exactly 1/ocp_dt Hz so n_shift=1 always. Warn if we
-        // deviate — a mismatch means x[1] is not exactly "one ocp_dt step ahead
-        // of the current moment" and accumulated drift will cause the reference
-        // to lag or lead the real trajectory.
-        const double ideal_rate = 1.0 / ocp_dt_;
-        if (std::abs(solver_period - ocp_dt_) > 1e-4) {
-            RCLCPP_WARN(this->get_logger(),
-                "solver_rate (%d Hz, period=%.4fs) != 1/ocp_dt (%.1f Hz, ocp_dt=%.4fs). "
-                "n_shift=%d. Best practice: set solver_rate=%.0f to match ocp_dt.",
-                solver_rate_, solver_period, ideal_rate, ocp_dt_, n_shift_, ideal_rate);
+        // ── Initial state ─────────────────────────────────────────────────────
+        current_state_ = Eigen::VectorXd::Zero(13);
+        current_state_(6) = 1.0;
+
+        // ── Set up platform-specific pub/sub ──────────────────────────────────
+        if (platform_ == "crazyflie") {
+            setupCrazyflie();
+        } else {
+            setupPX4();
         }
 
-        // ── Initial state — identity quaternion, everything else zero ─────────
-        current_state_ = Eigen::VectorXd::Zero(13);
-        current_state_(6) = 1.0;   // qw = 1
-
-        // ── Publishers ────────────────────────────────────────────────────────
-        cmd_pub_  = this->create_publisher<crazyflie_interfaces::msg::FullState>(
-            "/" + drone_name_ + "/cmd_full_state", 10);
+        // ── Trajectory visualisation (shared) ─────────────────────────────────
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
 
-        // ── Subscribers ───────────────────────────────────────────────────────
-        // 1) Motion-capture pose — position + quaternion at 100 Hz
-        pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-            "/" + drone_name_ + "/pose", 10,
-            std::bind(&PlannerNode::poseCallback, this, std::placeholders::_1));
-
-        // 2) Kalman odom — world-frame velocity + body gyro rates at 100 Hz
-        //    twist.linear:  vx,vy,vz  in m/s  (Kalman, world frame)
-        //    twist.angular: wx,wy,wz  in deg/s (gyro — converted to rad/s below)
-        //
-        //    UNIT NOTE: crazyflie_server publishes gyro.x/y/z from firmware
-        //    which logs in deg/s. Crazyswarm2's _log_odom_data_callback does
-        //    NOT convert them before stuffing into twist.angular, so we apply
-        //    DEG2RAD here. Verify: print twist.angular.x while spinning —
-        //    if values are ~100-500 during fast spin they are still deg/s.
-        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/" + drone_name_ + "/odom", 10,
-            std::bind(&PlannerNode::odomCallback, this, std::placeholders::_1));
-
         // ── Solver timer ──────────────────────────────────────────────────────
-        // This is the only timer. On every tick it solves the OCP, then
-        // immediately publishes x[1] as the new reference for Mellinger.
-        //
-        // PREVIOUSLY there was also a separate control_timer_ that walked the
-        // trajectory index forward between solves using:
-        //   idx = 1 + floor(elapsed_since_last_solve / ocp_dt)
-        // WHY WE REMOVED IT:
-        //   Mellinger is a full-state feedback controller at ~500 Hz on the
-        //   firmware — it continuously corrects toward whatever reference we
-        //   give it. Walking the index from our side added mutex/thread
-        //   complexity with no practical gain.
         solver_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(1000 / solver_rate_),
             std::bind(&PlannerNode::solverLoop, this));
-
+        // ── High-rate command publishing (100 Hz) ─────────────────────────
+        // Interpolates along the latest planned trajectory so the
+        // reference ramps smoothly from X[0] (≈ current state) to X[1]
+        // over one ocp_dt.  Without this, jumping directly to X[1]
+        // creates a large velocity error that Mellinger double-counts
+        // with acc_ff, generating violent angular rates on the drone.
+        cmd_timer_ = this->create_wall_timer(
+            10ms,
+            std::bind(&PlannerNode::cmdPublishLoop, this));
         RCLCPP_INFO(this->get_logger(),
-            "Planner ready  drone=%s  ocp=%s  solver=%dHz  ocp_dt=%.3fs  n_shift=%d",
-            drone_name_.c_str(), ocp.c_str(), solver_rate_, ocp_dt_, n_shift_);
+            "Planner ready  platform=%s  solver=%s  ocp=%s  rate=%dHz  ocp_dt=%.3fs  n_shift=%d",
+            platform_.c_str(), solver_type_.c_str(), ocp.c_str(),
+            solver_rate_, ocp_dt_, n_shift_);
         RCLCPP_INFO(this->get_logger(),
-            "Hover target: [%.3f, %.3f, %.3f]", tx, ty, tz);
+            "Target: [%.3f, %.3f, %.3f]", tx, ty, tz);
         RCLCPP_INFO(this->get_logger(),
-            "Waiting for /pose AND /odom before starting MPC...");
+            "Waiting for state feedback before starting MPC...");
     }
 
 private:
     // ─────────────────────────────────────────────────────────────────────────
-    // Callbacks
+    //  Platform setup
     // ─────────────────────────────────────────────────────────────────────────
 
-    // /pose — Motion-capture position + quaternion
-    void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+    void setupCrazyflie()
     {
-        current_state_(0) = msg->pose.position.x;
-        current_state_(1) = msg->pose.position.y;
-        current_state_(2) = msg->pose.position.z;
-        current_state_(6) = msg->pose.orientation.w;  // qw
-        current_state_(7) = msg->pose.orientation.x;  // qx
-        current_state_(8) = msg->pose.orientation.y;  // qy
-        current_state_(9) = msg->pose.orientation.z;  // qz
+        cf_cmd_pub_ = this->create_publisher<crazyflie_interfaces::msg::FullState>(
+            "/" + drone_name_ + "/cmd_full_state", 10);
+
+        pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/" + drone_name_ + "/pose", 10,
+            std::bind(&PlannerNode::cfPoseCallback, this, std::placeholders::_1));
+
+        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/" + drone_name_ + "/odom", 10,
+            std::bind(&PlannerNode::cfOdomCallback, this, std::placeholders::_1));
+    }
+
+    void setupPX4()
+    {
+#ifdef HAS_PX4_MSGS
+        px4_setpoint_pub_ = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>(
+            "/fmu/in/trajectory_setpoint", 10);
+        px4_offboard_pub_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>(
+            "/fmu/in/offboard_control_mode", 10);
+        px4_cmd_pub_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
+            "/fmu/in/vehicle_command", 10);
+
+        px4_odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
+            "/fmu/out/vehicle_odometry", 10,
+            std::bind(&PlannerNode::px4OdomCallback, this, std::placeholders::_1));
+
+        // PX4 requires continuous heartbeat to stay in offboard mode
+        px4_heartbeat_timer_ = this->create_wall_timer(
+            100ms, std::bind(&PlannerNode::px4HeartbeatCallback, this));
+
+        RCLCPP_INFO(this->get_logger(),
+            "PX4 interface: /fmu/out/vehicle_odometry -> /fmu/in/trajectory_setpoint");
+#endif
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Crazyflie callbacks
+    // ─────────────────────────────────────────────────────────────────────────
+
+    void cfPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+    {
+        // Fallback: only used until the first /odom arrives.
+        // Once odom_received_ is true, /odom is the authoritative source
+        // for ALL 13 states (temporally consistent).
+        if (!odom_received_) {
+            current_state_(0) = msg->pose.position.x;
+            current_state_(1) = msg->pose.position.y;
+            current_state_(2) = msg->pose.position.z;
+            current_state_(6) = msg->pose.orientation.w;
+            current_state_(7) = msg->pose.orientation.x;
+            current_state_(8) = msg->pose.orientation.y;
+            current_state_(9) = msg->pose.orientation.z;
+        }
         pose_received_ = true;
     }
 
-    // /odom — Kalman velocity + gyro angular rates
-    void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+    void cfOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
-        // World-frame velocity from Kalman filter
+        // ── Read ALL 13 state components from the single odom message ─────
+        // The /odom topic's pose and twist come from the SAME firmware log
+        // sample, so they are temporally consistent.  Previously, position
+        // + quaternion came from /pose and velocity + angular rate from
+        // /odom — two independent log configs that fire at different times.
+        // During aggressive maneuvering this created physically impossible
+        // states (e.g. identity quaternion + 191 deg/s angular rate) that
+        // caused the solver to diverge on the second solve.
+        //
+        // NOTE on pitch sign: The Crazyswarm2 Python server's /pose callback
+        // negates pitch (line 615: pitch = -1*stabilizer.pitch) while the
+        // /odom callback does NOT (line 663).  This is a known inconsistency
+        // in crazyswarm2.  We use the odom quaternion directly here.  For a
+        // drone near hover the difference is negligible; both converge to
+        // identity.  For large pitch angles we may revisit with an explicit
+        // correction, but temporal consistency is far more important.
+
+        // Position (world frame, m)
+        current_state_(0) = msg->pose.pose.position.x;
+        current_state_(1) = msg->pose.pose.position.y;
+        current_state_(2) = msg->pose.pose.position.z;
+
+        // Velocity (world frame, m/s — from Kalman filter statePX/PY/PZ)
         current_state_(3) = msg->twist.twist.linear.x;
         current_state_(4) = msg->twist.twist.linear.y;
         current_state_(5) = msg->twist.twist.linear.z;
 
-        // Body-frame angular rates from gyro — firmware logs in deg/s
+        // Quaternion (from stabilizer euler angles in the same log sample)
+        current_state_(6) = msg->pose.pose.orientation.w;
+        current_state_(7) = msg->pose.pose.orientation.x;
+        current_state_(8) = msg->pose.pose.orientation.y;
+        current_state_(9) = msg->pose.pose.orientation.z;
+
+        // Angular rate (body frame, gyro.x/y/z — in deg/s → rad/s)
         constexpr double DEG2RAD = M_PI / 180.0;
         current_state_(10) = msg->twist.twist.angular.x * DEG2RAD;
         current_state_(11) = msg->twist.twist.angular.y * DEG2RAD;
         current_state_(12) = msg->twist.twist.angular.z * DEG2RAD;
 
+        pose_received_ = true;
         odom_received_ = true;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Solver loop — runs at solver_rate_ Hz
+    //  PX4 callbacks
     // ─────────────────────────────────────────────────────────────────────────
+
+#ifdef HAS_PX4_MSGS
+    void px4OdomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg)
+    {
+        // PX4 VehicleOdometry is in NED frame — convert to ENU for solver
+        Eigen::Vector3d pos_ned(msg->position[0], msg->position[1], msg->position[2]);
+        Eigen::Vector3d vel_ned(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
+        Eigen::Vector3d omega_frd(msg->angular_velocity[0], msg->angular_velocity[1], msg->angular_velocity[2]);
+
+        Eigen::Vector3d pos_enu   = frame_conv::ned_to_enu(pos_ned);
+        Eigen::Vector3d vel_enu   = frame_conv::ned_to_enu(vel_ned);
+        Eigen::Quaterniond q_enu  = frame_conv::quat_ned_to_enu(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
+        Eigen::Vector3d omega_flu = frame_conv::omega_frd_to_flu(omega_frd);
+
+        current_state_(0)  = pos_enu.x();
+        current_state_(1)  = pos_enu.y();
+        current_state_(2)  = pos_enu.z();
+        current_state_(3)  = vel_enu.x();
+        current_state_(4)  = vel_enu.y();
+        current_state_(5)  = vel_enu.z();
+        current_state_(6)  = q_enu.w();
+        current_state_(7)  = q_enu.x();
+        current_state_(8)  = q_enu.y();
+        current_state_(9)  = q_enu.z();
+        current_state_(10) = omega_flu.x();
+        current_state_(11) = omega_flu.y();
+        current_state_(12) = omega_flu.z();
+
+        pose_received_ = true;
+        odom_received_ = true;  // PX4 odom has everything in one message
+    }
+
+    void px4HeartbeatCallback()
+    {
+        px4_msgs::msg::OffboardControlMode msg;
+        msg.timestamp     = this->now().nanoseconds() / 1000;
+        msg.position      = true;
+        msg.velocity      = true;
+        msg.acceleration  = false;
+        msg.attitude      = false;
+        msg.body_rate     = false;
+        px4_offboard_pub_->publish(msg);
+    }
+
+    void px4Arm()
+    {
+        px4_msgs::msg::VehicleCommand msg;
+        msg.timestamp        = this->now().nanoseconds() / 1000;
+        msg.command          = 400;     // VEHICLE_CMD_COMPONENT_ARM_DISARM
+        msg.param1           = 1.0;     // 1 = arm
+        msg.target_system    = 1;
+        msg.target_component = 1;
+        msg.source_system    = 1;
+        msg.source_component = 1;
+        msg.from_external    = true;
+        px4_cmd_pub_->publish(msg);
+    }
+
+    void px4SetOffboardMode()
+    {
+        px4_msgs::msg::VehicleCommand msg;
+        msg.timestamp        = this->now().nanoseconds() / 1000;
+        msg.command          = 176;     // VEHICLE_CMD_DO_SET_MODE
+        msg.param1           = 1.0;     // base mode
+        msg.param2           = 6.0;     // PX4_CUSTOM_MAIN_MODE_OFFBOARD
+        msg.target_system    = 1;
+        msg.target_component = 1;
+        msg.source_system    = 1;
+        msg.source_component = 1;
+        msg.from_external    = true;
+        px4_cmd_pub_->publish(msg);
+    }
+#endif
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Solver loop
+    // ─────────────────────────────────────────────────────────────────────────
+
     void solverLoop()
     {
         if (!pose_received_ || !odom_received_) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "Waiting for /pose [%s] and /odom [%s]...",
+                "Waiting for state: /pose [%s] /odom [%s]...",
                 pose_received_ ? "OK" : "MISSING",
                 odom_received_ ? "OK" : "MISSING");
             return;
@@ -206,11 +424,21 @@ private:
 
         if (!is_flying_) {
             is_flying_ = true;
-            RCLCPP_INFO(this->get_logger(), "Both topics received — starting MPC");
+            RCLCPP_INFO(this->get_logger(), "State feedback received — starting MPC (%s)", solver_type_.c_str());
+
+#ifdef HAS_PX4_MSGS
+            if (platform_ == "px4") {
+                px4SetOffboardMode();
+                px4Arm();
+                RCLCPP_INFO(this->get_logger(), "PX4: Offboard mode + Arm commands sent");
+            }
+#endif
+
             if (logging_enabled_ && !logging_initialized_) {
                 setupLogging();
                 logging_initialized_ = true;
             }
+
             RCLCPP_INFO(this->get_logger(),
                 "Initial state: pos=[%.3f,%.3f,%.3f] vel=[%.3f,%.3f,%.3f] "
                 "q=[%.3f,%.3f,%.3f,%.3f] w=[%.3f,%.3f,%.3f]",
@@ -220,39 +448,53 @@ private:
                 current_state_(10), current_state_(11), current_state_(12));
         }
 
-        // n_shift_ is baked into config_.n_shift at construction — no per-call arg needed.
-        auto result = mpc_->solve(current_state_);
+        // ── Solve with selected solver ────────────────────────────────────────
+        SolverResult result;
+
+        if (solver_type_ == "alipddp" && alipddp_mpc_) {
+            auto r = alipddp_mpc_->solve(current_state_);
+            result.success            = r.success;
+            result.next_state         = r.next_state;
+            result.state_trajectory   = r.state_trajectory;
+            result.control_trajectory = r.control_trajectory;
+            result.solve_time_ms      = r.solve_time_ms;
+            result.solve_timestamp    = r.solve_timestamp;
+        }
+#ifdef HAS_ACADOS
+        else if (solver_type_ == "acados" && acados_mpc_) {
+            auto r = acados_mpc_->solve(current_state_);
+            result.success            = r.success;
+            result.next_state         = r.next_state;
+            result.state_trajectory   = r.state_trajectory;
+            result.control_trajectory = r.control_trajectory;
+            result.solve_time_ms      = r.solve_time_ms;
+            result.solve_timestamp    = r.solve_timestamp;
+        }
+#endif
 
         if (result.success) {
             const auto& X = result.state_trajectory;
             const auto& U = result.control_trajectory;
 
-            // ── Publish x[1] as the reference setpoint ────────────────────────
-            // x[0] = current measured state (initial condition, not commanded).
-            // x[1] = first planned future state — Mellinger tracks this until
-            //        the next solve fires.
-            //
-            // Acceleration feedforward:
-            //   a_ff = ( x[2][3:5] - x[1][3:5] ) / ocp_dt
-            // This is the planned net world-frame acceleration at node 1.
-            // NOTE: currently disabled (zero) because the finite-difference
-            // gives the net acceleration INCLUDING gravity, which double-counts
-            // gravity in Mellinger's thrust computation. Re-enable only after
-            // verifying the frame convention with the firmware.
-            Eigen::Vector3d acc_ff = Eigen::Vector3d::Zero();
-            // if (X.size() > 2)
-            //     acc_ff = (X[2].segment(3, 3) - X[1].segment(3, 3)) / ocp_dt_;
+            // ── Store trajectory for high-rate command interpolation ──────
+            // cmdPublishLoop() (100 Hz) walks X[0]→X[1] smoothly so the
+            // Mellinger controller never sees a large velocity jump.
+            // This is why the open-loop test works: it publishes X[0]
+            // first (zero tracking error), then X[1] next tick (by which
+            // time the drone has already moved via acc_ff).  We reproduce
+            // that gradual ramp-up here.
+            latest_X_ = X;
+            latest_U_ = U;
+            traj_start_time_ = Clock::now();
+            have_trajectory_ = true;
 
-            publishCommand(X[1], acc_ff);
-
-            // ── Publish full trajectory for visualisation ─────────────────────
             publishTrajectory(X);
 
-            // ── Logging ───────────────────────────────────────────────────────
+            // ── Logging ──────────────────────────────────────────────────────
             if (logging_enabled_ && logging_initialized_) {
                 logActualState();
                 const Eigen::VectorXd& u0 = U.empty() ? Eigen::VectorXd::Zero(6) : U[0];
-                logCommandedState(X[1], u0);
+                logCommandedState(X[0], u0);
                 if (!first_solve_logged_) {
                     logFirstTrajectory(X, U);
                     first_solve_logged_ = true;
@@ -263,44 +505,150 @@ private:
             if (++diag_count % 10 == 0) printDiagnostics(result);
 
         } else {
-            RCLCPP_WARN(this->get_logger(), "MPC solve failed");
+            RCLCPP_WARN(this->get_logger(), "MPC solve failed (%s)", solver_type_.c_str());
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Publishing
+    //  High-rate command interpolation (100 Hz)
+    //
+    //  WHY THIS EXISTS:
+    //    The MPC solves every ocp_dt (100 ms).  Publishing X[1] directly as
+    //    the Mellinger reference creates a large velocity gap (drone at rest,
+    //    reference at planned velocity).  Mellinger's Kd term generates
+    //    aggressive forces ON TOP of acc_ff, double-counting the planned
+    //    acceleration.  This causes >4 rad/s angular rates in 0.1s,
+    //    corrupting the next warm start and making the solver diverge.
+    //
+    //    The open-loop test avoids this by publishing X[0] first (zero
+    //    tracking error), then X[1] on the next tick (by which time the
+    //    drone has been pushed by acc_ff and is already near X[1]).
+    //
+    //    This loop reproduces that gradual ramp-up: at t=0 after a solve
+    //    it publishes X[0] (the full solver state), then linearly
+    //    interpolates toward X[1] over ocp_dt.  Tracking error stays
+    //    small at every tick, so Mellinger's PD terms stay small and only
+    //    acc_ff drives the motion — exactly like the standalone RH test.
     // ─────────────────────────────────────────────────────────────────────────
-    void publishCommand(const Eigen::VectorXd& s, const Eigen::Vector3d& acc_cmd)
+
+    void cmdPublishLoop()
+    {
+        if (!have_trajectory_ || latest_X_.size() < 2 || latest_U_.empty())
+            return;
+
+        // How far along the current solve interval are we?
+        double elapsed = std::chrono::duration<double>(
+            Clock::now() - traj_start_time_).count();
+        double t_frac = elapsed / ocp_dt_;
+
+        // Walk further along the trajectory if the solver is slow
+        int k = std::max(0, std::min(static_cast<int>(std::floor(t_frac)),
+                                     static_cast<int>(latest_X_.size()) - 2));
+        double alpha = std::max(0.0, std::min(t_frac - k, 1.0));
+
+        // Linear interpolation between X[k] and X[k+1]  (full 13-dim state)
+        const auto& xa = latest_X_[k];
+        const auto& xb = latest_X_[k + 1];
+        Eigen::VectorXd x_ref = (1.0 - alpha) * xa + alpha * xb;
+
+        // Renormalize quaternion after linear interpolation
+        double qn = x_ref.segment(6, 4).norm();
+        if (qn > 1e-8) x_ref.segment(6, 4) /= qn;
+
+        // Feedforward acceleration from U[k], rotated by the interpolated
+        // orientation (body-frame → world-frame).
+        constexpr double CF_MASS = 0.027;
+        int uk = std::min(k, static_cast<int>(latest_U_.size()) - 1);
+        Eigen::Quaterniond q_ref(x_ref(6), x_ref(7), x_ref(8), x_ref(9));
+        Eigen::Vector3d acc_ff = q_ref.toRotationMatrix()
+                               * latest_U_[uk].head(3) / CF_MASS;
+        acc_ff.z() -= 9.81;  // Mellinger adds gravity back
+
+        if (platform_ == "crazyflie") {
+            publishCrazyflieCommand(x_ref, acc_ff);
+        } else {
+            publishPX4Command(x_ref, acc_ff);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Publishing — Crazyflie
+    // ─────────────────────────────────────────────────────────────────────────
+
+    void publishCrazyflieCommand(const Eigen::VectorXd& s, const Eigen::Vector3d& acc_cmd)
     {
         crazyflie_interfaces::msg::FullState msg;
         msg.header.stamp    = this->now();
         msg.header.frame_id = "world";
 
-        msg.pose.position.x = s(0);
-        msg.pose.position.y = s(1);
-        msg.pose.position.z = s(2);
-
-        msg.twist.linear.x = s(3);
-        msg.twist.linear.y = s(4);
-        msg.twist.linear.z = s(5);
-
-        // Solver quaternion order: qw(6), qx(7), qy(8), qz(9)
+        msg.pose.position.x    = s(0);
+        msg.pose.position.y    = s(1);
+        msg.pose.position.z    = s(2);
+        msg.twist.linear.x    = s(3);
+        msg.twist.linear.y    = s(4);
+        msg.twist.linear.z    = s(5);
         msg.pose.orientation.w = s(6);
         msg.pose.orientation.x = s(7);
         msg.pose.orientation.y = s(8);
         msg.pose.orientation.z = s(9);
-
-        // Angular velocity — solver output already in rad/s
-        msg.twist.angular.x = s(10);
-        msg.twist.angular.y = s(11);
-        msg.twist.angular.z = s(12);
-
+        msg.twist.angular.x   = s(10);
+        msg.twist.angular.y   = s(11);
+        msg.twist.angular.z   = s(12);
         msg.acc.x = acc_cmd(0);
         msg.acc.y = acc_cmd(1);
         msg.acc.z = acc_cmd(2);
 
-        cmd_pub_->publish(msg);
+        cf_cmd_pub_->publish(msg);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Publishing — PX4
+    // ─────────────────────────────────────────────────────────────────────────
+
+    void publishPX4Command(const Eigen::VectorXd& s,
+                           [[maybe_unused]] const Eigen::Vector3d& acc_cmd)
+    {
+#ifdef HAS_PX4_MSGS
+        // Convert solver ENU state to PX4 NED frame
+        Eigen::Vector3d pos_enu(s(0), s(1), s(2));
+        Eigen::Vector3d vel_enu(s(3), s(4), s(5));
+
+        Eigen::Vector3d pos_ned = frame_conv::enu_to_ned(pos_enu);
+        Eigen::Vector3d vel_ned = frame_conv::enu_to_ned(vel_enu);
+
+        // Yaw from quaternion (ENU → NED)
+        Eigen::Quaterniond q_enu(s(6), s(7), s(8), s(9));
+        Eigen::Quaterniond q_ned = frame_conv::quat_enu_to_ned(q_enu);
+
+        // Extract yaw in NED frame
+        double yaw_ned = std::atan2(
+            2.0 * (q_ned.w() * q_ned.z() + q_ned.x() * q_ned.y()),
+            1.0 - 2.0 * (q_ned.y() * q_ned.y() + q_ned.z() * q_ned.z()));
+
+        px4_msgs::msg::TrajectorySetpoint sp;
+        sp.timestamp     = this->now().nanoseconds() / 1000;
+        sp.position[0]   = static_cast<float>(pos_ned.x());
+        sp.position[1]   = static_cast<float>(pos_ned.y());
+        sp.position[2]   = static_cast<float>(pos_ned.z());
+        sp.velocity[0]   = static_cast<float>(vel_ned.x());
+        sp.velocity[1]   = static_cast<float>(vel_ned.y());
+        sp.velocity[2]   = static_cast<float>(vel_ned.z());
+        sp.acceleration[0] = std::numeric_limits<float>::quiet_NaN();
+        sp.acceleration[1] = std::numeric_limits<float>::quiet_NaN();
+        sp.acceleration[2] = std::numeric_limits<float>::quiet_NaN();
+        sp.jerk[0]       = std::numeric_limits<float>::quiet_NaN();
+        sp.jerk[1]       = std::numeric_limits<float>::quiet_NaN();
+        sp.jerk[2]       = std::numeric_limits<float>::quiet_NaN();
+        sp.yaw           = static_cast<float>(yaw_ned);
+        sp.yawspeed      = std::numeric_limits<float>::quiet_NaN();
+
+        px4_setpoint_pub_->publish(sp);
+#endif
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Trajectory visualisation (shared)
+    // ─────────────────────────────────────────────────────────────────────────
 
     void publishTrajectory(const std::vector<Eigen::VectorXd>& traj)
     {
@@ -323,29 +671,27 @@ private:
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Logging
+    //  Logging
     // ─────────────────────────────────────────────────────────────────────────
+
     void setupLogging()
     {
         auto now = std::chrono::system_clock::now();
         auto t   = std::chrono::system_clock::to_time_t(now);
         std::stringstream ts;
         ts << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S");
-        std::string folder = "./logs/" + drone_name_ + "_flight_" + ts.str();
+        std::string folder = "./logs/" + drone_name_ + "_" + solver_type_ + "_flight_" + ts.str();
         std::filesystem::create_directories(folder);
 
         commanded_state_log_.open(folder  + "/commanded_state.csv");
         actual_state_log_.open(folder     + "/actual_state.csv");
         first_trajectory_log_.open(folder + "/first_solve_trajectory.csv");
 
-        // commanded_state: state + corresponding control at each MPC tick
         if (commanded_state_log_.is_open())
             commanded_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
                                     "fx,fy,fz,mx,my,mz,thrust_norm\n";
-        // actual_state: sensor data only — no paired control
         if (actual_state_log_.is_open())
             actual_state_log_    << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
-        // first_solve_trajectory: full X[0..N] and U[0..N-1] from the cold-start solve
         if (first_trajectory_log_.is_open())
             first_trajectory_log_ << "node,t,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
                                      "fx,fy,fz,mx,my,mz,thrust_norm\n";
@@ -362,8 +708,6 @@ private:
                             const std::vector<Eigen::VectorXd>& ctrls)
     {
         if (!first_trajectory_log_.is_open()) return;
-        // Each row: node index, time along horizon, full 13-dim state, 6-dim control + thrust_norm.
-        // The terminal node (i == N) has no paired control — write zeros for the control columns.
         for (int i = 0; i < (int)traj.size(); ++i) {
             const auto& s = traj[i];
             if (s.size() < 13) continue;
@@ -372,7 +716,6 @@ private:
                 << i << "," << t;
             for (int j = 0; j < 13; ++j)
                 first_trajectory_log_ << "," << s(j);
-            // Control: use U[i] if available, otherwise zeros for terminal node
             if (i < (int)ctrls.size() && ctrls[i].size() >= 6) {
                 const auto& u = ctrls[i];
                 Eigen::Vector3d f = u.segment(0, 3);
@@ -404,7 +747,6 @@ private:
         if (!commanded_state_log_.is_open() || s.size() < 13) return;
         commanded_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
         for (int i = 0; i < 13; ++i) commanded_state_log_ << "," << s(i);
-        // Append paired control (U[0] — the control applied at this tick)
         if (u.size() >= 6) {
             Eigen::Vector3d f = u.segment(0, 3);
             commanded_state_log_ << "," << f(0) << "," << f(1) << "," << f(2)
@@ -417,7 +759,7 @@ private:
         commanded_state_log_.flush();
     }
 
-    void printDiagnostics(const QuadrotorMPC::Result& result)
+    void printDiagnostics(const SolverResult& result)
     {
         Eigen::Vector3d pos = current_state_.segment(0, 3);
         Eigen::Vector3d vel = current_state_.segment(3, 3);
@@ -425,8 +767,9 @@ private:
         double thrust = result.control_trajectory.empty() ? 0.0
             : result.control_trajectory[0].segment(0, 3).norm();
         RCLCPP_INFO(this->get_logger(),
-            "MPC %.1fms | pos[%.3f,%.3f,%.3f] vel[%.3f,%.3f,%.3f] "
+            "[%s] %.1fms | pos[%.3f,%.3f,%.3f] vel[%.3f,%.3f,%.3f] "
             "w[%.3f,%.3f,%.3f]rad/s | T=%.3fN",
+            solver_type_.c_str(),
             result.solve_time_ms,
             pos.x(), pos.y(), pos.z(),
             vel.x(), vel.y(), vel.z(),
@@ -435,27 +778,50 @@ private:
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Members
+    //  Members
     // ─────────────────────────────────────────────────────────────────────────
-    std::unique_ptr<QuadrotorMPC> mpc_;
-    std::string                   drone_name_;
-    bool                          logging_enabled_;
-    int                           solver_rate_;
-    double                        ocp_dt_ = 0.05;
-    int                           n_shift_ = 1;   // steps to shift warm-start per tick
 
-    // Publishers
-    rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr cmd_pub_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                  traj_pub_;
+    // Config
+    std::string platform_;
+    std::string solver_type_;
+    std::string drone_name_;
+    bool        logging_enabled_;
+    int         solver_rate_;
+    double      ocp_dt_  = 0.1;
+    int         n_shift_ = 1;
 
-    // Subscribers
-    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr  pose_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr          odom_sub_;
+    // Solvers (only one is active)
+    std::unique_ptr<QuadrotorMPC> alipddp_mpc_;
+#ifdef HAS_ACADOS
+    std::unique_ptr<AcadosMPC>    acados_mpc_;
+#endif
 
-    // Timer — single solver timer replaces the old solver+control pair
-    rclcpp::TimerBase::SharedPtr solver_timer_;
+    // ── Crazyflie publishers / subscribers ────────────────────────────────────
+    rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr cf_cmd_pub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr   pose_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr           odom_sub_;
 
-    // State — assembled from /pose and /odom callbacks
+    // ── PX4 publishers / subscribers ──────────────────────────────────────────
+#ifdef HAS_PX4_MSGS
+    rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr     px4_setpoint_pub_;
+    rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr    px4_offboard_pub_;
+    rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr         px4_cmd_pub_;
+    rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr    px4_odom_sub_;
+    rclcpp::TimerBase::SharedPtr                                        px4_heartbeat_timer_;
+#endif
+
+    // ── Shared ────────────────────────────────────────────────────────────────
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
+    rclcpp::TimerBase::SharedPtr                      solver_timer_;
+    rclcpp::TimerBase::SharedPtr                      cmd_timer_;
+
+    // ── Trajectory interpolation (for 100 Hz command loop) ────────────────────
+    std::vector<Eigen::VectorXd> latest_X_;
+    std::vector<Eigen::VectorXd> latest_U_;
+    Clock::time_point            traj_start_time_;
+    bool                         have_trajectory_ = false;
+
+    // State
     Eigen::VectorXd current_state_;
     bool pose_received_ = false;
     bool odom_received_ = false;
@@ -463,13 +829,13 @@ private:
 
     // Logging
     bool logging_initialized_ = false;
-    std::ofstream commanded_state_log_;   // state[1..] + paired U[0] per tick
-    std::ofstream actual_state_log_;      // sensor state only — no paired control
-    std::ofstream first_trajectory_log_;  // full X[0..N] + U[0..N-1] from first solve
+    std::ofstream commanded_state_log_;
+    std::ofstream actual_state_log_;
+    std::ofstream first_trajectory_log_;
     bool          first_solve_logged_ = false;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);

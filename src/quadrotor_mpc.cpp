@@ -6,9 +6,6 @@ using namespace std;
 
 QuadrotorMPC::QuadrotorMPC(const Config& config) : config_(config) {
     // Solver parameters are defined per-OCP in ocp_registry.hpp.
-    // Each OCP tunes these independently: hover needs fewer iterations and
-    // lower rho (simple quadratic, one inequality), landing needs higher rho
-    // and more iterations (SOC constraints + soft terminal cost).
     try {
         solver_params_ = OCPRegistry::getSolverParams(config_.ocp_type);
     } catch (const std::runtime_error& e) {

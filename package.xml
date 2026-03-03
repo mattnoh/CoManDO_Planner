@@ -3,7 +3,7 @@
 <package format="3">
   <name>comando_planner</name>
   <version>0.1.0</version>
-  <description>CoManDO MPC planner using ALIPDDP solver for Crazyflie control</description>
+  <description>CoManDO MPC planner — ALIPDDP and acados solvers, Crazyflie and PX4 platforms</description>
   <maintainer email="your_email@example.com">Your Name</maintainer>
   <license>MIT</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -15,6 +15,8 @@
   <depend>tf2_ros</depend>
   <!-- Crazyflie interface messages -->
   <depend>crazyflie_interfaces</depend>
+  <!-- PX4 interface messages (optional — build proceeds without it) -->
+  <exec_depend>px4_msgs</exec_depend>
   <!-- Eigen for linear algebra -->
   <depend>eigen</depend>
   <test_depend>ament_lint_auto</test_depend>
