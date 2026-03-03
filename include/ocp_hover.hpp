@@ -69,14 +69,15 @@ public:
 
         Scalar att_err = qv.squaredNorm() + (1.0 - q0) * (1.0 - q0);
 
-        Eigen::Vector3d f = u.template segment<3>(0);
-        Eigen::Vector3d m = u.template segment<3>(3);
+        // u = [fz_B, Mx, My, Mz]
+        Scalar fz  = u(0);
+        Eigen::Vector3d m = u.template segment<3>(1);
 
         return W_POS_STAGE     * (pos - target_pos_).squaredNorm()
              + W_VEL_STAGE     * (vel - target_vel_).squaredNorm()
              + W_ATT_STAGE     * att_err
              + W_ANGRATE_STAGE * omega.squaredNorm()
-             + W_THRUST        * f.squaredNorm()
+             + W_THRUST        * fz * fz
              + W_MOMENT        * m.squaredNorm();
     }
 
@@ -99,9 +100,10 @@ public:
 
     Vector<Scalar> qu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x;
+        // u = [fz_B, Mx, My, Mz]
         Vector<Scalar> g = Vector<Scalar>::Zero(u.size());
-        g.template segment<3>(0) = 2.0 * W_THRUST * u.template segment<3>(0);
-        g.template segment<3>(3) = 2.0 * W_MOMENT * u.template segment<3>(3);
+        g(0) = 2.0 * W_THRUST * u(0);
+        g.template segment<3>(1) = 2.0 * W_MOMENT * u.template segment<3>(1);
         return g;
     }
 
@@ -120,9 +122,10 @@ public:
 
     Matrix<Scalar> quu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; (void)u;
+        // u = [fz_B, Mx, My, Mz]
         Matrix<Scalar> H = Matrix<Scalar>::Zero(u.size(), u.size());
-        H.template block<3,3>(0,0) = 2.0 * W_THRUST * Matrix<Scalar>::Identity(3,3);
-        H.template block<3,3>(3,3) = 2.0 * W_MOMENT * Matrix<Scalar>::Identity(3,3);
+        H(0, 0) = 2.0 * W_THRUST;
+        H.template block<3,3>(1,1) = 2.0 * W_MOMENT * Matrix<Scalar>::Identity(3,3);
         return H;
     }
 
@@ -207,11 +210,12 @@ public:
         this->dim_c = 1;
     }
 
+    // fz_B <= FMAX  →  fz_B - FMAX <= 0
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x;
         Vector<Scalar> c_n(1);
-        c_n(0) = fmax_ - u.template segment<3>(0).norm();
-        return -c_n;   // we require c(x,u) <= 0
+        c_n(0) = u(0) - fmax_;
+        return c_n;
     }
 
     Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
@@ -220,13 +224,10 @@ public:
     }
 
     Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x;
+        (void)x; (void)u;
         Matrix<Scalar> J = Matrix<Scalar>::Zero(1, u.size());
-        auto f = u.template segment<3>(0).eval();
-        Scalar nf = f.norm();
-        if (nf > 1e-8)
-            J.template block<1,3>(0, 0) = -f.transpose() / nf;
-        return -J;
+        J(0, 0) = 1.0;
+        return J;
     }
 };
 
@@ -266,13 +267,10 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     // Initial state
     prob->setInitialState(0, current_state);
 
-    // Warm‑start: gravity‑cancelling thrust in body frame
-    Eigen::Quaterniond q(current_state(6), current_state(7),
-                         current_state(8), current_state(9));
-    q.normalize();
-    Eigen::Vector3d f0 = q.inverse() * Eigen::Vector3d(0.0, 0.0, MASS * 9.81);
-    Eigen::VectorXd u0(6);
-    u0 << f0(0), f0(1), f0(2), 0.0, 0.0, 0.0;
+    // Warm-start: gravity-compensating thrust on body-z, zero moments
+    // u = [fz_B, Mx, My, Mz]
+    Eigen::VectorXd u0(4);
+    u0 << MASS * 9.81, 0.0, 0.0, 0.0;
     for (int i = 0; i < HORIZON; ++i)
         prob->setInitialControl(i, u0);
 

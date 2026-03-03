@@ -13,7 +13,7 @@ namespace LandingOCP {
 
 // ── Fixed parameters (mirroring standalone solve — verified: err 0.0003) ──────
 const int    HORIZON = 100;                      // 100 steps × 0.1s = 10s horizon
-const double DT      = 0.2;                      // seconds (standalone used 0.1)
+const double DT      = 0.1;                      // seconds (standalone used 0.1)
 const double MASS    = 0.027;                    // kg
 
 // Scale inertia so that the diagonal entries become ~O(1)
@@ -27,7 +27,7 @@ const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
 const double FMIN        = 0.08;                  // N — 30% hover thrust
 const double FMAX        = 0.6;                   // N (standalone used 1.2)
 const double GLIDESLOPE  = 70.0;                  // degrees (unchanged)
-const double THRUST_CONE = 60.0;                   // degrees (standalone used 60°)
+const double TILT_CONE   = 60.0;                   // degrees — max vehicle tilt from vertical
 
 // ── Solver parameters (tuned for landing — verified working in standalone) ────
 // Higher tolerance + max_iter lets outer loop converge on cold start,
@@ -45,15 +45,15 @@ const double SOLVER_RHOT = 50.0;
 // Q: running state cost (13x13) — nonzero penalises drift during horizon
 static const Eigen::VectorXd Q_DIAG = (Eigen::VectorXd(13) <<
     2.0, 2.0, 2.0,                    // position  x, y, z
-    1.0, 1.0, 10.0,                    // velocity  vx, vy, vz
+    10.0, 10.0, 10.0,                    // velocity  vx, vy, vz
     0.5,                               // quaternion qw
     0.5, 0.5, 0.5,                    // quaternion qx, qy, qz
     0.5, 0.5, 0.5).finished();        // angular rate wx, wy, wz
 
-// R: running control cost (6x6) – must be > 0 for well‑conditioned Q_uu
-static const Eigen::VectorXd R_DIAG = (Eigen::VectorXd(6) <<
-    1e-3, 1e-3, 1e-3,   // thrust (fx, fy, fz)
-    1e-2, 1e-2, 1e-2).finished();   // moments (mx, my, mz)
+// R: running control cost (4x4) – u = [fz_B, Mx, My, Mz]
+static const Eigen::VectorXd R_DIAG = (Eigen::VectorXd(4) <<
+    1e-3,               // fz_B (body-z thrust)
+    1e-4, 1e-4, 1e-4).finished();   // moments (Mx, My, Mz)
 
 // P: terminal state cost (13x13) – large enough to drive x_N ≈ x_ref
 static const Eigen::VectorXd P_DIAG = (Eigen::VectorXd(13) <<
@@ -73,8 +73,8 @@ static Eigen::VectorXd make_x_ref() {
 
 // ── Reference control: gravity‑compensating hover ────────────────────────────
 static Eigen::VectorXd make_u_ref() {
-    Eigen::VectorXd ur = Eigen::VectorXd::Zero(6);
-    ur(2) = MASS * 9.81;   // fz = mg
+    Eigen::VectorXd ur = Eigen::VectorXd::Zero(4);
+    ur(0) = MASS * 9.81;   // fz_B = mg
     return ur;
 }
 
@@ -169,11 +169,12 @@ public:
         this->dim_c = 1;
     }
 
+    // fz_B <= FMAX
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x;
         Vector<Scalar> c_n(1);
-        c_n(0) = fmax_ - u.template segment<3>(0).norm();
-        return -c_n;
+        c_n(0) = u(0) - fmax_;
+        return c_n;
     }
 
     Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
@@ -182,13 +183,10 @@ public:
     }
 
     Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x;
+        (void)x; (void)u;
         Matrix<Scalar> J = Matrix<Scalar>::Zero(1, u.size());
-        auto f = u.template segment<3>(0).eval();
-        Scalar nf = f.norm();
-        if (nf > 1e-8)
-            J.template block<1,3>(0, 0) = -f.transpose() / nf;
-        return -J;
+        J(0, 0) = 1.0;
+        return J;
     }
 };
 
@@ -205,7 +203,7 @@ public:
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x;
         Vector<Scalar> c_n(1);
-        c_n(0) = FMIN - u(2);
+        c_n(0) = FMIN - u(0);   // fz_B >= FMIN
         return c_n;
     }
     Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
@@ -215,7 +213,7 @@ public:
     Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; (void)u;
         Matrix<Scalar> J = Matrix<Scalar>::Zero(1, u.size());
-        J(0, 2) = -1.0;
+        J(0, 0) = -1.0;
         return J;
     }
 };
@@ -259,40 +257,40 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Thrust cone constraint (SOC)
+// Tilt cone constraint (SOC on state quaternion)
+// ||[qx, qy]||_2 <= sin(tilt_max/2)  (exact formula from cos(phi)=1-2*(qx^2+qy^2))
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
-class ThrustConeConstraint : public StageConstraintBase<Scalar> {
+class TiltConeConstraint : public StageConstraintBase<Scalar> {
 private:
-    Scalar tan_tc_;
+    Scalar tilt_limit_;
 public:
-    ThrustConeConstraint(Scalar theta_max_deg = THRUST_CONE) {
-        tan_tc_ = std::tan(theta_max_deg * M_PI / 180.0);
+    TiltConeConstraint(Scalar theta_max_deg = TILT_CONE) {
+        tilt_limit_ = std::sqrt((1.0 - std::cos(theta_max_deg * M_PI / 180.0)) / 2.0);
         this->constraint_type = ConstraintType::SOC;
         this->dim_c = 3;
     }
 
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        (void)x;
+        (void)u;
         Vector<Scalar> c_n(3);
-        c_n(0) = tan_tc_ * u(2);
-        c_n(1) = u(0);
-        c_n(2) = u(1);
+        c_n(0) = tilt_limit_;   // -c_n(0) = -tilt_limit (the cone apex)
+        c_n(1) = x(7);          // qx
+        c_n(2) = x(8);          // qy
         return -c_n;
     }
 
     Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; (void)u;
-        return Matrix<Scalar>::Zero(3, x.size());
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(3, x.size());
+        J(1, 7) = 1.0;   // d/d(qx)
+        J(2, 8) = 1.0;   // d/d(qy)
+        return -J;
     }
 
     Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; (void)u;
-        Matrix<Scalar> J = Matrix<Scalar>::Zero(3, u.size());
-        J(0, 2) = tan_tc_;
-        J(1, 0) = 1.0;
-        J(2, 1) = 1.0;
-        return -J;
+        return Matrix<Scalar>::Zero(3, u.size());
     }
 };
 
@@ -329,7 +327,7 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
 
     // Stage constraints with standalone parameters
     auto gs = std::make_shared<GlideslopeConstraint<double>>(GLIDESLOPE);
-    auto tc = std::make_shared<ThrustConeConstraint<double>>(THRUST_CONE);
+    auto tc = std::make_shared<TiltConeConstraint<double>>(TILT_CONE);
     auto mt = std::make_shared<MaxThrustConstraint<double>>(FMAX);
     auto fmin = std::make_shared<MinThrustConstraint<double>>();
     for (int i = 0; i < HORIZON; ++i) {
@@ -342,13 +340,9 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     // Initial state
     prob->setInitialState(0, current_state);
 
-    // Warm-start: gravity-cancelling thrust in body frame
-    Eigen::Quaterniond q(current_state(6), current_state(7),
-                         current_state(8), current_state(9));
-    q.normalize();
-    Eigen::Vector3d f0 = q.inverse() * Eigen::Vector3d(0.0, 0.0, MASS * 9.81);
-    Eigen::VectorXd u0(6);
-    u0 << f0(0), f0(1), f0(2), 0.0, 0.0, 0.0;
+    // Warm-start: gravity compensation on body-z thrust, zero moments
+    Eigen::VectorXd u0(4);
+    u0 << MASS * 9.81, 0.0, 0.0, 0.0;   // [fz_B, Mx, My, Mz]
     for (int i = 0; i < HORIZON; ++i)
         prob->setInitialControl(i, u0);
 

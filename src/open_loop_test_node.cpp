@@ -187,8 +187,8 @@ private:
                     current_state_(2) = msg->pose.position.z;
                     current_state_(6) = msg->pose.orientation.w;
                     current_state_(7) = msg->pose.orientation.x;
-                    current_state_(8) = msg->pose.orientation.y;
-                    current_state_(9) = msg->pose.orientation.z;
+                    current_state_(8) = -msg->pose.orientation.y;  // FRD→FLU
+                    current_state_(9) = -msg->pose.orientation.z;  // FRD→FLU
                     pose_received_ = true;
                 }
             });
@@ -240,12 +240,12 @@ private:
         current_state_(5) = msg->twist.twist.linear.z;
         current_state_(6) = msg->pose.pose.orientation.w;
         current_state_(7) = msg->pose.pose.orientation.x;
-        current_state_(8) = msg->pose.pose.orientation.y;
-        current_state_(9) = msg->pose.pose.orientation.z;
+        current_state_(8) = -msg->pose.pose.orientation.y;   // FRD→FLU
+        current_state_(9) = -msg->pose.pose.orientation.z;   // FRD→FLU
         constexpr double DEG2RAD = M_PI / 180.0;
         current_state_(10) = msg->twist.twist.angular.x * DEG2RAD;
-        current_state_(11) = msg->twist.twist.angular.y * DEG2RAD;
-        current_state_(12) = msg->twist.twist.angular.z * DEG2RAD;
+        current_state_(11) = -msg->twist.twist.angular.y * DEG2RAD;  // FRD→FLU
+        current_state_(12) = -msg->twist.twist.angular.z * DEG2RAD;  // FRD→FLU
         pose_received_ = true;
         odom_received_ = true;
     }
@@ -352,12 +352,14 @@ private:
         const Eigen::VectorXd& x_cmd = ref_X_[step];
 
         // Feedforward acceleration from the corresponding control
+        // u = [fz_B, Mx, My, Mz] — only thrust (u(0)) contributes to acceleration
         Eigen::Vector3d acc_ff = Eigen::Vector3d::Zero();
-        if (step < static_cast<int>(ref_U_.size()) && ref_U_[step].size() >= 3) {
+        if (step < static_cast<int>(ref_U_.size()) && ref_U_[step].size() >= 1) {
             constexpr double CF_MASS = 0.027;  // kg
             Eigen::Quaterniond q_cmd(x_cmd(6), x_cmd(7), x_cmd(8), x_cmd(9));
             q_cmd.normalize();
-            acc_ff = q_cmd.toRotationMatrix() * ref_U_[step].head(3) / CF_MASS;
+            Eigen::Vector3d f_body(0.0, 0.0, ref_U_[step](0));  // thrust along body-z only
+            acc_ff = q_cmd.toRotationMatrix() * f_body / CF_MASS;
             acc_ff.z() -= 9.81;  // Mellinger adds gravity back
         }
 
@@ -419,13 +421,13 @@ private:
         msg.twist.linear.x     = s(3);
         msg.twist.linear.y     = s(4);
         msg.twist.linear.z     = s(5);
-        msg.pose.orientation.w = s(6);
-        msg.pose.orientation.x = s(7);
-        msg.pose.orientation.y = s(8);
-        msg.pose.orientation.z = s(9);
-        msg.twist.angular.x    = s(10);
-        msg.twist.angular.y    = s(11);
-        msg.twist.angular.z    = s(12);
+        msg.pose.orientation.w =  s(6);      // qw unchanged
+        msg.pose.orientation.x =  s(7);      // qx unchanged
+        msg.pose.orientation.y = -s(8);      // qy: FLU→FRD flip
+        msg.pose.orientation.z = -s(9);      // qz: FLU→FRD flip
+        msg.twist.angular.x    =  s(10);     // wx unchanged
+        msg.twist.angular.y    = -s(11);     // wy: FLU→FRD flip
+        msg.twist.angular.z    = -s(12);     // wz: FLU→FRD flip
         msg.acc.x = acc_ff(0);
         msg.acc.y = acc_ff(1);
         msg.acc.z = acc_ff(2);
@@ -531,12 +533,12 @@ private:
                 << i << "," << (i * ocp_dt_);
             for (int j = 0; j < 13; ++j)
                 planned_log_ << "," << s(j);
-            if (i < static_cast<int>(ref_U_.size()) && ref_U_[i].size() >= 6) {
+            if (i < static_cast<int>(ref_U_.size()) && ref_U_[i].size() >= 4) {
                 const auto& u = ref_U_[i];
-                Eigen::Vector3d f = u.segment(0, 3);
-                planned_log_ << "," << f(0) << "," << f(1) << "," << f(2)
-                             << "," << u(3) << "," << u(4) << "," << u(5)
-                             << "," << f.norm();
+                // u = [fz, Mx, My, Mz]
+                planned_log_ << ",0,0," << u(0)  // fx=0, fy=0, fz=u(0)
+                             << "," << u(1) << "," << u(2) << "," << u(3)  // Mx, My, Mz
+                             << "," << u(0);  // thrust_norm = fz
             } else {
                 planned_log_ << ",0,0,0,0,0,0,0";
             }

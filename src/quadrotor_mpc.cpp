@@ -199,7 +199,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
             prev_U_            = U_result;
             has_prev_solution_ = true;
 
-            for (int i = 0; i < min(4, (int)X_result.size()); ++i)
+            for (int i = 0; i < std::min(4, (int)X_result.size()); ++i)
                 cout << "X[" << i << "]: " << X_result[i].transpose() << "\n";
         } else {
             cerr << "ERROR: Empty trajectory from solver\n";

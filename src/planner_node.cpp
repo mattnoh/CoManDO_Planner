@@ -38,7 +38,6 @@
 #include "acados_solver.hpp"
 #endif
 
-#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <filesystem>
@@ -204,15 +203,7 @@ public:
         solver_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(1000 / solver_rate_),
             std::bind(&PlannerNode::solverLoop, this));
-        // ── High-rate command publishing (100 Hz) ─────────────────────────
-        // Interpolates along the latest planned trajectory so the
-        // reference ramps smoothly from X[0] (≈ current state) to X[1]
-        // over one ocp_dt.  Without this, jumping directly to X[1]
-        // creates a large velocity error that Mellinger double-counts
-        // with acc_ff, generating violent angular rates on the drone.
-        cmd_timer_ = this->create_wall_timer(
-            10ms,
-            std::bind(&PlannerNode::cmdPublishLoop, this));
+
         RCLCPP_INFO(this->get_logger(),
             "Planner ready  platform=%s  solver=%s  ocp=%s  rate=%dHz  ocp_dt=%.3fs  n_shift=%d",
             platform_.c_str(), solver_type_.c_str(), ocp.c_str(),
@@ -315,17 +306,27 @@ private:
         current_state_(4) = msg->twist.twist.linear.y;
         current_state_(5) = msg->twist.twist.linear.z;
 
-        // Quaternion (from stabilizer euler angles in the same log sample)
+        // Quaternion (FRD→FLU frame correction)
+        // Crazyflie firmware uses FRD (front-right-down), but MPC is in FLU (front-left-up).
+        // Qx stays the same; Qy and Qz flip sign.
         current_state_(6) = msg->pose.pose.orientation.w;
-        current_state_(7) = msg->pose.pose.orientation.x;
-        current_state_(8) = msg->pose.pose.orientation.y;
-        current_state_(9) = msg->pose.pose.orientation.z;
+        current_state_(7) = msg->pose.pose.orientation.x;      // qx unchanged
+        current_state_(8) = -msg->pose.pose.orientation.y;     // qy flips sign (FRD→FLU)
+        current_state_(9) = -msg->pose.pose.orientation.z;     // qz flips sign (FRD→FLU)
 
         // Angular rate (body frame, gyro.x/y/z — in deg/s → rad/s)
+        // Apply same FRD→FLU correction to angular rates
         constexpr double DEG2RAD = M_PI / 180.0;
-        current_state_(10) = msg->twist.twist.angular.x * DEG2RAD;
-        current_state_(11) = msg->twist.twist.angular.y * DEG2RAD;
-        current_state_(12) = msg->twist.twist.angular.z * DEG2RAD;
+        Eigen::Vector3d raw_omega;
+        raw_omega(0) = msg->twist.twist.angular.x * DEG2RAD;
+        raw_omega(1) = -msg->twist.twist.angular.y * DEG2RAD;
+        raw_omega(2) = -msg->twist.twist.angular.z * DEG2RAD;
+
+        // EMA filter on angular rates: attenuates IMU noise/transients from Mellinger's inner loop
+        filtered_omega_ = OMEGA_FILTER_ALPHA * raw_omega + (1.0 - OMEGA_FILTER_ALPHA) * filtered_omega_;
+        current_state_(10) = filtered_omega_(0);
+        current_state_(11) = filtered_omega_(1);
+        current_state_(12) = filtered_omega_(2);
 
         pose_received_ = true;
         odom_received_ = true;
@@ -476,25 +477,42 @@ private:
             const auto& X = result.state_trajectory;
             const auto& U = result.control_trajectory;
 
-            // ── Store trajectory for high-rate command interpolation ──────
-            // cmdPublishLoop() (100 Hz) walks X[0]→X[1] smoothly so the
-            // Mellinger controller never sees a large velocity jump.
-            // This is why the open-loop test works: it publishes X[0]
-            // first (zero tracking error), then X[1] next tick (by which
-            // time the drone has already moved via acc_ff).  We reproduce
-            // that gradual ramp-up here.
-            latest_X_ = X;
-            latest_U_ = U;
-            traj_start_time_ = Clock::now();
-            have_trajectory_ = true;
+            // ── Feedforward acceleration from MPC's body-frame forces ────────
+            // The Mellinger controller computes desired thrust as:
+            //   F.x = mass * acc_ff.x + Kp * ep.x + Kd * ev.x
+            //   F.y = mass * acc_ff.y + Kp * ep.y + Kd * ev.y
+            //   F.z = mass * (acc_ff.z + g) + Kp * ep.z + Kd * ev.z
+            //
+            // Without feedforward (acc_ff=0), the PD loop must generate ALL
+            // acceleration, causing aggressive tilting (27° for 0.7 m/s vel
+            // error) and huge angular rates (>190 deg/s) that the MPC never
+            // predicted, leading to divergence on the next solve.
+            // u = [fz_B, Mx, My, Mz] — only thrust (u(0)) contributes to acceleration
+            Eigen::Vector3d acc_ff = Eigen::Vector3d::Zero();
+            if (!U.empty() && U[0].size() >= 1) {
+                constexpr double CF_MASS = 0.027;  // kg (Crazyflie mass)
+                Eigen::Quaterniond q_cur(current_state_(6), current_state_(7),
+                                         current_state_(8), current_state_(9));
+                q_cur.normalize();
+                Eigen::Vector3d f_body(0.0, 0.0, U[0](0));  // thrust along body-z only
+                acc_ff = q_cur.toRotationMatrix() * f_body / CF_MASS;
+                acc_ff.z() -= 9.81;  // Mellinger adds GRAVITY_MAGNITUDE back
+            }
+
+            // ── Platform-specific command publishing ──────────────────────────
+            if (platform_ == "crazyflie") {
+                publishCrazyflieCommand(X[1], acc_ff);
+            } else {
+                publishPX4Command(X[1], acc_ff);
+            }
 
             publishTrajectory(X);
 
             // ── Logging ──────────────────────────────────────────────────────
             if (logging_enabled_ && logging_initialized_) {
                 logActualState();
-                const Eigen::VectorXd& u0 = U.empty() ? Eigen::VectorXd::Zero(6) : U[0];
-                logCommandedState(X[0], u0);
+                const Eigen::VectorXd& u0 = U.empty() ? Eigen::VectorXd::Zero(4) : U[0];
+                logCommandedState(X[1], u0);
                 if (!first_solve_logged_) {
                     logFirstTrajectory(X, U);
                     first_solve_logged_ = true;
@@ -506,68 +524,6 @@ private:
 
         } else {
             RCLCPP_WARN(this->get_logger(), "MPC solve failed (%s)", solver_type_.c_str());
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  High-rate command interpolation (100 Hz)
-    //
-    //  WHY THIS EXISTS:
-    //    The MPC solves every ocp_dt (100 ms).  Publishing X[1] directly as
-    //    the Mellinger reference creates a large velocity gap (drone at rest,
-    //    reference at planned velocity).  Mellinger's Kd term generates
-    //    aggressive forces ON TOP of acc_ff, double-counting the planned
-    //    acceleration.  This causes >4 rad/s angular rates in 0.1s,
-    //    corrupting the next warm start and making the solver diverge.
-    //
-    //    The open-loop test avoids this by publishing X[0] first (zero
-    //    tracking error), then X[1] on the next tick (by which time the
-    //    drone has been pushed by acc_ff and is already near X[1]).
-    //
-    //    This loop reproduces that gradual ramp-up: at t=0 after a solve
-    //    it publishes X[0] (the full solver state), then linearly
-    //    interpolates toward X[1] over ocp_dt.  Tracking error stays
-    //    small at every tick, so Mellinger's PD terms stay small and only
-    //    acc_ff drives the motion — exactly like the standalone RH test.
-    // ─────────────────────────────────────────────────────────────────────────
-
-    void cmdPublishLoop()
-    {
-        if (!have_trajectory_ || latest_X_.size() < 2 || latest_U_.empty())
-            return;
-
-        // How far along the current solve interval are we?
-        double elapsed = std::chrono::duration<double>(
-            Clock::now() - traj_start_time_).count();
-        double t_frac = elapsed / ocp_dt_;
-
-        // Walk further along the trajectory if the solver is slow
-        int k = std::max(0, std::min(static_cast<int>(std::floor(t_frac)),
-                                     static_cast<int>(latest_X_.size()) - 2));
-        double alpha = std::max(0.0, std::min(t_frac - k, 1.0));
-
-        // Linear interpolation between X[k] and X[k+1]  (full 13-dim state)
-        const auto& xa = latest_X_[k];
-        const auto& xb = latest_X_[k + 1];
-        Eigen::VectorXd x_ref = (1.0 - alpha) * xa + alpha * xb;
-
-        // Renormalize quaternion after linear interpolation
-        double qn = x_ref.segment(6, 4).norm();
-        if (qn > 1e-8) x_ref.segment(6, 4) /= qn;
-
-        // Feedforward acceleration from U[k], rotated by the interpolated
-        // orientation (body-frame → world-frame).
-        constexpr double CF_MASS = 0.027;
-        int uk = std::min(k, static_cast<int>(latest_U_.size()) - 1);
-        Eigen::Quaterniond q_ref(x_ref(6), x_ref(7), x_ref(8), x_ref(9));
-        Eigen::Vector3d acc_ff = q_ref.toRotationMatrix()
-                               * latest_U_[uk].head(3) / CF_MASS;
-        acc_ff.z() -= 9.81;  // Mellinger adds gravity back
-
-        if (platform_ == "crazyflie") {
-            publishCrazyflieCommand(x_ref, acc_ff);
-        } else {
-            publishPX4Command(x_ref, acc_ff);
         }
     }
 
@@ -587,13 +543,13 @@ private:
         msg.twist.linear.x    = s(3);
         msg.twist.linear.y    = s(4);
         msg.twist.linear.z    = s(5);
-        msg.pose.orientation.w = s(6);
-        msg.pose.orientation.x = s(7);
-        msg.pose.orientation.y = s(8);
-        msg.pose.orientation.z = s(9);
-        msg.twist.angular.x   = s(10);
-        msg.twist.angular.y   = s(11);
-        msg.twist.angular.z   = s(12);
+        msg.pose.orientation.w =  s(6);      // qw unchanged
+        msg.pose.orientation.x =  s(7);      // qx unchanged
+        msg.pose.orientation.y = -s(8);      // qy: FLU→FRD flip
+        msg.pose.orientation.z = -s(9);      // qz: FLU→FRD flip
+        msg.twist.angular.x   =  s(10);      // wx unchanged
+        msg.twist.angular.y   = -s(11);      // wy: FLU→FRD flip
+        msg.twist.angular.z   = -s(12);      // wz: FLU→FRD flip
         msg.acc.x = acc_cmd(0);
         msg.acc.y = acc_cmd(1);
         msg.acc.z = acc_cmd(2);
@@ -716,12 +672,12 @@ private:
                 << i << "," << t;
             for (int j = 0; j < 13; ++j)
                 first_trajectory_log_ << "," << s(j);
-            if (i < (int)ctrls.size() && ctrls[i].size() >= 6) {
+            if (i < (int)ctrls.size() && ctrls[i].size() >= 4) {
                 const auto& u = ctrls[i];
-                Eigen::Vector3d f = u.segment(0, 3);
-                first_trajectory_log_ << "," << f(0) << "," << f(1) << "," << f(2)
-                                      << "," << u(3) << "," << u(4) << "," << u(5)
-                                      << "," << f.norm();
+                // u = [fz, Mx, My, Mz]
+                first_trajectory_log_ << ",0,0," << u(0)  // fx=0, fy=0, fz=u(0)
+                                      << "," << u(1) << "," << u(2) << "," << u(3)  // Mx, My, Mz
+                                      << "," << u(0);  // thrust_norm = fz
             } else {
                 first_trajectory_log_ << ",0,0,0,0,0,0,0";
             }
@@ -747,11 +703,11 @@ private:
         if (!commanded_state_log_.is_open() || s.size() < 13) return;
         commanded_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
         for (int i = 0; i < 13; ++i) commanded_state_log_ << "," << s(i);
-        if (u.size() >= 6) {
-            Eigen::Vector3d f = u.segment(0, 3);
-            commanded_state_log_ << "," << f(0) << "," << f(1) << "," << f(2)
-                                 << "," << u(3) << "," << u(4) << "," << u(5)
-                                 << "," << f.norm();
+        if (u.size() >= 4) {
+            // u = [fz, Mx, My, Mz]
+            commanded_state_log_ << ",0,0," << u(0)  // fx=0, fy=0, fz=u(0)
+                                 << "," << u(1) << "," << u(2) << "," << u(3)  // Mx, My, Mz
+                                 << "," << u(0);  // thrust_norm = fz
         } else {
             commanded_state_log_ << ",0,0,0,0,0,0,0";
         }
@@ -765,7 +721,7 @@ private:
         Eigen::Vector3d vel = current_state_.segment(3, 3);
         Eigen::Vector3d ww  = current_state_.segment(10, 3);
         double thrust = result.control_trajectory.empty() ? 0.0
-            : result.control_trajectory[0].segment(0, 3).norm();
+            : result.control_trajectory[0](0);  // u(0) = fz only
         RCLCPP_INFO(this->get_logger(),
             "[%s] %.1fms | pos[%.3f,%.3f,%.3f] vel[%.3f,%.3f,%.3f] "
             "w[%.3f,%.3f,%.3f]rad/s | T=%.3fN",
@@ -813,16 +769,11 @@ private:
     // ── Shared ────────────────────────────────────────────────────────────────
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
     rclcpp::TimerBase::SharedPtr                      solver_timer_;
-    rclcpp::TimerBase::SharedPtr                      cmd_timer_;
-
-    // ── Trajectory interpolation (for 100 Hz command loop) ────────────────────
-    std::vector<Eigen::VectorXd> latest_X_;
-    std::vector<Eigen::VectorXd> latest_U_;
-    Clock::time_point            traj_start_time_;
-    bool                         have_trajectory_ = false;
 
     // State
     Eigen::VectorXd current_state_;
+    Eigen::Vector3d filtered_omega_ = Eigen::Vector3d::Zero();
+    static constexpr double OMEGA_FILTER_ALPHA = 0.3;
     bool pose_received_ = false;
     bool odom_received_ = false;
     bool is_flying_     = false;
