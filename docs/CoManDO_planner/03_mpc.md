@@ -22,9 +22,14 @@ x[k] = [ px, py, pz,           position       (0:2)
           wx, wy, wz ]          angular rate    (10:12)
 ```
 
-Each `u[k]` is the 6-dimensional control:
+Each `u[k]` is the 4-dimensional control:
 
 ```
+u[k] = [ fz_B, body-z thrust (index 0)
+Mx, My, Mz ] body-frame moments (indices 1:3)
+```
+
+> **Note:** Previous versions used 6 inputs `[fx, fy, fz, mx, my, mz]` representing full body-frame forces and torques. This was reduced to 4 inputs because quadrotor thrust acts only along the body-z axis — rotors cannot produce lateral forces directly. See [Chapter 4: Debugging Log](04_debugging_log.md#10-model-validation-via-open-loop-testing) for the rationale and validation process.
 u[k] = [ fx, fy, fz,           body-frame force   (0:2)
           mx, my, mz ]          body-frame torque  (3:5)
 ```

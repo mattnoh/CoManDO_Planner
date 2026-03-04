@@ -35,17 +35,17 @@ const double TILT_CONE   = 60.0;                   // degrees — max vehicle ti
 const double SOLVER_REG1_MIN  = 1e-6;
 const double SOLVER_REG2_MIN  = 1e-2;       // standalone used 1e-2
 const double SOLVER_MU_MUL    = 0.1;
-const double SOLVER_RHO       = 50.0;
-const double SOLVER_RHO_MUL   = 9.0;
+const double SOLVER_RHO       = 1.0;         // default (standalone doesn't override)
+const double SOLVER_RHO_MUL   = 10.0;        // default (standalone doesn't override)
 const double SOLVER_TOLERANCE = 5.0;         // standalone used 5.0
 const int    SOLVER_MAX_ITER  = 300;         // standalone used 300
-const double SOLVER_RHOT = 50.0;
+const double SOLVER_RHOT = 1.0;              // default (standalone doesn't override)
 
 // ── Cost matrices (diagonal, matching standalone — verified working) ──────────
 // Q: running state cost (13x13) — nonzero penalises drift during horizon
 static const Eigen::VectorXd Q_DIAG = (Eigen::VectorXd(13) <<
     2.0, 2.0, 2.0,                    // position  x, y, z
-    10.0, 10.0, 10.0,                    // velocity  vx, vy, vz
+    1.0, 1.0, 1.0,                    // velocity  vx, vy, vz
     0.5,                               // quaternion qw
     0.5, 0.5, 0.5,                    // quaternion qx, qy, qz
     0.5, 0.5, 0.5).finished();        // angular rate wx, wy, wz
