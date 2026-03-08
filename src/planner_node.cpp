@@ -205,10 +205,16 @@ public:
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
 
-        // ── Solver timer ──────────────────────────────────────────────────────
-        solver_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(1000 / solver_rate_),
-            std::bind(&PlannerNode::solverLoop, this));
+        // ── Timer setup depends on mode ─────────────────────────────────────
+        if (mode_ == "mpc") {
+            solver_timer_ = this->create_wall_timer(
+                std::chrono::milliseconds(1000 / solver_rate_),
+                std::bind(&PlannerNode::solverLoop, this));
+        } else {
+            // open_loop: wait for first state, solve once, then replay
+            startup_timer_ = this->create_wall_timer(
+                50ms, std::bind(&PlannerNode::openLoopStartupCheck, this));
+        }
 
         RCLCPP_INFO(this->get_logger(),
             "Planner ready  mode=%s  platform=%s  solver=%s  ocp=%s  rate=%dHz  ocp_dt=%.3fs  n_shift=%d",
@@ -540,7 +546,6 @@ private:
         if (logging_enabled_) {
             setupLogging();
             logging_initialized_ = true;
-            logOpenLoopPlannedTrajectory();
             logSolveTrajectory(ol_ref_X_, ol_ref_U_, result.solve_time_ms);
         }
 
@@ -576,8 +581,11 @@ private:
         }
 #endif
 
-        if (logging_enabled_ && ol_comparison_log_.is_open()) {
-            logOpenLoopComparison(step, x_cmd);
+        if (logging_enabled_ && logging_initialized_) {
+            logActualState();
+            const Eigen::VectorXd u_step = (step < (int)ol_ref_U_.size())
+                ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4);
+            logCommandedState(x_cmd, u_step);
         }
 
         if (ol_replay_step_ % 10 == 0 || trajectory_done) {
@@ -598,7 +606,6 @@ private:
                 RCLCPP_INFO(this->get_logger(),
                     "[OpenLoop] Trajectory complete. Holding final position X[%d].", N);
                 ol_done_logged_ = true;
-                if (ol_comparison_log_.is_open()) ol_comparison_log_.flush();
             }
         } else {
             ++ol_replay_step_;
@@ -754,19 +761,6 @@ private:
             published_commands_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
                                        "acc_x,acc_y,acc_z\n";
 
-        // 5. Open-loop comparison CSV (only in open_loop mode)
-        if (mode_ == "open_loop") {
-            ol_comparison_log_.open(folder + "/commanded_vs_actual.csv");
-            if (ol_comparison_log_.is_open())
-                ol_comparison_log_ <<
-                    "step,t,"
-                    "cmd_x,cmd_y,cmd_z,cmd_vx,cmd_vy,cmd_vz,"
-                    "cmd_qw,cmd_qx,cmd_qy,cmd_qz,cmd_wx,cmd_wy,cmd_wz,"
-                    "act_x,act_y,act_z,act_vx,act_vy,act_vz,"
-                    "act_qw,act_qx,act_qy,act_qz,act_wx,act_wy,act_wz,"
-                    "err_x,err_y,err_z,pos_err_norm\n";
-        }
-
         RCLCPP_INFO(this->get_logger(), "Logging to: %s", folder.c_str());
     }
 
@@ -835,52 +829,6 @@ private:
         }
         commanded_state_log_ << "\n";
         commanded_state_log_.flush();
-    }
-
-    // ── Open-loop specific logging ───────────────────────────────────────────
-
-    void logOpenLoopPlannedTrajectory()
-    {
-        std::ofstream planned_log(log_folder_ + "/planned_trajectory.csv");
-        if (!planned_log.is_open()) return;
-
-        planned_log << "node,t,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
-                       "fz,mx,my,mz\n";
-
-        for (int i = 0; i < (int)ol_ref_X_.size(); ++i) {
-            const auto& s = ol_ref_X_[i];
-            if (s.size() < 13) continue;
-            planned_log << std::fixed << std::setprecision(6)
-                << i << "," << (i * ocp_dt_);
-            for (int j = 0; j < 13; ++j)
-                planned_log << "," << s(j);
-            if (i < (int)ol_ref_U_.size() && ol_ref_U_[i].size() >= 4) {
-                const auto& u = ol_ref_U_[i];
-                planned_log << "," << u(0)
-                            << "," << u(1) << "," << u(2) << "," << u(3);
-            } else {
-                planned_log << ",0,0,0,0";
-            }
-            planned_log << "\n";
-        }
-        planned_log.flush();
-        RCLCPP_INFO(this->get_logger(),
-            "[OpenLoop] Planned trajectory written (%zu nodes)", ol_ref_X_.size());
-    }
-
-    void logOpenLoopComparison(int step, const Eigen::VectorXd& x_cmd)
-    {
-        double t_rel = step * ocp_dt_;
-        Eigen::Vector3d pos_err = current_state_.head(3) - x_cmd.head(3);
-
-        ol_comparison_log_ << std::fixed << std::setprecision(6)
-            << step << "," << t_rel;
-        for (int j = 0; j < 13; ++j)
-            ol_comparison_log_ << "," << x_cmd(j);
-        for (int j = 0; j < 13; ++j)
-            ol_comparison_log_ << "," << current_state_(j);
-        ol_comparison_log_ << "," << pos_err(0) << "," << pos_err(1) << "," << pos_err(2)
-                           << "," << pos_err.norm() << "\n";
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -969,7 +917,6 @@ private:
     std::ofstream actual_state_log_;
     std::ofstream all_solves_log_;
     std::ofstream published_commands_log_;
-    std::ofstream ol_comparison_log_;   // open_loop mode only
     int           solve_count_ = 0;
 };
 
