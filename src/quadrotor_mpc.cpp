@@ -170,6 +170,21 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
             solver_ = make_shared<ALIPDDP<double>>(*problem_);
             solver_->init(solver_params_);
         } else {
+            std::cout << "warmstart x0:  " << current_state.transpose() << "\n";
+            if (prev_X_.size() > 1) {
+                std::cout << "predicted x1:  " << prev_X_[1].transpose() << "\n";
+                const Eigen::VectorXd dx = current_state - prev_X_[1];
+                std::cout << "x0 - x1_pred:  " << dx.transpose() << "\n";
+                std::cout << "||x0 - x1_pred||: " << dx.norm() << "\n";
+            } else {
+                std::cout << "predicted x1:  <missing prev_X_[1]>\n";
+            }
+            if (!prev_U_.empty()) {
+                std::cout << "prev_U_[0]:    " << prev_U_[0].transpose() << "\n";
+            } else {
+                std::cout << "prev_U_[0]:    <missing>\n";
+            }
+
             // Shift warm-start U forward by n_shift steps, then inject
             // x[0] and U directly into the solver without touching multipliers.
             shiftWarmStart();
@@ -199,7 +214,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
             prev_U_            = U_result;
             has_prev_solution_ = true;
 
-            for (int i = 0; i < std::min(4, (int)X_result.size()); ++i)
+            for (int i = 0; i < std::min(20, (int)X_result.size()); ++i)
                 cout << "X[" << i << "]: " << X_result[i].transpose() << "\n";
         } else {
             cerr << "ERROR: Empty trajectory from solver\n";

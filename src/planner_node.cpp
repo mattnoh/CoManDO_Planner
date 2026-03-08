@@ -111,15 +111,17 @@ public:
         this->declare_parameter("enable_logging", true);
         this->declare_parameter("platform",       std::string("crazyflie"));
         this->declare_parameter("solver",         std::string("alipddp"));
+        this->declare_parameter("mode",           std::string("mpc"));
         this->declare_parameter("hover_target_x", 0.0);
         this->declare_parameter("hover_target_y", 0.0);
         this->declare_parameter("hover_target_z", 1.0);
 
-        std::string ocp = this->get_parameter("ocp_type").as_string();
+        ocp_type_        = this->get_parameter("ocp_type").as_string();
         drone_name_      = this->get_parameter("drone_name").as_string();
         logging_enabled_ = this->get_parameter("enable_logging").as_bool();
         platform_        = this->get_parameter("platform").as_string();
         solver_type_     = this->get_parameter("solver").as_string();
+        mode_            = this->get_parameter("mode").as_string();
 
         double tx = this->get_parameter("hover_target_x").as_double();
         double ty = this->get_parameter("hover_target_y").as_double();
@@ -133,6 +135,10 @@ public:
         if (solver_type_ != "alipddp" && solver_type_ != "acados") {
             RCLCPP_ERROR(this->get_logger(), "Unknown solver '%s'. Use 'alipddp' or 'acados'", solver_type_.c_str());
             throw std::runtime_error("Invalid solver: " + solver_type_);
+        }
+        if (mode_ != "mpc" && mode_ != "open_loop") {
+            RCLCPP_ERROR(this->get_logger(), "Unknown mode '%s'. Use 'mpc' or 'open_loop'", mode_.c_str());
+            throw std::runtime_error("Invalid mode: " + mode_);
         }
 #ifndef HAS_ACADOS
         if (solver_type_ == "acados") {
@@ -155,7 +161,7 @@ public:
         terminal(6) = 1.0;  // qw = 1
 
         // ── Solver rate: match 1/ocp_dt for n_shift=1 ────────────────────────
-        double ocp_dt_temp = OCPRegistry::getDT(ocp);
+        double ocp_dt_temp = OCPRegistry::getDT(ocp_type_);
         const int default_solver_rate = static_cast<int>(std::round(1.0 / ocp_dt_temp));
         this->declare_parameter("solver_rate", default_solver_rate);
         solver_rate_ = this->get_parameter("solver_rate").as_int();
@@ -166,7 +172,7 @@ public:
         // ── Create solver ─────────────────────────────────────────────────────
         if (solver_type_ == "alipddp") {
             QuadrotorMPC::Config cfg;
-            cfg.ocp_type       = ocp;
+            cfg.ocp_type       = ocp_type_;
             cfg.terminal_state = terminal;
             cfg.n_shift        = n_shift_;
             alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
@@ -175,7 +181,7 @@ public:
 #ifdef HAS_ACADOS
         else if (solver_type_ == "acados") {
             AcadosMPC::Config cfg;
-            cfg.ocp_type       = ocp;
+            cfg.ocp_type       = ocp_type_;
             cfg.terminal_state = terminal;
             cfg.dt             = ocp_dt_temp;
             cfg.n_shift        = n_shift_;
@@ -205,13 +211,13 @@ public:
             std::bind(&PlannerNode::solverLoop, this));
 
         RCLCPP_INFO(this->get_logger(),
-            "Planner ready  platform=%s  solver=%s  ocp=%s  rate=%dHz  ocp_dt=%.3fs  n_shift=%d",
-            platform_.c_str(), solver_type_.c_str(), ocp.c_str(),
+            "Planner ready  mode=%s  platform=%s  solver=%s  ocp=%s  rate=%dHz  ocp_dt=%.3fs  n_shift=%d",
+            mode_.c_str(), platform_.c_str(), solver_type_.c_str(), ocp_type_.c_str(),
             solver_rate_, ocp_dt_, n_shift_);
         RCLCPP_INFO(this->get_logger(),
             "Target: [%.3f, %.3f, %.3f]", tx, ty, tz);
         RCLCPP_INFO(this->get_logger(),
-            "Waiting for state feedback before starting MPC...");
+            "Waiting for state feedback before starting...");
     }
 
 private:
@@ -450,17 +456,152 @@ private:
                 logActualState();
                 const Eigen::VectorXd& u0 = U.empty() ? Eigen::VectorXd::Zero(4) : U[0];
                 logCommandedState(X[1], u0);
-                if (!first_solve_logged_) {
-                    logFirstTrajectory(X, U);
-                    first_solve_logged_ = true;
-                }
+                logSolveTrajectory(X, U, result.solve_time_ms);
             }
 
-            static int diag_count = 0;
-            if (++diag_count % 10 == 0) printDiagnostics(result);
+            if (++diag_count_ % 10 == 0) printDiagnostics(result);
 
         } else {
             RCLCPP_WARN(this->get_logger(), "MPC solve failed (%s)", solver_type_.c_str());
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Unified solve helper — calls whichever solver is active
+    // ═════════════════════════════════════════════════════════════════════════
+
+    SolverResult callSolver(const Eigen::VectorXd& state)
+    {
+        SolverResult result;
+
+        if (solver_type_ == "alipddp" && alipddp_mpc_) {
+            auto r = alipddp_mpc_->solve(state);
+            result.success            = r.success;
+            result.next_state         = r.next_state;
+            result.state_trajectory   = r.state_trajectory;
+            result.control_trajectory = r.control_trajectory;
+            result.solve_time_ms      = r.solve_time_ms;
+            result.solve_timestamp    = r.solve_timestamp;
+        }
+#ifdef HAS_ACADOS
+        else if (solver_type_ == "acados" && acados_mpc_) {
+            auto r = acados_mpc_->solve(state);
+            result.success            = r.success;
+            result.next_state         = r.next_state;
+            result.state_trajectory   = r.state_trajectory;
+            result.control_trajectory = r.control_trajectory;
+            result.solve_time_ms      = r.solve_time_ms;
+            result.solve_timestamp    = r.solve_timestamp;
+        }
+#endif
+        return result;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  MODE: Open-loop — single solve then replay
+    // ═════════════════════════════════════════════════════════════════════════
+
+    void openLoopStartupCheck()
+    {
+        if (!odom_received_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[OpenLoop] Waiting for /odom...");
+            return;
+        }
+
+        startup_timer_->cancel();
+
+        RCLCPP_INFO(this->get_logger(),
+            "[OpenLoop] First state received. Running ONE solve (%s)...", solver_type_.c_str());
+        RCLCPP_INFO(this->get_logger(),
+            "[OpenLoop] x0 = [%.3f, %.3f, %.3f | %.3f, %.3f, %.3f | "
+            "%.3f, %.3f, %.3f, %.3f | %.3f, %.3f, %.3f]",
+            current_state_(0), current_state_(1), current_state_(2),
+            current_state_(3), current_state_(4), current_state_(5),
+            current_state_(6), current_state_(7), current_state_(8), current_state_(9),
+            current_state_(10), current_state_(11), current_state_(12));
+
+        SolverResult result = callSolver(current_state_);
+
+        if (!result.success || result.state_trajectory.size() < 2) {
+            RCLCPP_ERROR(this->get_logger(), "[OpenLoop] Solve FAILED. Cannot run test.");
+            return;
+        }
+
+        ol_ref_X_ = result.state_trajectory;
+        ol_ref_U_ = result.control_trajectory;
+
+        RCLCPP_INFO(this->get_logger(),
+            "[OpenLoop] Solve OK in %.1f ms — %zu states, %zu controls, horizon = %.2f s",
+            result.solve_time_ms,
+            ol_ref_X_.size(), ol_ref_U_.size(),
+            (ol_ref_X_.size() - 1) * ocp_dt_);
+
+        if (logging_enabled_) {
+            setupLogging();
+            logging_initialized_ = true;
+            logOpenLoopPlannedTrajectory();
+            logSolveTrajectory(ol_ref_X_, ol_ref_U_, result.solve_time_ms);
+        }
+
+        publishTrajectory(ol_ref_X_);
+
+        ol_replay_step_ = 0;
+        ol_replay_start_time_ = Clock::now();
+
+        const int period_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
+        replay_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(period_ms),
+            std::bind(&PlannerNode::openLoopReplayTick, this));
+
+        RCLCPP_INFO(this->get_logger(),
+            "[OpenLoop] Replay started at %d ms/step (%zu steps total)",
+            period_ms, ol_ref_X_.size());
+    }
+
+    void openLoopReplayTick()
+    {
+        const int N = static_cast<int>(ol_ref_X_.size()) - 1;
+        const int step = std::min(ol_replay_step_, N);
+        const bool trajectory_done = (ol_replay_step_ >= N);
+
+        const Eigen::VectorXd& x_cmd = ol_ref_X_[step];
+
+        if (platform_ == "crazyflie") {
+            publishCrazyflieCommand(x_cmd, Eigen::Vector3d::Zero());
+        }
+#ifdef HAS_PX4_MSGS
+        else if (platform_ == "px4") {
+            publishPX4Command(x_cmd, Eigen::Vector3d::Zero());
+        }
+#endif
+
+        if (logging_enabled_ && ol_comparison_log_.is_open()) {
+            logOpenLoopComparison(step, x_cmd);
+        }
+
+        if (ol_replay_step_ % 10 == 0 || trajectory_done) {
+            double t_elapsed = std::chrono::duration<double>(
+                Clock::now() - ol_replay_start_time_).count();
+            Eigen::Vector3d pos_err = current_state_.head(3) - x_cmd.head(3);
+            RCLCPP_INFO(this->get_logger(),
+                "[Step %3d/%d | t=%.2fs] "
+                "cmd=[%.3f,%.3f,%.3f]  act=[%.3f,%.3f,%.3f]  |err|=%.3fm",
+                step, N, t_elapsed,
+                x_cmd(0), x_cmd(1), x_cmd(2),
+                current_state_(0), current_state_(1), current_state_(2),
+                pos_err.norm());
+        }
+
+        if (trajectory_done) {
+            if (!ol_done_logged_) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[OpenLoop] Trajectory complete. Holding final position X[%d].", N);
+                ol_done_logged_ = true;
+                if (ol_comparison_log_.is_open()) ol_comparison_log_.flush();
+            }
+        } else {
+            ++ol_replay_step_;
         }
     }
 
@@ -492,6 +633,16 @@ private:
         msg.acc.z = acc_cmd(2);
 
         cf_cmd_pub_->publish(msg);
+
+        // Log every published command
+        if (published_commands_log_.is_open()) {
+            published_commands_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
+            for (int i = 0; i < 13; ++i)
+                published_commands_log_ << "," << s(i);
+            published_commands_log_ << "," << acc_cmd(0) << "," << acc_cmd(1) << "," << acc_cmd(2);
+            published_commands_log_ << "\n";
+            published_commands_log_.flush();
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -573,21 +724,48 @@ private:
         auto t   = std::chrono::system_clock::to_time_t(now);
         std::stringstream ts;
         ts << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S");
-        std::string folder = "./logs/" + drone_name_ + "_" + solver_type_ + "_flight_" + ts.str();
+
+        std::string folder = "./logs/" + drone_name_ + "_" + ocp_type_ + "_"
+                           + mode_ + "_" + solver_type_ + "_" + ts.str();
         std::filesystem::create_directories(folder);
+        log_folder_ = folder;
 
-        commanded_state_log_.open(folder  + "/commanded_state.csv");
-        actual_state_log_.open(folder     + "/actual_state.csv");
-        first_trajectory_log_.open(folder + "/first_solve_trajectory.csv");
-
+        // 1. commanded_state.csv — x[1] + u[0] each MPC tick
+        commanded_state_log_.open(folder + "/commanded_state.csv");
         if (commanded_state_log_.is_open())
             commanded_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
-                                    "fx,fy,fz,mx,my,mz,thrust_norm\n";
+                                    "fz,mx,my,mz\n";
+
+        // 2. actual_state.csv — sensor data each tick
+        actual_state_log_.open(folder + "/actual_state.csv");
         if (actual_state_log_.is_open())
-            actual_state_log_    << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
-        if (first_trajectory_log_.is_open())
-            first_trajectory_log_ << "node,t,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
-                                     "fx,fy,fz,mx,my,mz,thrust_norm\n";
+            actual_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
+
+        // 3. all_solves.csv — full X[0..N] and U[0..N-1] for EVERY solve
+        all_solves_log_.open(folder + "/all_solves.csv");
+        if (all_solves_log_.is_open())
+            all_solves_log_ << "solve_num,solve_time_ms,node,t,"
+                               "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
+                               "fz,mx,my,mz\n";
+
+        // 4. published_commands.csv — every FullState published to crazyflie
+        published_commands_log_.open(folder + "/published_commands.csv");
+        if (published_commands_log_.is_open())
+            published_commands_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
+                                       "acc_x,acc_y,acc_z\n";
+
+        // 5. Open-loop comparison CSV (only in open_loop mode)
+        if (mode_ == "open_loop") {
+            ol_comparison_log_.open(folder + "/commanded_vs_actual.csv");
+            if (ol_comparison_log_.is_open())
+                ol_comparison_log_ <<
+                    "step,t,"
+                    "cmd_x,cmd_y,cmd_z,cmd_vx,cmd_vy,cmd_vz,"
+                    "cmd_qw,cmd_qx,cmd_qy,cmd_qz,cmd_wx,cmd_wy,cmd_wz,"
+                    "act_x,act_y,act_z,act_vx,act_vy,act_vz,"
+                    "act_qw,act_qx,act_qy,act_qz,act_wx,act_wy,act_wz,"
+                    "err_x,err_y,err_z,pos_err_norm\n";
+        }
 
         RCLCPP_INFO(this->get_logger(), "Logging to: %s", folder.c_str());
     }
@@ -597,33 +775,41 @@ private:
         return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
     }
 
-    void logFirstTrajectory(const std::vector<Eigen::VectorXd>& traj,
-                            const std::vector<Eigen::VectorXd>& ctrls)
+    void logSolveTrajectory(const std::vector<Eigen::VectorXd>& traj,
+                            const std::vector<Eigen::VectorXd>& ctrls,
+                            double solve_time_ms)
     {
-        if (!first_trajectory_log_.is_open()) return;
+        if (!all_solves_log_.is_open()) return;
+
         for (int i = 0; i < (int)traj.size(); ++i) {
             const auto& s = traj[i];
             if (s.size() < 13) continue;
             double t = i * ocp_dt_;
-            first_trajectory_log_ << std::fixed << std::setprecision(6)
+
+            all_solves_log_ << std::fixed << std::setprecision(6)
+                << solve_count_ << "," << solve_time_ms << ","
                 << i << "," << t;
+
             for (int j = 0; j < 13; ++j)
-                first_trajectory_log_ << "," << s(j);
+                all_solves_log_ << "," << s(j);
+
             if (i < (int)ctrls.size() && ctrls[i].size() >= 4) {
                 const auto& u = ctrls[i];
-                // u = [fz, Mx, My, Mz]
-                first_trajectory_log_ << ",0,0," << u(0)  // fx=0, fy=0, fz=u(0)
-                                      << "," << u(1) << "," << u(2) << "," << u(3)  // Mx, My, Mz
-                                      << "," << u(0);  // thrust_norm = fz
+                all_solves_log_ << "," << u(0)
+                                << "," << u(1) << "," << u(2) << "," << u(3);
             } else {
-                first_trajectory_log_ << ",0,0,0,0,0,0,0";
+                all_solves_log_ << ",0,0,0,0";
             }
-            first_trajectory_log_ << "\n";
+            all_solves_log_ << "\n";
         }
-        first_trajectory_log_.flush();
-        RCLCPP_INFO(this->get_logger(),
-            "First solve trajectory saved (%zu nodes, %.2fs horizon)",
-            traj.size(), (traj.size() - 1) * ocp_dt_);
+        all_solves_log_.flush();
+
+        if (solve_count_ == 0) {
+            RCLCPP_INFO(this->get_logger(),
+                "First solve trajectory logged (%zu nodes, %.2fs horizon)",
+                traj.size(), (traj.size() - 1) * ocp_dt_);
+        }
+        ++solve_count_;
     }
 
     void logActualState()
@@ -640,17 +826,64 @@ private:
         if (!commanded_state_log_.is_open() || s.size() < 13) return;
         commanded_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
         for (int i = 0; i < 13; ++i) commanded_state_log_ << "," << s(i);
+        // u = [fz, Mx, My, Mz]
         if (u.size() >= 4) {
-            // u = [fz, Mx, My, Mz]
-            commanded_state_log_ << ",0,0," << u(0)  // fx=0, fy=0, fz=u(0)
-                                 << "," << u(1) << "," << u(2) << "," << u(3)  // Mx, My, Mz
-                                 << "," << u(0);  // thrust_norm = fz
+            commanded_state_log_ << "," << u(0)
+                                 << "," << u(1) << "," << u(2) << "," << u(3);
         } else {
-            commanded_state_log_ << ",0,0,0,0,0,0,0";
+            commanded_state_log_ << ",0,0,0,0";
         }
         commanded_state_log_ << "\n";
         commanded_state_log_.flush();
     }
+
+    // ── Open-loop specific logging ───────────────────────────────────────────
+
+    void logOpenLoopPlannedTrajectory()
+    {
+        std::ofstream planned_log(log_folder_ + "/planned_trajectory.csv");
+        if (!planned_log.is_open()) return;
+
+        planned_log << "node,t,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
+                       "fz,mx,my,mz\n";
+
+        for (int i = 0; i < (int)ol_ref_X_.size(); ++i) {
+            const auto& s = ol_ref_X_[i];
+            if (s.size() < 13) continue;
+            planned_log << std::fixed << std::setprecision(6)
+                << i << "," << (i * ocp_dt_);
+            for (int j = 0; j < 13; ++j)
+                planned_log << "," << s(j);
+            if (i < (int)ol_ref_U_.size() && ol_ref_U_[i].size() >= 4) {
+                const auto& u = ol_ref_U_[i];
+                planned_log << "," << u(0)
+                            << "," << u(1) << "," << u(2) << "," << u(3);
+            } else {
+                planned_log << ",0,0,0,0";
+            }
+            planned_log << "\n";
+        }
+        planned_log.flush();
+        RCLCPP_INFO(this->get_logger(),
+            "[OpenLoop] Planned trajectory written (%zu nodes)", ol_ref_X_.size());
+    }
+
+    void logOpenLoopComparison(int step, const Eigen::VectorXd& x_cmd)
+    {
+        double t_rel = step * ocp_dt_;
+        Eigen::Vector3d pos_err = current_state_.head(3) - x_cmd.head(3);
+
+        ol_comparison_log_ << std::fixed << std::setprecision(6)
+            << step << "," << t_rel;
+        for (int j = 0; j < 13; ++j)
+            ol_comparison_log_ << "," << x_cmd(j);
+        for (int j = 0; j < 13; ++j)
+            ol_comparison_log_ << "," << current_state_(j);
+        ol_comparison_log_ << "," << pos_err(0) << "," << pos_err(1) << "," << pos_err(2)
+                           << "," << pos_err.norm() << "\n";
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
 
     void printDiagnostics(const SolverResult& result)
     {
@@ -675,8 +908,10 @@ private:
     // ─────────────────────────────────────────────────────────────────────────
 
     // Config
+    std::string ocp_type_;
     std::string platform_;
     std::string solver_type_;
+    std::string mode_;
     std::string drone_name_;
     bool        logging_enabled_;
     int         solver_rate_;
@@ -705,7 +940,9 @@ private:
 
     // ── Shared ────────────────────────────────────────────────────────────────
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
-    rclcpp::TimerBase::SharedPtr                      solver_timer_;
+    rclcpp::TimerBase::SharedPtr                      solver_timer_;      // MPC mode
+    rclcpp::TimerBase::SharedPtr                      startup_timer_;     // open_loop mode
+    rclcpp::TimerBase::SharedPtr                      replay_timer_;      // open_loop mode
 
     // State
     Eigen::VectorXd current_state_;
@@ -715,12 +952,25 @@ private:
     bool odom_received_ = false;
     bool is_flying_     = false;
 
+    // MPC diagnostics
+    int diag_count_ = 0;
+
+    // Open-loop mode state
+    std::vector<Eigen::VectorXd> ol_ref_X_;
+    std::vector<Eigen::VectorXd> ol_ref_U_;
+    int          ol_replay_step_ = 0;
+    bool         ol_done_logged_ = false;
+    Clock::time_point ol_replay_start_time_;
+
     // Logging
-    bool logging_initialized_ = false;
+    bool          logging_initialized_ = false;
+    std::string   log_folder_;
     std::ofstream commanded_state_log_;
     std::ofstream actual_state_log_;
-    std::ofstream first_trajectory_log_;
-    bool          first_solve_logged_ = false;
+    std::ofstream all_solves_log_;
+    std::ofstream published_commands_log_;
+    std::ofstream ol_comparison_log_;   // open_loop mode only
+    int           solve_count_ = 0;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
