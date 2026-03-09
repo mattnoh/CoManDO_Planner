@@ -24,45 +24,18 @@ double QuadrotorMPC::getOcpDt() const {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shift the warm-start solution forward by n_shift steps.
-//
-// WHY n_shift AND NOT ALWAYS 1:
-//   The solver fires every (1/solver_rate) seconds. The OCP time step is ocp_dt.
-//   Between two solver ticks the drone has consumed:
-//
-//     n_shift = round( solver_period / ocp_dt )
-//
-//   steps of the trajectory. If solver_rate=10Hz and ocp_dt=0.05s, n_shift=2.
-//   Shifting by only 1 leaves the warm-start one step behind where the drone
-//   actually is — after a few solves the reference drifts, the solver has to
-//   work harder each time to reconcile, and the published path looks jagged
-//   as if solving from cold each time.
-//
-// WHAT WE DO WITH prev_X_:
-//   Shifted but NOT passed to the solver. DDP always recomputes x[1..N] from
-//   x[0] and U in its own forward rollout — x[1..N] set from outside are
-//   immediately overwritten. Kept for future use if we add an X-seed API.
-//
-// WHAT WE DO WITH prev_U_:
-//   This IS the warm-start seed. After shifting by n_shift:
-//     u_warm[k] = u_prev[k + n_shift]   for k = 0 .. N-1-n_shift
-//     u_warm[k] = u_prev[N-1]           for k = N-n_shift .. N-1  (hold last)
-// ─────────────────────────────────────────────────────────────────────────────
 void QuadrotorMPC::shiftWarmStart() {
     if (prev_X_.size() < 2 || prev_U_.empty()) return;
     const int Nx = (int)prev_X_.size();
     const int Nu = (int)prev_U_.size();
     const int n_shift = std::max(1, std::min(config_.n_shift, Nu - 1));
 
-    // Shift X — NOT sent to the solver, kept for future use only.
     {
         vector<Eigen::VectorXd> sx(Nx);
         for (int i = 0; i < Nx; ++i)
             sx[i] = prev_X_[std::min(i + n_shift, Nx - 1)];
         prev_X_ = move(sx);
     }
-
-    // Shift U — this IS the DDP warm-start seed.
     {
         vector<Eigen::VectorXd> su(Nu);
         for (int i = 0; i < Nu; ++i)
@@ -127,22 +100,7 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
     // solver's own forward rollout before the first backward pass.
     problem_->setInitialState(0, current_state);
 
-    if (has_prev_solution_) {
-        // Shift U forward by n_shift steps (one step per ocp_dt elapsed).
-        // This overrides whatever the problem currently holds, which is what
-        // we want — the previous optimal solution is a much better seed than
-        // the generic hover create() provided on cold start.
-        //
-        // REMOVED (old code): manual forward rollout setting x[1..N] via
-        //   getDynamics(i)->f(x, u) → setInitialState(i+1, ...).
-        // DDP overwrites all of those in its first forward sweep anyway.
-        // shiftWarmStart();
-
-        // for (int i = 0; i < (int)prev_U_.size(); ++i)
-        //     problem_->setInitialControl(i, prev_U_[i]);
-    }
-    // If !has_prev_solution_ here, the problem still holds the create() hover
-    // seed from the first call — which is a valid cold-start U.
+    // Shifting and warm-starting are handled in solve() after this returns.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -153,46 +111,51 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
     auto t0 = chrono::high_resolution_clock::now();
 
     try {
-        setupProblem(current_state);
+        // ── Project state onto OCP model manifold ─────────────────────────────
+        Eigen::VectorXd x0_ocp = current_state;
+        x0_ocp.segment(10, 3).setZero();   // zero wx, wy, wz
 
-        if (!problem_) {
-            cerr << "ERROR: Problem not initialized\n";
-            return result;
-        }
+        setupProblem(x0_ocp);   // <-- pass x0_ocp, not current_state
 
-        // ── Create and init solver ONCE per problem lifetime ──────────────────
-        // Recreating the solver every tick resets AL multipliers (lambda, Y, S,
-        // Z, R) to zero, forcing a cold start every iteration even with a good
-        // U warm-start. Persisting the solver lets the multipliers carry over
-        // so subsequent solves start near the previous solution.
-        //
-        // NOTE: the solver's internal ocp is a copy made at construction time —
-        // calling problem_->setInitialState/Control() after construction has no
-        // effect on the solver. We must use warmStart() to inject x[0] and U
-        // directly into the solver's internal X[0] and U arrays.
         if (!solver_) {
             solver_ = make_shared<ALIPDDP<double>>(*problem_);
             solver_->init(solver_params_);
         } else {
-            std::cout << "warmstart x0:  " << current_state.transpose() << "\n";
+            // Log the PHYSICAL state for diagnosis, but warm-start with projected
+            std::cout << "warmstart x0 (raw):  " << current_state.transpose() << "\n";
+            std::cout << "warmstart x0 (ocp):  " << x0_ocp.transpose() << "\n";
             if (prev_X_.size() > 1) {
-                std::cout << "predicted x1:  " << prev_X_[1].transpose() << "\n";
-                const Eigen::VectorXd dx = current_state - prev_X_[1];
-                std::cout << "x0 - x1_pred:  " << dx.transpose() << "\n";
-                std::cout << "||x0 - x1_pred||: " << dx.norm() << "\n";
-            } else {
-                std::cout << "predicted x1:  <missing prev_X_[1]>\n";
-            }
-            if (!prev_U_.empty()) {
-                std::cout << "prev_U_[0]:    " << prev_U_[0].transpose() << "\n";
-            } else {
-                std::cout << "prev_U_[0]:    <missing>\n";
+                const Eigen::VectorXd dx_pos = current_state.head(6) - prev_X_[1].head(6);
+                std::cout << "||pos+vel mismatch||: " << dx_pos.norm() << "\n";
             }
 
-            // Shift warm-start U forward by n_shift steps, then inject
-            // x[0] and U directly into the solver without touching multipliers.
+            // Shift U forward by n_shift steps.
             shiftWarmStart();
-            solver_->warmStart(current_state, prev_U_);
+
+            // Roll dynamics forward from x0_ocp using shifted U so that
+            // the warm-start X is consistent with the measured state.
+            {
+                auto dyn = std::make_shared<Quad6DOF<double>>();
+                dyn->setMass(LandingOCP::MASS);
+                dyn->setGravity(Eigen::Vector3d(0, 0, -9.81));
+                dyn->setJb(LandingOCP::INERTIA);
+                dyn->setDt(LandingOCP::DT);
+
+                Eigen::VectorXd xr = x0_ocp;
+                std::vector<Eigen::VectorXd> X_ws;
+                X_ws.reserve(LandingOCP::HORIZON + 1);
+                X_ws.push_back(xr);
+                for (int k = 0; k < LandingOCP::HORIZON; ++k) {
+                    xr = dyn->f(xr, prev_U_[k]);
+                    X_ws.push_back(xr);
+                }
+                prev_X_ = X_ws;  // update cached X to match
+            }
+
+            // warmStart takes (x0, U): injects x0 and U into the solver's
+            // internal arrays without resetting AL multipliers.
+            solver_->init(solver_params_);          // resets λ, ρ to initial values
+            solver_->warmStart(x0_ocp, prev_U_);
         }
 
         solver_->solve();
@@ -210,10 +173,6 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
             result.control_trajectory = U_result;
             result.success            = true;
 
-            // Cache full solution for the next warm start.
-            // prev_X_ is not read by the solver — stored for future use only.
-            // prev_U_ is the actual warm-start seed shifted and passed to the
-            // next setupProblem() call.
             prev_X_            = X_result;
             prev_U_            = U_result;
             has_prev_solution_ = true;

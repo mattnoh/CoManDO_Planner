@@ -446,6 +446,20 @@ private:
                 x0(10), x0(11), x0(12));
         }
 
+        // ── Hold hover at current position until first solve completes ────────
+        // The first solve takes >100ms. Without this the drone drifts during
+        // that blocking call because no command is being published.
+        if (solve_count_ == 0) {
+            Eigen::VectorXd x_hover = x0;
+            x_hover.segment(3, 3).setZero();   // zero velocity
+            x_hover.segment(10, 3).setZero();  // zero omega
+            if (platform_ == "crazyflie") {
+                publishCrazyflieCommand(x_hover, Eigen::Vector3d::Zero());
+            } else {
+                publishPX4Command(x_hover, Eigen::Vector3d::Zero());
+            }
+        }
+
         // ── Solve with selected solver ────────────────────────────────────────
         SolverResult result;
 

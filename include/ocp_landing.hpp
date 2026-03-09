@@ -61,14 +61,18 @@ const double C_TAU       = 0.005;
 const double TAU_XY_MAX  = L_ARM * (F_MOTOR_MAX - F_MOTOR_MIN);   // ≈ 0.006 N·m
 const double TAU_Z_MAX   = C_TAU * (F_MOTOR_MAX - F_MOTOR_MIN) * 4.0;
 const double TAU_MAX     = TAU_XY_MAX;  // conservative: tightest axis
+// Per-step velocity change limit (jerk proxy):
+//   j_max = 0.075 m/s  /  DT = 0.75 m/s²  (net world-frame acceleration bound)
+//   Constraint: |v[k+1] - v[k]| / DT ≤ J_MAX  ⟺  |Δv| ≤ J_MAX * DT = 0.075 m/s
+const double J_MAX       = 0.397 / DT;   // 0.75 m/s² — max |v[k+1]-v[k]| / DT
 
 // ── Solver parameters ─────────────────────────────────────────────────────────
 const double SOLVER_REG1_MIN  = 1e-6;
 const double SOLVER_REG2_MIN  = 1e-2;
 const double SOLVER_MU_MUL    = 0.1;
-const double SOLVER_RHO       = 1.0;
+const double SOLVER_RHO       = 10.0;
 const double SOLVER_RHO_MUL   = 10.0;
-const double SOLVER_TOLERANCE = 5.0;
+const double SOLVER_TOLERANCE = 0.05;
 const int    SOLVER_MAX_ITER  = 300;
 const double SOLVER_RHOT      = 1.0;
 
@@ -400,6 +404,101 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Velocity jerk constraint  (coupling x[k]→x[k+1] inlined via dynamics)
+//
+//   Δv_k = v[k+1] - v[k] = DT * a_I(x[k], u[k])
+//         = DT * ( C(q[k]) * [0,0,fz_B[k]] / m  +  g )
+//
+//   Constraint (per axis, nonneg-orthant, 6 inequalities):
+//       Δv_i  ≤ J_MAX * DT      (upper)          c[i]   = Δv_i  - dv_max ≤ 0
+//      -Δv_i  ≤ J_MAX * DT      (lower)          c[3+i] = -Δv_i - dv_max ≤ 0
+//
+//   Jacobians mirror rows 3–5 of Quad6DOF::fx / Quad6DOF::fu.
+//
+//   NOTE: no native x[k]↔x[k+1] coupling needed — v[k+1] is a deterministic
+//   function of (x[k], u[k]) through the dynamics, so this lives purely in
+//   stage k of the standard c(x,u) interface.
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Scalar>
+class VelocityJerkConstraint : public StageConstraintBase<Scalar> {
+    double mass_;
+    double dt_;
+    Eigen::Vector3d gravity_;
+    double dv_max_;   // = J_MAX * DT  (per-step Δv bound, m/s)
+public:
+    VelocityJerkConstraint(double mass, double dt,
+                            const Eigen::Vector3d& gravity, double j_max)
+        : mass_(mass), dt_(dt), gravity_(gravity), dv_max_(j_max * dt)
+    {
+        this->constraint_type = ConstraintType::NO;
+        this->dim_c = 6;   // ±Δvx, ±Δvy, ±Δvz
+    }
+
+    // Δv = dt * (C(q)*[0,0,fz]/m + g)
+    Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        const Eigen::Vector4d q = x.segment(6, 4);
+        const double fz = u(0);
+        const Eigen::Matrix3d C = Quad6DOF<Scalar>::calcC(q);
+        const Eigen::Vector3d dv =
+            dt_ * (C * Eigen::Vector3d(0.0, 0.0, fz) / mass_ + gravity_);
+
+        Vector<Scalar> c_n(6);
+        for (int i = 0; i < 3; ++i) {
+            c_n(i)     =  dv(i) - dv_max_;   // upper: Δv_i ≤ dv_max
+            c_n(3 + i) = -dv(i) - dv_max_;   // lower: -Δv_i ≤ dv_max
+        }
+        return c_n;
+    }
+
+    // ∂c/∂x: only columns 6–9 (quaternion) are non-zero
+    // Mirrors ∂v_next/∂q from Quad6DOF::fx() rows 3–5
+    Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        const Eigen::Vector4d q = x.segment(6, 4);
+        const double fz = u(0);
+        const Eigen::Vector3d f_B(0.0, 0.0, fz);
+
+        Eigen::Matrix3d dCdq0, dCdq1, dCdq2, dCdq3;
+        dCdq0 << 0,        -2*q(3),  2*q(2),
+                 2*q(3),   0,       -2*q(1),
+                -2*q(2),   2*q(1),  0;
+        dCdq1 << 0,         2*q(2),  2*q(3),
+                 2*q(2),  -4*q(1), -2*q(0),
+                 2*q(3),   2*q(0), -4*q(1);
+        dCdq2 << -4*q(2),   2*q(1),  2*q(0),
+                  2*q(1),  0,        2*q(3),
+                 -2*q(0),  2*q(3), -4*q(2);
+        dCdq3 << -4*q(3),  -2*q(0),  2*q(1),
+                  2*q(0),  -4*q(3),  2*q(2),
+                  2*q(1),   2*q(2),  0;
+
+        // ∂(Δv)/∂q[j] = (dt/m) * dCdqj * f_B
+        Eigen::Matrix<double, 3, 4> ddv_dq;
+        ddv_dq.col(0) = (dt_ / mass_) * (dCdq0 * f_B);
+        ddv_dq.col(1) = (dt_ / mass_) * (dCdq1 * f_B);
+        ddv_dq.col(2) = (dt_ / mass_) * (dCdq2 * f_B);
+        ddv_dq.col(3) = (dt_ / mass_) * (dCdq3 * f_B);
+
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(6, x.size());
+        J.block(0, 6, 3, 4) =  ddv_dq;   // upper bounds
+        J.block(3, 6, 3, 4) = -ddv_dq;   // lower bounds
+        return J;
+    }
+
+    // ∂c/∂u: only column 0 (fz_B) is non-zero
+    // Mirrors ∂v_next/∂fz from Quad6DOF::fu() rows 3–5
+    Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+        const Eigen::Vector4d q = x.segment(6, 4);
+        const Eigen::Matrix3d C = Quad6DOF<Scalar>::calcC(q);
+        const Eigen::Vector3d ddv_dfz = (dt_ / mass_) * C.col(2);
+
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(6, u.size());
+        J.block(0, 0, 3, 1) =  ddv_dfz;   // upper bounds
+        J.block(3, 0, 3, 1) = -ddv_dfz;   // lower bounds
+        return J;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Factory function — builds a fresh OCP for online replanning.
 //
 // Called by QuadrotorMPC::setupProblem() on cold start or after
@@ -450,6 +549,10 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     auto mt   = std::make_shared<MaxThrustConstraint<double>>(FMAX);
     auto fmin = std::make_shared<MinThrustConstraint<double>>();
     auto mm   = std::make_shared<MaxMomentConstraint<double>>();
+    // Jerk constraint: |v[k+1] - v[k]| / DT ≤ J_MAX = 0.75 m/s²  (per axis)
+    // Expressed as c(x[k], u[k]) by inlining the velocity dynamics.
+    auto jerk = std::make_shared<VelocityJerkConstraint<double>>(
+        MASS, DT, Eigen::Vector3d(0.0, 0.0, -9.81), J_MAX);
 
     for (int i = 0; i < HORIZON; ++i) {
         prob->addStageConstraint(i, gs);
@@ -457,6 +560,7 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
         prob->addStageConstraint(i, mt);
         prob->addStageConstraint(i, fmin);
         prob->addStageConstraint(i, mm);
+        prob->addStageConstraint(i, jerk);
     }
 
     // Initial state
