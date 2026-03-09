@@ -6,8 +6,7 @@
 ///   2. MaxMomentConstraint — SOC constraint on [Mx,My,Mz] from allocation matrix
 ///   3. Q_DIAG / S_DIAG    — synced to verified standalone values
 ///
-/// FMIN = 0.200 N, FMAX = 0.400 N — tightened band; limits |Δvz| ≤ 0.24 m/s/step
-/// so Mellinger can track the planned descent profile.
+/// FMAX = 0.6 N (Crazyflie RH value, not the 1.2 N used in cold-start standalone).
 
 #pragma once
 
@@ -30,17 +29,18 @@ const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
     0.0, 0.0, 2.92e-5 * J_SCALE).finished();
 
 // ── Constraint parameters ─────────────────────────────────────────────────────
+// Mellinger jerk limit:
+//   |Δvz| / dt ≤ ω_xy_max * fz/m
+//   For ω_xy_max = 2.0 rad/s: a_z_max = 2.0 * 9.81 * 0.1 = 1.96 m/s²
 //
-// FMIN/FMAX tightened to enforce Mellinger jerk limit:
-//   net a_z range = (FMIN - mg)/m .. (FMAX - mg)/m
-//                = (0.200 - 0.265)/0.027 .. (0.400 - 0.265)/0.027
-//                = -2.41 .. +5.00 m/s²
-//   |Δvz|_max = 2.41 * DT = 0.24 m/s/step  — Mellinger-trackable
-// With FMIN=0.08 the solver could plan Δvz = 6.5 m/s² → 0.65 m/s/step,
-// which Mellinger cannot track and which drives the oscillating-solve failure.
+//   FMIN_MELL = m * (g - a_z_max) = 0.027 * (9.81 - 1.96) = 0.212 N
+//   FMAX_MELL = m * (g + a_z_max) = 0.027 * (9.81 + 1.96) = 0.318 N
 //
-const double FMIN       = 0.200;   // N — tightened lower bound (~75 % hover)
-const double FMAX       = 0.400;   // N — symmetric upper bound around hover (0.265 N)
+// The full hardware range [0.08, 0.6] is still available for Mellinger
+// to reject disturbances — this is the "tightened constraint set" from
+// the Korean report (축소된 제약 집합).
+const double FMIN       = 0.212;   // N — Mellinger acceleration bound
+const double FMAX       = 0.318;   // N — Mellinger acceleration bound
 const double GLIDESLOPE = 70.0;    // degrees
 const double TILT_CONE  = 60.0;    // degrees — max vehicle tilt from vertical
 
@@ -73,31 +73,31 @@ const int    SOLVER_MAX_ITER  = 300;
 const double SOLVER_RHOT      = 1.0;
 
 // ── Q: running state cost (13×13 diagonal) ────────────────────────────────────
+// vz reduced from 10→2: old value with R_fz=1e-3 was a pathological ratio
+// that forced aggressive sub-hover thrust at step 0. With vz=2 the solver
+// plans a gradual descent instead of slamming thrust to kill vz instantly.
 static const Eigen::VectorXd Q_DIAG = (Eigen::VectorXd(13) <<
-    2.0, 2.0, 2.0,        // position
-    1.0, 1.0, 2.0,        // velocity — vz reduced from 10→2 (S_fz now handles smoothing)
-    0.1,                  // qw
+    2.0, 2.0, 2.0,        // position  — pulls toward origin
+    1.0, 1.0, 2.0,        // velocity  — vz reduced from 10→2, gradual descent
+    0.1,                  // qw        — light (allow tilting during manoeuvre)
     0.1, 0.1, 0.1,        // qx, qy, qz
-    0.1, 0.1, 0.1).finished();  // angular rate — reduced: Mellinger owns ω bandwidth
+    0.05, 0.05, 0.05).finished();  // angular rate
 
 // ── R: running control cost (4×4 diagonal) ────────────────────────────────────
+// u = [fz_B, Mx, My, Mz]
 static const Eigen::VectorXd R_DIAG = (Eigen::VectorXd(4) <<
-    1e-3,
-    1e-4, 1e-4, 1e-4).finished();
+    1e-3,                         // fz_B  — light (thrust changes OK)
+    1e-4, 1e-4, 1e-4).finished(); // moments — weak absolute penalty
 
 // ── S: delta-u (slew-rate) penalty (4×4 diagonal) ─────────────────────────────
-// NOTE: In the original create() (13-dim state) this is anchored to u_ref and
-// is structurally equivalent to a heavier R — it does NOT couple consecutive
-// controls. Use the augmented create_aug() below which reads u_prev from
-// state slots 13–16 for genuine consecutive-step coupling.
+// Light penalty on (u[k] - u_prev[k]). This does not enforce the jerk constraint
+// because u_prev is fixed to u_ref; it only penalizes deviation from hover.
 //
-// Jerk limit (Korean report §3, differential flatness):
-//   |Δfz| ≤ m*(g)*ω_xy_max*dt = 0.027*9.81*5.0*0.1 ≈ 0.132 N/step
-//   S_fz sized so slew cost dominates vz state cost at the limit:
-//   S_fz*(0.132)² ≥ Q_vz*(0.1)²  →  S_fz ≥ 1.15 → use 2.0
+// The per-step acceleration limit is enforced by FMIN/FMAX tightening (Mellinger
+// bound). This keeps S light, avoiding over-constraint at cold start.
 static const Eigen::VectorXd S_DIAG = (Eigen::VectorXd(4) <<
-    2.0,                          // dfz — enforces jerk limit (effective in aug OCP)
-    1e-1, 1e-1, 1e-1).finished(); // dMx, dMy, dMz
+    1e-3,                         // dfz   — light; jerk enforced by FMIN/FMAX
+    1e-1, 1e-1, 1e-1).finished(); // dMx, dMy, dMz — unchanged
 
 // ── P: terminal state cost (13×13 diagonal) ───────────────────────────────────
 static const Eigen::VectorXd P_DIAG = (Eigen::VectorXd(13) <<
@@ -400,176 +400,26 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AugStageCost — stage cost operating on 17-dim augmented state
+// Factory function — builds a fresh OCP for online replanning.
 //
-//   J_k = (x[0:13] - x_ref)^T Q (x[0:13] - x_ref)
-//       + (u - u_ref)^T R (u - u_ref)
-//       + (u - x[13:16])^T S (u - x[13:16])   ← genuine u[k]-u[k-1] slew
+// Called by QuadrotorMPC::setupProblem() on cold start or after
+// setTerminalState(). On warm-start re-solves the problem_ is REUSED and
+// only x[0] + U warm-start are updated (see quadrotor_mpc.hpp).
 //
-// S now reads u_prev from x_aug[13:16] rather than a fixed anchor, so the
-// DDP backward pass couples consecutive controls through the Riccati recursion.
+// u_prev for DeltaUStageCost is anchored to u_ref (hover) for all stages.
+// This is correct for cold start. On warm re-solves MaxMomentConstraint
+// hard-bounds the moments so the S penalty provides additional smoothing
+// even with a fixed u_prev = u_ref anchor.
 // ─────────────────────────────────────────────────────────────────────────────
-template <typename Scalar>
-class AugStageCost : public StageCostBase<Scalar> {
-    Eigen::VectorXd x_ref_, u_ref_, Q_diag_, R_diag_, S_diag_;
-public:
-    AugStageCost(const Eigen::VectorXd& x_ref,
-                 const Eigen::VectorXd& u_ref,
-                 const Eigen::VectorXd& Q_diag,
-                 const Eigen::VectorXd& R_diag,
-                 const Eigen::VectorXd& S_diag)
-        : x_ref_(x_ref), u_ref_(u_ref),
-          Q_diag_(Q_diag), R_diag_(R_diag), S_diag_(S_diag) {}
-
-    Scalar q(const Vector<Scalar>& x_aug, const Vector<Scalar>& u) const override {
-        Vector<Scalar> ex = x_aug.head(13) - x_ref_;
-        Vector<Scalar> eu = u - u_ref_;
-        Vector<Scalar> du = u - x_aug.tail(4);   // u[k] - u[k-1]
-        return ex.dot(Q_diag_.asDiagonal() * ex)
-             + eu.dot(R_diag_.asDiagonal() * eu)
-             + du.dot(S_diag_.asDiagonal() * du);
-    }
-
-    Vector<Scalar> qx(const Vector<Scalar>& x_aug,
-                      const Vector<Scalar>& u) const override {
-        Vector<Scalar> g(17);
-        g.head(13) = 2.0 * (Q_diag_.asDiagonal() * (x_aug.head(13) - x_ref_));
-        g.tail(4)  = -2.0 * (S_diag_.asDiagonal() * (u - x_aug.tail(4)));
-        return g;
-    }
-
-    Vector<Scalar> qu(const Vector<Scalar>& x_aug,
-                      const Vector<Scalar>& u) const override {
-        return 2.0 * (R_diag_.asDiagonal() * (u - u_ref_))
-             + 2.0 * (S_diag_.asDiagonal() * (u - x_aug.tail(4)));
-    }
-
-    Matrix<Scalar> qxx(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        Matrix<Scalar> H = Matrix<Scalar>::Zero(17, 17);
-        H.block(0,  0,  13, 13) = (2.0 * Q_diag_).asDiagonal();
-        H.block(13, 13, 4,  4)  = (2.0 * S_diag_).asDiagonal();
-        return H;
-    }
-
-    Matrix<Scalar> quu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        return (2.0 * (R_diag_ + S_diag_)).asDiagonal();
-    }
-
-    // qxu: dim_x × dim_u = 17×4
-    // Only nonzero: ∂²/∂(u_prev)∂u of S‖u-u_prev‖² = -2S at rows 13:16
-    Matrix<Scalar> qxu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        Matrix<Scalar> H = Matrix<Scalar>::Zero(17, 4);
-        H.block(13, 0, 4, 4) = (-2.0 * S_diag_).asDiagonal();
-        return H;
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AugTerminalCost — terminal cost for 17-dim state (u_prev slots zero weight)
-// ─────────────────────────────────────────────────────────────────────────────
-template <typename Scalar>
-class AugTerminalCost : public TerminalCostBase<Scalar> {
-    Eigen::VectorXd x_ref_, P_diag_;
-public:
-    AugTerminalCost(const Eigen::VectorXd& x_ref, const Eigen::VectorXd& P_diag)
-        : x_ref_(x_ref), P_diag_(P_diag) {}
-
-    Scalar p(const Vector<Scalar>& x_aug) const override {
-        Vector<Scalar> e = x_aug.head(13) - x_ref_;
-        return e.dot(P_diag_.asDiagonal() * e);
-    }
-
-    Vector<Scalar> px(const Vector<Scalar>& x_aug) const override {
-        Vector<Scalar> g(17);
-        g.head(13) = 2.0 * (P_diag_.asDiagonal() * (x_aug.head(13) - x_ref_));
-        g.tail(4).setZero();
-        return g;
-    }
-
-    Matrix<Scalar> pxx(const Vector<Scalar>&) const override {
-        Matrix<Scalar> H = Matrix<Scalar>::Zero(17, 17);
-        H.block(0, 0, 13, 13) = (2.0 * P_diag_).asDiagonal();
-        return H;
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AugConstraintWrapper — pads any 13-dim constraint's cx to 17 columns.
-//
-// All physical constraints (thrust, moment, glideslope, tilt) only use
-// x[0:12] and u. This wrapper appends zero columns for u_prev (indices 13-16).
-// ─────────────────────────────────────────────────────────────────────────────
-template <typename Scalar>
-class AugConstraintWrapper : public StageConstraintBase<Scalar> {
-    std::shared_ptr<StageConstraintBase<Scalar>> inner_;
-public:
-    // Pass constraint_type and dim_c explicitly to avoid accessing protected members.
-    // These match the inner constraint's values — copy them from the concrete instance
-    // before wrapping, e.g.:
-    //   auto inner = std::make_shared<GlideslopeConstraint<double>>();
-    //   auto wrapped = std::make_shared<AugConstraintWrapper<double>>(
-    //       inner, ConstraintType::SOC, 3);
-    AugConstraintWrapper(std::shared_ptr<StageConstraintBase<Scalar>> inner,
-                         ConstraintType ctype, int dim)
-        : inner_(inner)
-    {
-        this->constraint_type = ctype;
-        this->dim_c           = dim;
-    }
-
-    Vector<Scalar> c(const Vector<Scalar>& x_aug,
-                     const Vector<Scalar>& u) const override {
-        return inner_->c(x_aug.head(13), u);
-    }
-
-    Matrix<Scalar> cx(const Vector<Scalar>& x_aug,
-                      const Vector<Scalar>& u) const override {
-        Matrix<Scalar> J = Matrix<Scalar>::Zero(this->dim_c, 17);
-        J.block(0, 0, this->dim_c, 13) = inner_->cx(x_aug.head(13), u);
-        return J;
-    }
-
-    Matrix<Scalar> cu(const Vector<Scalar>& x_aug,
-                      const Vector<Scalar>& u) const override {
-        return inner_->cu(x_aug.head(13), u);
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// make_x_aug — build a 17-dim augmented initial state
-//
-//   x_aug = [ x_physical(13), u_prev(4) ]
-//
-//   On cold start:  u_prev = make_u_ref()  (hover)
-//   On warm re-solve: u_prev = prev_U_[0] (last executed control)
-// ─────────────────────────────────────────────────────────────────────────────
-static Eigen::VectorXd make_x_aug(const Eigen::VectorXd& x13,
-                                   const Eigen::VectorXd& u_prev)
-{
-    Eigen::VectorXd x_aug(17);
-    x_aug.head(13) = x13;
-    x_aug.tail(4)  = u_prev;
-    return x_aug;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// create_aug — factory for augmented (17-dim state) OCP
-//
-// Use this instead of create() for Mellinger-tracked RH operation.
-// The S slew penalty now genuinely couples u[k] to u[k-1] within the horizon.
-//
-// @param current_state_aug  17-dim state built with make_x_aug()
-// @param prev_U             previous horizon controls for warm-start seeding
-// ─────────────────────────────────────────────────────────────────────────────
-inline std::shared_ptr<OptimalControlProblem<double>> create_aug(
-    const Eigen::VectorXd& current_state_aug,
-    const Eigen::VectorXd& /* terminal_state */,
-    const std::vector<Eigen::VectorXd>& prev_U = {})
+inline std::shared_ptr<OptimalControlProblem<double>> create(
+    const Eigen::VectorXd& current_state,
+    const Eigen::VectorXd& /* terminal_state */,    // unused — P drives terminal
+    const std::vector<Eigen::VectorXd>& prev_U = {}) // previous solve's U (empty = cold start)
 {
     auto prob = std::make_shared<OptimalControlProblem<double>>(HORIZON);
 
-    // Augmented dynamics (17-dim)
-    auto dyn = std::make_shared<Quad6DOFAug<double>>();
+    // Dynamics
+    auto dyn = std::make_shared<Quad6DOF<double>>();
     dyn->setMass(MASS);
     dyn->setGravity(Eigen::Vector3d(0.0, 0.0, -9.81));
     dyn->setJb(INERTIA);
@@ -577,30 +427,29 @@ inline std::shared_ptr<OptimalControlProblem<double>> create_aug(
     for (int i = 0; i < HORIZON; ++i)
         prob->setStageDynamics(i, dyn);
 
+    // References
     const Eigen::VectorXd x_ref = make_x_ref();
     const Eigen::VectorXd u_ref = make_u_ref();
 
-    // AugStageCost: reads u_prev from x_aug[13:16] — no fixed anchor needed
-    auto stage_cost = std::make_shared<AugStageCost<double>>(
-        x_ref, u_ref, Q_DIAG, R_DIAG, S_DIAG);
-    for (int i = 0; i < HORIZON; ++i)
-        prob->setStageCost(i, stage_cost);
+    // Stage cost: Q/R running + S slew-rate penalty
+    // u_prev[k] = prev_U[k] if available (warm re-solve), else u_ref (cold start)
+    for (int i = 0; i < HORIZON; ++i) {
+        const Eigen::VectorXd& u_prev =
+            (prev_U.size() > static_cast<size_t>(i)) ? prev_U[i] : u_ref;
+        prob->setStageCost(i, std::make_shared<DeltaUStageCost<double>>(
+            x_ref, u_ref, Q_DIAG, R_DIAG, S_DIAG, u_prev));
+    }
 
-    prob->setTerminalCost(std::make_shared<AugTerminalCost<double>>(x_ref, P_DIAG));
+    // Terminal cost
+    prob->setTerminalCost(std::make_shared<GenericTerminalCost<double>>(
+        x_ref, P_DIAG));
 
-    // Wrap all physical constraints for 17-dim state.
-    // Pass ConstraintType and dim_c explicitly (protected in base class).
-    auto gs_inner   = std::make_shared<GlideslopeConstraint<double>>(GLIDESLOPE);
-    auto tc_inner   = std::make_shared<TiltConeConstraint<double>>(TILT_CONE);
-    auto mt_inner   = std::make_shared<MaxThrustConstraint<double>>(FMAX);
-    auto fmin_inner = std::make_shared<MinThrustConstraint<double>>();
-    auto mm_inner   = std::make_shared<MaxMomentConstraint<double>>();
-
-    auto gs   = std::make_shared<AugConstraintWrapper<double>>(gs_inner,   ConstraintType::SOC, 3);
-    auto tc   = std::make_shared<AugConstraintWrapper<double>>(tc_inner,   ConstraintType::SOC, 3);
-    auto mt   = std::make_shared<AugConstraintWrapper<double>>(mt_inner,   ConstraintType::NO,  1);
-    auto fmin = std::make_shared<AugConstraintWrapper<double>>(fmin_inner, ConstraintType::NO,  1);
-    auto mm   = std::make_shared<AugConstraintWrapper<double>>(mm_inner,   ConstraintType::SOC, 4);
+    // Stage constraints
+    auto gs   = std::make_shared<GlideslopeConstraint<double>>(GLIDESLOPE);
+    auto tc   = std::make_shared<TiltConeConstraint<double>>(TILT_CONE);
+    auto mt   = std::make_shared<MaxThrustConstraint<double>>(FMAX);
+    auto fmin = std::make_shared<MinThrustConstraint<double>>();
+    auto mm   = std::make_shared<MaxMomentConstraint<double>>();
 
     for (int i = 0; i < HORIZON; ++i) {
         prob->addStageConstraint(i, gs);
@@ -610,36 +459,16 @@ inline std::shared_ptr<OptimalControlProblem<double>> create_aug(
         prob->addStageConstraint(i, mm);
     }
 
-    prob->setInitialState(0, current_state_aug);
+    // Initial state
+    prob->setInitialState(0, current_state);
 
-    // Warm-start controls
+    // Warm-start: hover (gravity compensation, zero moments)
     Eigen::VectorXd u0(4);
     u0 << MASS * 9.81, 0.0, 0.0, 0.0;
-    for (int i = 0; i < HORIZON; ++i) {
-        const Eigen::VectorXd& ui = (prev_U.size() > (size_t)i) ? prev_U[i] : u0;
-        prob->setInitialControl(i, ui);
-    }
+    for (int i = 0; i < HORIZON; ++i)
+        prob->setInitialControl(i, u0);
 
     return prob;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// create — delegates to create_aug (augmented 17-dim state).
-//
-// ocp_registry.hpp calls: LandingOCP::create(current_state, terminal_state, prev_U)
-// This function accepts that signature and builds the augmented initial state
-// automatically, so no changes to ocp_registry or quadrotor_mpc are required.
-//
-// u_prev for the augmented state: prev_U[0] if available, hover otherwise.
-// ─────────────────────────────────────────────────────────────────────────────
-inline std::shared_ptr<OptimalControlProblem<double>> create(
-    const Eigen::VectorXd& current_state,
-    const Eigen::VectorXd& terminal_state,
-    const std::vector<Eigen::VectorXd>& prev_U = {})
-{
-    const Eigen::VectorXd u_prev = prev_U.empty() ? make_u_ref() : prev_U[0];
-    const Eigen::VectorXd x_aug  = make_x_aug(current_state, u_prev);
-    return create_aug(x_aug, terminal_state, prev_U);
 }
 
 } // namespace LandingOCP

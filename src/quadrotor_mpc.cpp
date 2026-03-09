@@ -1,6 +1,5 @@
 #include "quadrotor_mpc.hpp"
 #include "ocp_registry.hpp"
-#include "ocp_landing.hpp"
 #include <iostream>
 
 using namespace std;
@@ -105,7 +104,11 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
     // ── Rebuild the problem only when necessary ───────────────────────────────
     if (!problem_ || need_problem_rebuild_) {
         try {
-            problem_ = OCPRegistry::create(config_.ocp_type, current_state, config_.terminal_state);
+            // Pass prev_U_ so stage costs get proper u_prev[k] for slew-rate
+            // penalty. On cold start prev_U_ is empty → create() defaults to
+            // u_ref (hover) for all k.
+            problem_ = OCPRegistry::create(
+                config_.ocp_type, current_state, config_.terminal_state, prev_U_);
         } catch (const std::runtime_error& e) {
             std::cerr << "ERROR: " << e.what() << "\n";
             throw;
@@ -120,12 +123,9 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
 
     // ── Reuse existing problem — only update x[0] and U ──────────────────────
     //
-    // OCP state is 17-dim (physical 13 + u_prev 4). Build x_aug so the
-    // u_prev slot holds the last executed control, not zeros.
-    const Eigen::VectorXd u_prev_aug =
-        has_prev_solution_ ? prev_U_[0] : LandingOCP::make_u_ref();
-    const Eigen::VectorXd x_aug = LandingOCP::make_x_aug(current_state, u_prev_aug);
-    problem_->setInitialState(0, x_aug);
+    // DDP reads only x[0] from outside. x[1..N] are always recomputed by the
+    // solver's own forward rollout before the first backward pass.
+    problem_->setInitialState(0, current_state);
 
     if (has_prev_solution_) {
         // Shift U forward by n_shift steps (one step per ocp_dt elapsed).
@@ -176,10 +176,8 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
         } else {
             std::cout << "warmstart x0:  " << current_state.transpose() << "\n";
             if (prev_X_.size() > 1) {
-                // prev_X_[1] is 17-dim — compare physical part only (head 13)
-                const Eigen::VectorXd x1_physical = prev_X_[1].head(13);
-                std::cout << "predicted x1:  " << x1_physical.transpose() << "\n";
-                const Eigen::VectorXd dx = current_state - x1_physical;
+                std::cout << "predicted x1:  " << prev_X_[1].transpose() << "\n";
+                const Eigen::VectorXd dx = current_state - prev_X_[1];
                 std::cout << "x0 - x1_pred:  " << dx.transpose() << "\n";
                 std::cout << "||x0 - x1_pred||: " << dx.norm() << "\n";
             } else {
@@ -192,13 +190,9 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
             }
 
             // Shift warm-start U forward by n_shift steps, then inject
-            // x[0] (17-dim augmented) and U directly into the solver.
+            // x[0] and U directly into the solver without touching multipliers.
             shiftWarmStart();
-            const Eigen::VectorXd u_prev_ws =
-                prev_U_.empty() ? LandingOCP::make_u_ref() : prev_U_[0];
-            const Eigen::VectorXd x_aug_ws =
-                LandingOCP::make_x_aug(current_state, u_prev_ws);
-            solver_->warmStart(x_aug_ws, prev_U_);
+            solver_->warmStart(current_state, prev_U_);
         }
 
         solver_->solve();
