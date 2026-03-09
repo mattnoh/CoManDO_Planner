@@ -41,8 +41,6 @@ endif()
 
 # ── Shared sources (no main) ──────────────────────────────────────────────────
 # quadrotor_mpc.cpp is the only shared translation unit.
-# planner_node.cpp and open_loop_test_node.cpp each have their own main()
-# and must be compiled into separate executables.
 set(SHARED_SOURCES
   src/quadrotor_mpc.cpp
 )
@@ -110,17 +108,9 @@ add_executable(comando_planner
 )
 configure_target(comando_planner)
 
-# ── Executable 2: single-solve open-loop test ────────────────────────────────
-add_executable(open_loop_test
-  src/open_loop_test_node.cpp
-  ${SHARED_SOURCES}
-)
-configure_target(open_loop_test)
-
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner
-    open_loop_test
   DESTINATION lib/${PROJECT_NAME}
 )
 

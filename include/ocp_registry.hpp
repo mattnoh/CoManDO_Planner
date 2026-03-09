@@ -50,13 +50,17 @@ inline Param getSolverParams(const std::string& ocp_type) {
 }
 
 // ── Factory — returns a ready-to-solve problem ────────────────────────────────
+// prev_U: previous solve's control trajectory (empty on cold start).
+//   Forwarded to OCP create() so stage costs can anchor slew-rate penalties
+//   to the actual previous solution rather than a fixed hover reference.
 inline std::shared_ptr<OptimalControlProblem<double>> create(
     const std::string& ocp_type,
     const Eigen::VectorXd& current_state,
-    const Eigen::VectorXd& terminal_state = Eigen::VectorXd())
+    const Eigen::VectorXd& terminal_state = Eigen::VectorXd(),
+    const std::vector<Eigen::VectorXd>& prev_U = {})
 {
     if (ocp_type == "hover")   return HoverOCP::create(current_state, terminal_state);
-    if (ocp_type == "landing") return LandingOCP::create(current_state);
+    if (ocp_type == "landing") return LandingOCP::create(current_state, terminal_state, prev_U);
     throw std::runtime_error("Unknown OCP type: " + ocp_type);
 }
 

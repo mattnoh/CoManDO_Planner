@@ -44,6 +44,7 @@
 #include <fstream>
 #include <iomanip>
 #include <cmath>
+#include <mutex>
 #include <Eigen/Dense>
 
 using namespace std::chrono_literals;
@@ -193,7 +194,11 @@ public:
         // ── Initial state ─────────────────────────────────────────────────────
         current_state_ = Eigen::VectorXd::Zero(13);
         current_state_(6) = 1.0;
-
+        // ── Callback groups for multi-threaded execution ───────────────────────────
+        sensor_cb_group_ = this->create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
+        solver_cb_group_ = this->create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
         // ── Set up platform-specific pub/sub ──────────────────────────────────
         if (platform_ == "crazyflie") {
             setupCrazyflie();
@@ -209,11 +214,13 @@ public:
         if (mode_ == "mpc") {
             solver_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(1000 / solver_rate_),
-                std::bind(&PlannerNode::solverLoop, this));
+                std::bind(&PlannerNode::solverLoop, this),
+                solver_cb_group_);
         } else {
             // open_loop: wait for first state, solve once, then replay
             startup_timer_ = this->create_wall_timer(
-                50ms, std::bind(&PlannerNode::openLoopStartupCheck, this));
+                50ms, std::bind(&PlannerNode::openLoopStartupCheck, this),
+                solver_cb_group_);
         }
 
         RCLCPP_INFO(this->get_logger(),
@@ -236,13 +243,18 @@ private:
         cf_cmd_pub_ = this->create_publisher<crazyflie_interfaces::msg::FullState>(
             "/" + drone_name_ + "/cmd_full_state", 10);
 
+        rclcpp::SubscriptionOptions sensor_opts;
+        sensor_opts.callback_group = sensor_cb_group_;
+
         pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "/" + drone_name_ + "/pose", 10,
-            std::bind(&PlannerNode::cfPoseCallback, this, std::placeholders::_1));
+            std::bind(&PlannerNode::cfPoseCallback, this, std::placeholders::_1),
+            sensor_opts);
 
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/" + drone_name_ + "/odom", 10,
-            std::bind(&PlannerNode::cfOdomCallback, this, std::placeholders::_1));
+            std::bind(&PlannerNode::cfOdomCallback, this, std::placeholders::_1),
+            sensor_opts);
     }
 
     void setupPX4()
@@ -255,9 +267,12 @@ private:
         px4_cmd_pub_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
             "/fmu/in/vehicle_command", 10);
 
+        rclcpp::SubscriptionOptions sensor_opts;
+        sensor_opts.callback_group = sensor_cb_group_;
         px4_odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
             "/fmu/out/vehicle_odometry", 10,
-            std::bind(&PlannerNode::px4OdomCallback, this, std::placeholders::_1));
+            std::bind(&PlannerNode::px4OdomCallback, this, std::placeholders::_1),
+            sensor_opts);
 
         // PX4 requires continuous heartbeat to stay in offboard mode
         px4_heartbeat_timer_ = this->create_wall_timer(
@@ -275,6 +290,7 @@ private:
     void cfPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
     {
         // Motion-capture position + quaternion — always authoritative
+        std::lock_guard<std::mutex> lk(state_mutex_);
         current_state_(0) = msg->pose.position.x;
         current_state_(1) = msg->pose.position.y;
         current_state_(2) = msg->pose.position.z;
@@ -288,6 +304,7 @@ private:
     void cfOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
         // World-frame velocity from Kalman filter (m/s)
+        std::lock_guard<std::mutex> lk(state_mutex_);
         current_state_(3) = msg->twist.twist.linear.x;
         current_state_(4) = msg->twist.twist.linear.y;
         current_state_(5) = msg->twist.twist.linear.z;
@@ -318,22 +335,24 @@ private:
         Eigen::Quaterniond q_enu  = frame_conv::quat_ned_to_enu(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
         Eigen::Vector3d omega_flu = frame_conv::omega_frd_to_flu(omega_frd);
 
-        current_state_(0)  = pos_enu.x();
-        current_state_(1)  = pos_enu.y();
-        current_state_(2)  = pos_enu.z();
-        current_state_(3)  = vel_enu.x();
-        current_state_(4)  = vel_enu.y();
-        current_state_(5)  = vel_enu.z();
-        current_state_(6)  = q_enu.w();
-        current_state_(7)  = q_enu.x();
-        current_state_(8)  = q_enu.y();
-        current_state_(9)  = q_enu.z();
-        current_state_(10) = omega_flu.x();
-        current_state_(11) = omega_flu.y();
-        current_state_(12) = omega_flu.z();
-
-        pose_received_ = true;
-        odom_received_ = true;  // PX4 odom has everything in one message
+        {
+            std::lock_guard<std::mutex> lk(state_mutex_);
+            current_state_(0)  = pos_enu.x();
+            current_state_(1)  = pos_enu.y();
+            current_state_(2)  = pos_enu.z();
+            current_state_(3)  = vel_enu.x();
+            current_state_(4)  = vel_enu.y();
+            current_state_(5)  = vel_enu.z();
+            current_state_(6)  = q_enu.w();
+            current_state_(7)  = q_enu.x();
+            current_state_(8)  = q_enu.y();
+            current_state_(9)  = q_enu.z();
+            current_state_(10) = omega_flu.x();
+            current_state_(11) = omega_flu.y();
+            current_state_(12) = omega_flu.z();
+            pose_received_ = true;
+            odom_received_ = true;  // PX4 odom has everything in one message
+        }
     }
 
     void px4HeartbeatCallback()
@@ -384,11 +403,20 @@ private:
 
     void solverLoop()
     {
-        if (!pose_received_ || !odom_received_) {
+        // Snapshot state under lock — sensor callbacks run on a separate thread
+        bool have_pose, have_odom;
+        Eigen::VectorXd x0;
+        {
+            std::lock_guard<std::mutex> lk(state_mutex_);
+            have_pose = pose_received_;
+            have_odom = odom_received_;
+            x0 = current_state_;
+        }
+        if (!have_pose || !have_odom) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                 "Waiting for state: /pose [%s] /odom [%s]...",
-                pose_received_ ? "OK" : "MISSING",
-                odom_received_ ? "OK" : "MISSING");
+                have_pose ? "OK" : "MISSING",
+                have_odom ? "OK" : "MISSING");
             return;
         }
 
@@ -412,17 +440,17 @@ private:
             RCLCPP_INFO(this->get_logger(),
                 "Initial state: pos=[%.3f,%.3f,%.3f] vel=[%.3f,%.3f,%.3f] "
                 "q=[%.3f,%.3f,%.3f,%.3f] w=[%.3f,%.3f,%.3f]",
-                current_state_(0), current_state_(1), current_state_(2),
-                current_state_(3), current_state_(4), current_state_(5),
-                current_state_(6), current_state_(7), current_state_(8), current_state_(9),
-                current_state_(10), current_state_(11), current_state_(12));
+                x0(0), x0(1), x0(2),
+                x0(3), x0(4), x0(5),
+                x0(6), x0(7), x0(8), x0(9),
+                x0(10), x0(11), x0(12));
         }
 
         // ── Solve with selected solver ────────────────────────────────────────
         SolverResult result;
 
         if (solver_type_ == "alipddp" && alipddp_mpc_) {
-            auto r = alipddp_mpc_->solve(current_state_);
+            auto r = alipddp_mpc_->solve(x0);
             result.success            = r.success;
             result.next_state         = r.next_state;
             result.state_trajectory   = r.state_trajectory;
@@ -432,7 +460,7 @@ private:
         }
 #ifdef HAS_ACADOS
         else if (solver_type_ == "acados" && acados_mpc_) {
-            auto r = acados_mpc_->solve(current_state_);
+            auto r = acados_mpc_->solve(x0);
             result.success            = r.success;
             result.next_state         = r.next_state;
             result.state_trajectory   = r.state_trajectory;
@@ -459,7 +487,7 @@ private:
 
             // ── Logging ──────────────────────────────────────────────────────
             if (logging_enabled_ && logging_initialized_) {
-                logActualState();
+                logActualState(x0);
                 const Eigen::VectorXd& u0 = U.empty() ? Eigen::VectorXd::Zero(4) : U[0];
                 logCommandedState(X[1], u0);
                 logSolveTrajectory(X, U, result.solve_time_ms);
@@ -509,7 +537,9 @@ private:
 
     void openLoopStartupCheck()
     {
-        if (!odom_received_) {
+        bool have_odom;
+        { std::lock_guard<std::mutex> lk(state_mutex_); have_odom = odom_received_; }
+        if (!have_odom) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                 "[OpenLoop] Waiting for /odom...");
             return;
@@ -517,17 +547,20 @@ private:
 
         startup_timer_->cancel();
 
+        Eigen::VectorXd x0;
+        { std::lock_guard<std::mutex> lk(state_mutex_); x0 = current_state_; }
+
         RCLCPP_INFO(this->get_logger(),
             "[OpenLoop] First state received. Running ONE solve (%s)...", solver_type_.c_str());
         RCLCPP_INFO(this->get_logger(),
             "[OpenLoop] x0 = [%.3f, %.3f, %.3f | %.3f, %.3f, %.3f | "
             "%.3f, %.3f, %.3f, %.3f | %.3f, %.3f, %.3f]",
-            current_state_(0), current_state_(1), current_state_(2),
-            current_state_(3), current_state_(4), current_state_(5),
-            current_state_(6), current_state_(7), current_state_(8), current_state_(9),
-            current_state_(10), current_state_(11), current_state_(12));
+            x0(0), x0(1), x0(2),
+            x0(3), x0(4), x0(5),
+            x0(6), x0(7), x0(8), x0(9),
+            x0(10), x0(11), x0(12));
 
-        SolverResult result = callSolver(current_state_);
+        SolverResult result = callSolver(x0);
 
         if (!result.success || result.state_trajectory.size() < 2) {
             RCLCPP_ERROR(this->get_logger(), "[OpenLoop] Solve FAILED. Cannot run test.");
@@ -557,7 +590,8 @@ private:
         const int period_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
         replay_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(period_ms),
-            std::bind(&PlannerNode::openLoopReplayTick, this));
+            std::bind(&PlannerNode::openLoopReplayTick, this),
+            solver_cb_group_);
 
         RCLCPP_INFO(this->get_logger(),
             "[OpenLoop] Replay started at %d ms/step (%zu steps total)",
@@ -581,8 +615,11 @@ private:
         }
 #endif
 
+        Eigen::VectorXd act_state;
+        { std::lock_guard<std::mutex> lk(state_mutex_); act_state = current_state_; }
+
         if (logging_enabled_ && logging_initialized_) {
-            logActualState();
+            logActualState(act_state);
             const Eigen::VectorXd u_step = (step < (int)ol_ref_U_.size())
                 ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4);
             logCommandedState(x_cmd, u_step);
@@ -591,13 +628,13 @@ private:
         if (ol_replay_step_ % 10 == 0 || trajectory_done) {
             double t_elapsed = std::chrono::duration<double>(
                 Clock::now() - ol_replay_start_time_).count();
-            Eigen::Vector3d pos_err = current_state_.head(3) - x_cmd.head(3);
+            Eigen::Vector3d pos_err = act_state.head(3) - x_cmd.head(3);
             RCLCPP_INFO(this->get_logger(),
                 "[Step %3d/%d | t=%.2fs] "
                 "cmd=[%.3f,%.3f,%.3f]  act=[%.3f,%.3f,%.3f]  |err|=%.3fm",
                 step, N, t_elapsed,
                 x_cmd(0), x_cmd(1), x_cmd(2),
-                current_state_(0), current_state_(1), current_state_(2),
+                act_state(0), act_state(1), act_state(2),
                 pos_err.norm());
         }
 
@@ -806,11 +843,11 @@ private:
         ++solve_count_;
     }
 
-    void logActualState()
+    void logActualState(const Eigen::VectorXd& state)
     {
         if (!actual_state_log_.is_open()) return;
         actual_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
-        for (int i = 0; i < 13; ++i) actual_state_log_ << "," << current_state_(i);
+        for (int i = 0; i < 13; ++i) actual_state_log_ << "," << state(i);
         actual_state_log_ << "\n";
         actual_state_log_.flush();
     }
@@ -835,9 +872,11 @@ private:
 
     void printDiagnostics(const SolverResult& result)
     {
-        Eigen::Vector3d pos = current_state_.segment(0, 3);
-        Eigen::Vector3d vel = current_state_.segment(3, 3);
-        Eigen::Vector3d ww  = current_state_.segment(10, 3);
+        Eigen::VectorXd snap;
+        { std::lock_guard<std::mutex> lk(state_mutex_); snap = current_state_; }
+        Eigen::Vector3d pos = snap.segment(0, 3);
+        Eigen::Vector3d vel = snap.segment(3, 3);
+        Eigen::Vector3d ww  = snap.segment(10, 3);
         double thrust = result.control_trajectory.empty() ? 0.0
             : result.control_trajectory[0](0);  // u(0) = fz only
         RCLCPP_INFO(this->get_logger(),
@@ -900,6 +939,11 @@ private:
     bool odom_received_ = false;
     bool is_flying_     = false;
 
+    // Threading
+    mutable std::mutex                   state_mutex_;
+    rclcpp::CallbackGroup::SharedPtr     sensor_cb_group_;
+    rclcpp::CallbackGroup::SharedPtr     solver_cb_group_;
+
     // MPC diagnostics
     int diag_count_ = 0;
 
@@ -924,7 +968,10 @@ private:
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PlannerNode>());
+    auto node = std::make_shared<PlannerNode>();
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

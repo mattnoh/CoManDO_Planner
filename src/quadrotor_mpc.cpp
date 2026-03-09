@@ -1,5 +1,6 @@
 #include "quadrotor_mpc.hpp"
 #include "ocp_registry.hpp"
+#include "ocp_landing.hpp"
 #include <iostream>
 
 using namespace std;
@@ -119,9 +120,12 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
 
     // ── Reuse existing problem — only update x[0] and U ──────────────────────
     //
-    // DDP reads only x[0] from outside. x[1..N] are always recomputed by the
-    // solver's own forward rollout before the first backward pass.
-    problem_->setInitialState(0, current_state);
+    // OCP state is 17-dim (physical 13 + u_prev 4). Build x_aug so the
+    // u_prev slot holds the last executed control, not zeros.
+    const Eigen::VectorXd u_prev_aug =
+        has_prev_solution_ ? prev_U_[0] : LandingOCP::make_u_ref();
+    const Eigen::VectorXd x_aug = LandingOCP::make_x_aug(current_state, u_prev_aug);
+    problem_->setInitialState(0, x_aug);
 
     if (has_prev_solution_) {
         // Shift U forward by n_shift steps (one step per ocp_dt elapsed).
@@ -172,8 +176,10 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
         } else {
             std::cout << "warmstart x0:  " << current_state.transpose() << "\n";
             if (prev_X_.size() > 1) {
-                std::cout << "predicted x1:  " << prev_X_[1].transpose() << "\n";
-                const Eigen::VectorXd dx = current_state - prev_X_[1];
+                // prev_X_[1] is 17-dim — compare physical part only (head 13)
+                const Eigen::VectorXd x1_physical = prev_X_[1].head(13);
+                std::cout << "predicted x1:  " << x1_physical.transpose() << "\n";
+                const Eigen::VectorXd dx = current_state - x1_physical;
                 std::cout << "x0 - x1_pred:  " << dx.transpose() << "\n";
                 std::cout << "||x0 - x1_pred||: " << dx.norm() << "\n";
             } else {
@@ -186,9 +192,13 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
             }
 
             // Shift warm-start U forward by n_shift steps, then inject
-            // x[0] and U directly into the solver without touching multipliers.
+            // x[0] (17-dim augmented) and U directly into the solver.
             shiftWarmStart();
-            solver_->warmStart(current_state, prev_U_);
+            const Eigen::VectorXd u_prev_ws =
+                prev_U_.empty() ? LandingOCP::make_u_ref() : prev_U_[0];
+            const Eigen::VectorXd x_aug_ws =
+                LandingOCP::make_x_aug(current_state, u_prev_ws);
+            solver_->warmStart(x_aug_ws, prev_U_);
         }
 
         solver_->solve();
