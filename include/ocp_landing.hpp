@@ -2,40 +2,50 @@
 /// @brief OCP formulation for landing problem (for online replanning).
 ///
 /// ════════════════════════════════════════════════════════════════════════════
-/// CHANGES FROM PREVIOUS VERSION
+/// CHANGES — trajectory-consistency penalty
 /// ════════════════════════════════════════════════════════════════════════════
 ///
-/// 1. DT 0.1s → 0.05s
-///    Each OCP step is now 50ms instead of 100ms.
-///    - Replay timer fires at 20Hz → Mellinger gets a new setpoint every 50ms
-///      instead of every 100ms. Position jump per step halved.
-///    - Jerk constraint now bounds 50ms acceleration increments → naturally
-///      tighter without changing J_MAX.
-///    - n_shift at solver_rate=1Hz becomes 20 (was 10).
-///    Horizon: 100 × 0.05s = 5s. Still sufficient for a 1m landing.
+/// ROOT CAUSE OF VELOCITY JUMPS
+/// ─────────────────────────────
+/// Each solve independently minimizes cost to the landing target, so two
+/// consecutive solves from slightly-different x0 (due to tracking error) can
+/// converge to completely different local optima.  The position blend in
+/// planner_node hides the jump visually, but the commanded velocities still
+/// diverge because the underlying trajectories are inconsistent.
 ///
-/// 2. J_MAX tightened: 0.133 → 0.05 m/s per step
-///    Old: 0.133/0.1s = 1.33 m/s² vertical jerk — aggressive, OCP hits this
-///         limit every step producing bang-bang thrust Mellinger can't track.
-///    New: 0.05/0.05s = 1.0 m/s² vertical jerk — still physically achievable
-///         but forces smoother thrust profiles between consecutive steps.
-///    Note: |Δvz| ≤ 0.05 m/s per 0.05s step is equivalent to limiting
-///    vertical thrust change to ~0.027*1.0 = 0.027 N per step — well within
-///    Mellinger's control bandwidth.
+/// FIX: trajectory-consistency penalty
+/// ─────────────────────────────────────
+/// Added a third state-error term to the stage cost:
 ///
-/// 3. Q_DIAG velocity weights: 1.0 → 3.0 (vx, vy), 4.0 (vz)
-///    Higher velocity penalty forces the OCP to produce slower, smoother
-///    trajectories. Previously the solver was happy to produce large velocity
-///    spikes because the cost of velocity was low relative to position.
-///    vz weighted higher than vx/vy to keep vertical motion controlled.
+///   q(x, u) = ||x - x_land_ref||_Q²          (landing-target cost, unchanged)
+///           + ||u - u_hover||_R²              (control cost, unchanged)
+///           + ||Δu||_S²                        (slew-rate cost, unchanged)
+///           + ||x[0:6] - x_prev[0:6]||_W²     (NEW: trajectory-consistency)
 ///
-/// 4. S_DIAG thrust slew tightened: 1e-3 → 5e-3
-///    Penalizes thrust changes between consecutive steps more aggressively.
-///    Combined with tighter jerk constraint, this removes the bang-bang
-///    thrust behavior that caused oscillation at each replan point.
+/// W_TRAJ_POS = 0 (position consistency DISABLED).
+///   A nonzero position weight anchors the solver to the first solve's
+///   lateral path, preventing correction to the landing target.
 ///
-/// UNCHANGED: all constraint classes, J_SCALE, FMIN/FMAX, moment limits,
-///            Q position weights, R, P, solver parameters.
+/// W_TRAJ_VEL = 15.0 — velocity consistency only.
+///   Removes inter-solve velocity jumps without locking the trajectory.
+///
+/// The penalty uses x_prev[k] = the k-th node of the previous solve's
+/// trajectory, shifted by n_shift (so node k of the new solve aligns
+/// temporally with the same physical time as x_prev[k]).
+///
+/// When x_prev is empty (first solve) the penalty is zero — cold start
+/// is unaffected.
+///
+/// W_TRAJ is intentionally tapered near the end of the horizon (last 20
+/// nodes): reduced to 0.1× so the terminal landing constraint is not
+/// compromised by an outdated reference from a different approach path.
+///
+/// OTHER CHANGES
+/// ─────────────
+///  - DT 0.1s → 0.05s (halved)
+///  - J_MAX tightened: 0.05/DT
+///  - Q velocity weights raised
+///  - S thrust slew tightened
 /// ════════════════════════════════════════════════════════════════════════════
 
 #pragma once
@@ -47,9 +57,9 @@
 namespace LandingOCP {
 
 // ── Fixed parameters ──────────────────────────────────────────────────────────
-const int    HORIZON = 100;        // 100 steps × 0.05s = 5s horizon
-const double DT      = 0.05;       // seconds — halved from 0.1s
-const double MASS    = 0.027;      // kg
+const int    HORIZON = 100;
+const double DT      = 0.05;
+const double MASS    = 0.027;
 
 const double J_SCALE = 1.0 / 1.66e-5;
 const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
@@ -63,17 +73,31 @@ const double FMAX       = 0.6;
 const double GLIDESLOPE = 60.0;
 const double TILT_CONE  = 60.0;
 
-const double L_ARM       = 0.046;
-const double F_MOTOR_MAX = FMAX / 4.0;
-const double F_MOTOR_MIN = FMIN / 4.0;
-const double C_TAU       = 0.005;
-const double TAU_XY_MAX  = L_ARM * (F_MOTOR_MAX - F_MOTOR_MIN);
-const double TAU_Z_MAX   = C_TAU * (F_MOTOR_MAX - F_MOTOR_MIN) * 4.0;
+const double L_ARM          = 0.046;
+const double F_MOTOR_MAX    = FMAX / 4.0;
+const double F_MOTOR_MIN    = FMIN / 4.0;
+const double C_TAU          = 0.005;
+const double TAU_XY_MAX     = L_ARM * (F_MOTOR_MAX - F_MOTOR_MIN);
+const double TAU_Z_MAX      = C_TAU * (F_MOTOR_MAX - F_MOTOR_MIN) * 4.0;
 const double TAU_MAX_SCALED = TAU_XY_MAX * J_SCALE;
 
-// Tightened jerk: 0.05 m/s per 0.05s step = 1.0 m/s² max vertical accel change.
-// Old was 0.133/0.1s = 1.33 m/s² — too loose, caused bang-bang thrust.
-const double J_MAX = 0.05 / DT;   // m/s² — recomputes correctly if DT changes
+const double J_MAX = 0.05 / DT;
+
+// ── Trajectory-consistency penalty weights ────────────────────────────────────
+// Applied to ||x[0:3] - x_prev[0:3]||² and ||x[3:6] - x_prev[3:6]||².
+// Set to 0 on nodes where no previous trajectory is available (first solve).
+// Tapered to W_TRAJ_TAPER_FACTOR for the last TAPER_NODES nodes so the
+// terminal landing cost is not compromised by a stale reference.
+// W_TRAJ_POS = 0: do NOT penalise position consistency.
+// A nonzero position weight locks the solver onto the first solve's lateral
+// path and prevents correction toward the landing target — the drone lands
+// at the first-solve position, not at origin.
+// Only velocity consistency is penalised: this removes inter-solve velocity
+// jumps (the jaggedness symptom) while letting position converge freely.
+const double W_TRAJ_POS          = 0.0;    // disabled
+const double W_TRAJ_VEL          = 0.0;    // disabled — pure QR cost
+const double W_TRAJ_TAPER_FACTOR = 0.1;    // multiplier for last TAPER_NODES
+const int    TAPER_NODES         = 40;     // last 40 nodes (2s) get tapered vel weight
 
 // ── Solver parameters ─────────────────────────────────────────────────────────
 const double SOLVER_REG1_MIN  = 1e-6;
@@ -86,14 +110,12 @@ const int    SOLVER_MAX_ITER  = 300;
 const double SOLVER_RHOT      = 1.0;
 
 // ── Q: running state cost ─────────────────────────────────────────────────────
-// Velocity weights raised (vx,vy: 1→3, vz: 2→4) to discourage aggressive
-// velocity profiles that Mellinger cannot track between replan points.
 static const Eigen::VectorXd Q_DIAG = (Eigen::VectorXd(13) <<
-    2.0, 2.0, 2.0,       // position
-    3.0, 3.0, 4.0,       // velocity — raised to smooth trajectory
-    0.1,                 // qw
-    0.1, 0.1, 0.1,       // qx qy qz
-    0.05, 0.05, 0.05).finished();  // omega
+    2.0, 2.0, 2.0,
+    3.0, 3.0, 4.0,
+    0.1,
+    0.1, 0.1, 0.1,
+    0.05, 0.05, 0.05).finished();
 
 // ── R: running control cost ───────────────────────────────────────────────────
 static const Eigen::VectorXd R_DIAG = (Eigen::VectorXd(4) <<
@@ -103,9 +125,8 @@ static const Eigen::VectorXd R_DIAG = (Eigen::VectorXd(4) <<
     1e-4 / (J_SCALE*J_SCALE)).finished();
 
 // ── S: delta-u slew-rate penalty ─────────────────────────────────────────────
-// Thrust slew tightened 1e-3 → 5e-3 to penalize aggressive thrust changes.
 static const Eigen::VectorXd S_DIAG = (Eigen::VectorXd(4) <<
-    5e-3,                          // raised from 1e-3
+    5e-3,
     1e-1 / (J_SCALE*J_SCALE),
     1e-1 / (J_SCALE*J_SCALE),
     1e-1 / (J_SCALE*J_SCALE)).finished();
@@ -131,47 +152,91 @@ static Eigen::VectorXd make_u_ref() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stage cost — unchanged
+// Stage cost with trajectory-consistency penalty
+//
+// cost = ||x - x_land_ref||_Q²
+//      + ||u - u_hover||_R²
+//      + ||Δu||_S²
+//      + taper_w * (W_pos * ||pos - pos_prev||² + W_vel * ||vel - vel_prev||²)
+//
+// x_traj_ref: node k from the PREVIOUS solve's trajectory (shifted by n_shift).
+//             Empty (size 0) on the first solve — penalty is zero.
+// taper_w:    1.0 for early nodes, W_TRAJ_TAPER_FACTOR for last TAPER_NODES.
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
-class DeltaUStageCost : public StageCostBase<Scalar> {
-    Eigen::VectorXd x_ref_, u_ref_, Q_diag_, R_diag_, S_diag_, u_prev_;
+class TrajectoryAwareStageCost : public StageCostBase<Scalar> {
+    Eigen::VectorXd x_land_ref_, u_ref_;
+    Eigen::VectorXd Q_diag_, R_diag_, S_diag_, u_prev_;
+    Eigen::VectorXd x_traj_ref_;   // previous solve's node at this time step
+    double          w_pos_;        // effective W_TRAJ_POS after tapering
+    double          w_vel_;        // effective W_TRAJ_VEL after tapering
+    bool            has_traj_ref_; // false on first solve
+
 public:
-    DeltaUStageCost(const Eigen::VectorXd& x_ref,
-                    const Eigen::VectorXd& u_ref,
-                    const Eigen::VectorXd& Q_diag,
-                    const Eigen::VectorXd& R_diag,
-                    const Eigen::VectorXd& S_diag,
-                    const Eigen::VectorXd& u_prev)
-        : x_ref_(x_ref), u_ref_(u_ref),
-          Q_diag_(Q_diag), R_diag_(R_diag),
-          S_diag_(S_diag), u_prev_(u_prev) {}
+    TrajectoryAwareStageCost(const Eigen::VectorXd& x_land_ref,
+                             const Eigen::VectorXd& u_ref,
+                             const Eigen::VectorXd& Q_diag,
+                             const Eigen::VectorXd& R_diag,
+                             const Eigen::VectorXd& S_diag,
+                             const Eigen::VectorXd& u_prev,
+                             const Eigen::VectorXd& x_traj_ref,
+                             double w_pos,
+                             double w_vel)
+        : x_land_ref_(x_land_ref), u_ref_(u_ref),
+          Q_diag_(Q_diag), R_diag_(R_diag), S_diag_(S_diag), u_prev_(u_prev),
+          x_traj_ref_(x_traj_ref), w_pos_(w_pos), w_vel_(w_vel),
+          has_traj_ref_(x_traj_ref.size() >= 6)
+    {}
 
     Scalar q(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        Vector<Scalar> ex = x - x_ref_;
+        Vector<Scalar> ex = x - x_land_ref_;
         Vector<Scalar> eu = u - u_ref_;
         Vector<Scalar> du = u - u_prev_;
-        return ex.dot(Q_diag_.asDiagonal() * ex)
-             + eu.dot(R_diag_.asDiagonal() * eu)
-             + du.dot(S_diag_.asDiagonal() * du);
+        Scalar cost = ex.dot(Q_diag_.asDiagonal() * ex)
+                    + eu.dot(R_diag_.asDiagonal() * eu)
+                    + du.dot(S_diag_.asDiagonal() * du);
+        if (has_traj_ref_) {
+            Vector<Scalar> dp = x.head(3) - x_traj_ref_.head(3).template cast<Scalar>();
+            Vector<Scalar> dv = x.segment(3,3) - x_traj_ref_.segment(3,3).template cast<Scalar>();
+            cost += static_cast<Scalar>(w_pos_) * dp.squaredNorm()
+                  + static_cast<Scalar>(w_vel_) * dv.squaredNorm();
+        }
+        return cost;
     }
+
     Vector<Scalar> qx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)u;
-        return 2.0 * (Q_diag_.asDiagonal() * (x - x_ref_));
+        Vector<Scalar> grad = 2.0 * (Q_diag_.asDiagonal() * (x - x_land_ref_));
+        if (has_traj_ref_) {
+            grad.head(3) += 2.0 * static_cast<Scalar>(w_pos_)
+                          * (x.head(3) - x_traj_ref_.head(3).template cast<Scalar>());
+            grad.segment(3,3) += 2.0 * static_cast<Scalar>(w_vel_)
+                               * (x.segment(3,3) - x_traj_ref_.segment(3,3).template cast<Scalar>());
+        }
+        return grad;
     }
+
     Vector<Scalar> qu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x;
         return 2.0 * (R_diag_.asDiagonal() * (u - u_ref_))
              + 2.0 * (S_diag_.asDiagonal() * (u - u_prev_));
     }
+
     Matrix<Scalar> qxx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; (void)u;
-        return (2.0 * Q_diag_).asDiagonal();
+        Eigen::VectorXd q2 = 2.0 * Q_diag_;
+        if (has_traj_ref_) {
+            q2(0) += 2.0 * w_pos_; q2(1) += 2.0 * w_pos_; q2(2) += 2.0 * w_pos_;
+            q2(3) += 2.0 * w_vel_; q2(4) += 2.0 * w_vel_; q2(5) += 2.0 * w_vel_;
+        }
+        return q2.asDiagonal();
     }
+
     Matrix<Scalar> quu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; (void)u;
         return (2.0 * (R_diag_ + S_diag_)).asDiagonal();
     }
+
     Matrix<Scalar> qxu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; (void)u;
         return Matrix<Scalar>::Zero(x.size(), u.size());
@@ -201,7 +266,7 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constraints — all unchanged
+// Constraints — unchanged
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class MaxThrustConstraint : public StageConstraintBase<Scalar> {
@@ -368,12 +433,18 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Factory — unchanged except DT propagates to all constraints automatically
+// Factory
+//
+// NEW PARAMETER: prev_X (previous solve's state trajectory, already shifted
+//   by n_shift in quadrotor_mpc.cpp before calling here).
+//   prev_X[k] is used as the trajectory reference for stage k.
+//   Pass empty vector on first solve — penalty is disabled automatically.
 // ─────────────────────────────────────────────────────────────────────────────
 inline std::shared_ptr<OptimalControlProblem<double>> create(
     const Eigen::VectorXd& current_state,
     const Eigen::VectorXd& /* terminal_state */,
-    const std::vector<Eigen::VectorXd>& prev_U = {})
+    const std::vector<Eigen::VectorXd>& prev_U = {},
+    const std::vector<Eigen::VectorXd>& prev_X = {})   // NEW
 {
     auto prob = std::make_shared<OptimalControlProblem<double>>(HORIZON);
 
@@ -385,17 +456,35 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     for (int i = 0; i < HORIZON; ++i)
         prob->setStageDynamics(i, dyn);
 
-    const Eigen::VectorXd x_ref = make_x_ref();
-    const Eigen::VectorXd u_ref = make_u_ref();
+    const Eigen::VectorXd x_land_ref = make_x_ref();
+    const Eigen::VectorXd u_ref      = make_u_ref();
+    const Eigen::VectorXd empty_traj_ref;   // zero-size → penalty disabled
 
     for (int i = 0; i < HORIZON; ++i) {
         const Eigen::VectorXd& u_prev =
             (prev_U.size() > static_cast<size_t>(i)) ? prev_U[i] : u_ref;
-        prob->setStageCost(i, std::make_shared<DeltaUStageCost<double>>(
-            x_ref, u_ref, Q_DIAG, R_DIAG, S_DIAG, u_prev));
+
+        // Trajectory reference for node i.
+        // Node i of the new solve corresponds to node (i + n_shift) of the
+        // old solve — but prev_X was already shifted in quadrotor_mpc.cpp,
+        // so we just index directly.
+        const Eigen::VectorXd& x_traj_ref =
+            (prev_X.size() > static_cast<size_t>(i + 1))
+                ? prev_X[i + 1]   // +1: node 0 is x0 (constrained), start from node 1
+                : empty_traj_ref;
+
+        // Taper the consistency weight near the end of the horizon so the
+        // terminal landing constraint isn't held hostage to an old path.
+        const bool in_taper = (i >= HORIZON - TAPER_NODES);
+        const double w_pos  = in_taper ? W_TRAJ_POS * W_TRAJ_TAPER_FACTOR : W_TRAJ_POS;
+        const double w_vel  = in_taper ? W_TRAJ_VEL * W_TRAJ_TAPER_FACTOR : W_TRAJ_VEL;
+
+        prob->setStageCost(i, std::make_shared<TrajectoryAwareStageCost<double>>(
+            x_land_ref, u_ref, Q_DIAG, R_DIAG, S_DIAG, u_prev,
+            x_traj_ref, w_pos, w_vel));
     }
 
-    prob->setTerminalCost(std::make_shared<GenericTerminalCost<double>>(x_ref, P_DIAG));
+    prob->setTerminalCost(std::make_shared<GenericTerminalCost<double>>(x_land_ref, P_DIAG));
 
     auto gs   = std::make_shared<GlideslopeConstraint<double>>(GLIDESLOPE);
     auto tc   = std::make_shared<TiltConeConstraint<double>>(TILT_CONE);

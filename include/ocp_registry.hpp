@@ -57,10 +57,11 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     const std::string& ocp_type,
     const Eigen::VectorXd& current_state,
     const Eigen::VectorXd& terminal_state = Eigen::VectorXd(),
-    const std::vector<Eigen::VectorXd>& prev_U = {})
+    const std::vector<Eigen::VectorXd>& prev_U = {},
+    const std::vector<Eigen::VectorXd>& prev_X = {})
 {
     if (ocp_type == "hover")   return HoverOCP::create(current_state, terminal_state);
-    if (ocp_type == "landing") return LandingOCP::create(current_state, terminal_state, prev_U);
+    if (ocp_type == "landing") return LandingOCP::create(current_state, terminal_state, prev_X, prev_U);
     throw std::runtime_error("Unknown OCP type: " + ocp_type);
 }
 
