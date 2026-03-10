@@ -64,7 +64,7 @@ const double TAU_MAX     = TAU_XY_MAX;  // conservative: tightest axis
 // Per-step velocity change limit (jerk proxy):
 //   j_max = 0.075 m/s  /  DT = 0.75 m/s²  (net world-frame acceleration bound)
 //   Constraint: |v[k+1] - v[k]| / DT ≤ J_MAX  ⟺  |Δv| ≤ J_MAX * DT = 0.075 m/s
-const double J_MAX       = 0.397 / DT;   // 0.75 m/s² — max |v[k+1]-v[k]| / DT
+const double J_MAX       = 0.133 / DT;   // 0.75 m/s² — max |v[k+1]-v[k]| / DT
 
 // ── Solver parameters ─────────────────────────────────────────────────────────
 const double SOLVER_REG1_MIN  = 1e-6;
@@ -497,6 +497,7 @@ public:
         return J;
     }
 };
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory function — builds a fresh OCP for online replanning.
