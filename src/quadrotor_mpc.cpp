@@ -5,7 +5,6 @@
 using namespace std;
 
 QuadrotorMPC::QuadrotorMPC(const Config& config) : config_(config) {
-    // Solver parameters are defined per-OCP in ocp_registry.hpp.
     try {
         solver_params_ = OCPRegistry::getSolverParams(config_.ocp_type);
     } catch (const std::runtime_error& e) {
@@ -19,7 +18,7 @@ double QuadrotorMPC::getOcpDt() const {
         return OCPRegistry::getDT(config_.ocp_type);
     } catch (const std::runtime_error& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
-        return config_.dt;  // fallback
+        return config_.dt;
     }
 }
 
@@ -29,7 +28,6 @@ void QuadrotorMPC::shiftWarmStart() {
     const int Nx = (int)prev_X_.size();
     const int Nu = (int)prev_U_.size();
     const int n_shift = std::max(1, std::min(config_.n_shift, Nu - 1));
-
     {
         vector<Eigen::VectorXd> sx(Nx);
         for (int i = 0; i < Nx; ++i)
@@ -45,41 +43,10 @@ void QuadrotorMPC::shiftWarmStart() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Set up (or refresh) the OCP problem and inject the warm-start.
-//
-// KEY DESIGN: when should we call create() vs reuse the existing problem_?
-//
-//   create() builds the entire OCP: dynamics, cost structure, constraints,
-//   and possibly a reference trajectory interpolated from current_state to
-//   terminal_state (depending on the OCP implementation).
-//
-//   If create() re-interpolates a reference trajectory from current_state,
-//   calling it on every solve changes the cost landscape every tick. The
-//   warm-start U from the previous solve is optimal for the OLD landscape —
-//   so the solver ignores it and cold-starts, producing jagged paths.
-//
-//   The fix: call create() ONLY when the problem genuinely changes:
-//     - First solve (cold start)
-//     - Terminal state changed (setTerminalState() called)
-//     - OCP type changed
-//
-//   On subsequent solves we reuse problem_ and only update x[0] and U.
-//   The cost landscape is identical to the previous solve, so the warm-start
-//   U is a valid and good initial guess.
-//
-// NOTE: After reusing problem_, we still recreate the solver object because
-//   ALIPDDP stores internal workspace tied to one problem instance. Recreating
-//   the solver but reusing the problem_ pointer is safe as long as the problem
-//   object outlives the solver.
-// ─────────────────────────────────────────────────────────────────────────────
 void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
 {
-    // ── Rebuild the problem only when necessary ───────────────────────────────
     if (!problem_ || need_problem_rebuild_) {
         try {
-            // Pass prev_U_ so stage costs get proper u_prev[k] for slew-rate
-            // penalty. On cold start prev_U_ is empty → create() defaults to
-            // u_ref (hover) for all k.
             problem_ = OCPRegistry::create(
                 config_.ocp_type, current_state, config_.terminal_state, prev_U_);
         } catch (const std::runtime_error& e) {
@@ -87,20 +54,10 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
             throw;
         }
         need_problem_rebuild_ = false;
-        solver_.reset();  // force solver re-init on next solve() call since problem changed
-        // create() already seeded U with a gravity-compensating hover from the
-        // current quaternion and called setInitialState(0, current_state).
-        // On a cold start we leave that seed as-is.
+        solver_.reset();
         return;
     }
-
-    // ── Reuse existing problem — only update x[0] and U ──────────────────────
-    //
-    // DDP reads only x[0] from outside. x[1..N] are always recomputed by the
-    // solver's own forward rollout before the first backward pass.
     problem_->setInitialState(0, current_state);
-
-    // Shifting and warm-starting are handled in solve() after this returns.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,51 +68,52 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
     auto t0 = chrono::high_resolution_clock::now();
 
     try {
-        // ── Project state onto OCP model manifold ─────────────────────────────
+        // Zero angular velocity before passing to OCP.
+        // Mellinger recomputes ω internally from attitude PD — its reactive
+        // corrections are not predicted by the OCP dynamics and feeding them
+        // back causes a state mismatch between x0_ocp and prev_X_[1].
         Eigen::VectorXd x0_ocp = current_state;
-        x0_ocp.segment(10, 3).setZero();   // zero wx, wy, wz
+        x0_ocp.segment(10, 3).setZero();
 
-        setupProblem(x0_ocp);   // <-- pass x0_ocp, not current_state
+        setupProblem(x0_ocp);
 
         if (!solver_) {
+            // ── First solve: cold start ───────────────────────────────────────
             solver_ = make_shared<ALIPDDP<double>>(*problem_);
             solver_->init(solver_params_);
+
         } else {
-            // Log the PHYSICAL state for diagnosis, but warm-start with projected
-            std::cout << "warmstart x0 (raw):  " << current_state.transpose() << "\n";
-            std::cout << "warmstart x0 (ocp):  " << x0_ocp.transpose() << "\n";
-            if (prev_X_.size() > 1) {
-                const Eigen::VectorXd dx_pos = current_state.head(6) - prev_X_[1].head(6);
-                std::cout << "||pos+vel mismatch||: " << dx_pos.norm() << "\n";
-            }
+            // ── Subsequent solves ─────────────────────────────────────────────
 
-            // Shift U forward by n_shift steps.
+            // Prediction error diagnosis
+            std::cout << "x0_actual:  " << current_state.transpose() << "\n";
+            std::cout << "prev_X_[1]: " << prev_X_[1].transpose() << "\n";
+            const double pos_err  = (current_state.head(3)     - prev_X_[1].head(3)).norm();
+            const double vel_err  = (current_state.segment(3,3) - prev_X_[1].segment(3,3)).norm();
+            const double quat_dot = std::abs(current_state.segment(6,4).dot(prev_X_[1].segment(6,4)));
+            const double att_err  = 2.0 * std::acos(std::min(1.0, quat_dot)) * 180.0/M_PI;
+            std::cout << "pos_err=" << pos_err
+                      << " vel_err=" << vel_err
+                      << " att_err_deg=" << att_err << "\n";
+
+            // ── WARM START (active) ───────────────────────────────────────────
+            // Original divergence was FMIN=0.212 putting x[1] on thrust floor
+            // and compounding each step. Now with FMIN=0.08 (hardware) + jerk
+            // constraint (|Dvz|<=0.133 m/s per step), compounding is prevented.
+            // Cold start from hover seed produces "start slowly" solutions —
+            // warm-start U carries descent momentum across solves.
+            //
+            // NOTE: forward rollout block removed. warmStart(x0, U) already
+            // does its own forward rollout internally. Computing X_ws before
+            // calling warmStart was redundant.
             shiftWarmStart();
-
-            // Roll dynamics forward from x0_ocp using shifted U so that
-            // the warm-start X is consistent with the measured state.
-            {
-                auto dyn = std::make_shared<Quad6DOF<double>>();
-                dyn->setMass(LandingOCP::MASS);
-                dyn->setGravity(Eigen::Vector3d(0, 0, -9.81));
-                dyn->setJb(LandingOCP::INERTIA);
-                dyn->setDt(LandingOCP::DT);
-
-                Eigen::VectorXd xr = x0_ocp;
-                std::vector<Eigen::VectorXd> X_ws;
-                X_ws.reserve(LandingOCP::HORIZON + 1);
-                X_ws.push_back(xr);
-                for (int k = 0; k < LandingOCP::HORIZON; ++k) {
-                    xr = dyn->f(xr, prev_U_[k]);
-                    X_ws.push_back(xr);
-                }
-                prev_X_ = X_ws;  // update cached X to match
-            }
-
-            // warmStart takes (x0, U): injects x0 and U into the solver's
-            // internal arrays without resetting AL multipliers.
-            solver_->init(solver_params_);          // resets λ, ρ to initial values
+            solver_->init(solver_params_);
             solver_->warmStart(x0_ocp, prev_U_);
+
+            // ── COLD START (disabled) ─────────────────────────────────────────
+            // Re-enable if warm-start diverges after large disturbance.
+            // Comment out the three lines above and uncomment below.
+            // solver_->init(solver_params_);
         }
 
         solver_->solve();
@@ -197,8 +155,6 @@ void QuadrotorMPC::setTerminalState(const Eigen::VectorXd& terminal) {
     if (terminal.size() == 13) {
         config_.terminal_state = terminal;
         has_prev_solution_    = false;
-        // Force create() to be called on the next solve so the new terminal
-        // is reflected in the cost function.
         need_problem_rebuild_ = true;
     }
 }
