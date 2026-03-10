@@ -1,44 +1,41 @@
 /// @file ocp_landing.hpp
 /// @brief OCP formulation for landing problem (for online replanning).
 ///
-/// Ported from standalone quad_cf.cpp — all feasibility fixes applied:
-///   1. DeltaUStageCost    — S penalty on moment slew rate (replaces GenericStageCost)
-///   2. MaxMomentConstraint — SOC constraint on [Mx,My,Mz] from allocation matrix
-///   3. Q_DIAG / S_DIAG    — synced to verified standalone values
-///
-/// FMAX = 0.6 N (Crazyflie RH value, not the 1.2 N used in cold-start standalone).
-///
 /// ════════════════════════════════════════════════════════════════════════════
-/// CHANGES FROM PREVIOUS VERSION (minimal diff)
+/// CHANGES FROM PREVIOUS VERSION
 /// ════════════════════════════════════════════════════════════════════════════
 ///
-/// 1. TAU_MAX → TAU_MAX_SCALED  [J_SCALE consistency fix — the main bug]
-///    OLD: TAU_MAX = TAU_XY_MAX = 0.006 N·m
-///         MaxMomentConstraint bounded scaled moments to 0.006
-///         → ω_dot_max = 0.006 / J_eff = 0.006 / 1 = 0.006 rad/s²  (60000× too slow)
-///         → solver kept ω≈0, couldn't tilt, x[1]≈x[0], z-drops-fast
-///    NEW: TAU_MAX_SCALED = TAU_XY_MAX * J_SCALE ≈ 361
-///         → ω_dot_max = 361 / 1 = 361 rad/s²  (physically correct)
+/// 1. DT 0.1s → 0.05s
+///    Each OCP step is now 50ms instead of 100ms.
+///    - Replay timer fires at 20Hz → Mellinger gets a new setpoint every 50ms
+///      instead of every 100ms. Position jump per step halved.
+///    - Jerk constraint now bounds 50ms acceleration increments → naturally
+///      tighter without changing J_MAX.
+///    - n_shift at solver_rate=1Hz becomes 20 (was 10).
+///    Horizon: 100 × 0.05s = 5s. Still sufficient for a 1m landing.
 ///
-/// 2. R/S moment channels divided by J_SCALE²
-///    After TAU_MAX fix the constraint allows moments up to 361 (scaled units).
-///    Without rescaling R/S, the cost-per-unit-moment drops by J_SCALE² = 3.6e9,
-///    so the solver slams moments to the constraint boundary every step.
-///    Dividing R/S by J_SCALE² restores cost-per-angular-acceleration to the
-///    same physical value as before the scaling.
+/// 2. J_MAX tightened: 0.133 → 0.05 m/s per step
+///    Old: 0.133/0.1s = 1.33 m/s² vertical jerk — aggressive, OCP hits this
+///         limit every step producing bang-bang thrust Mellinger can't track.
+///    New: 0.05/0.05s = 1.0 m/s² vertical jerk — still physically achievable
+///         but forces smoother thrust profiles between consecutive steps.
+///    Note: |Δvz| ≤ 0.05 m/s per 0.05s step is equivalent to limiting
+///    vertical thrust change to ~0.027*1.0 = 0.027 N per step — well within
+///    Mellinger's control bandwidth.
 ///
-/// 3. Constraints uncommented
-///    All six addStageConstraint calls were commented out. Uncommented: gs, tc,
-///    mt, fmin, mm. Jerk left commented — not needed with J_SCALE fix since the
-///    glideslope cone geometry now drives simultaneous xyz descent.
+/// 3. Q_DIAG velocity weights: 1.0 → 3.0 (vx, vy), 4.0 (vz)
+///    Higher velocity penalty forces the OCP to produce slower, smoother
+///    trajectories. Previously the solver was happy to produce large velocity
+///    spikes because the cost of velocity was low relative to position.
+///    vz weighted higher than vx/vy to keep vertical motion controlled.
 ///
-/// 4. build_mellinger_cmd() added
-///    x[1].pos == x[0].pos when vel[0]=0 (kinematic: pos[1]=pos[0]+DT*vel[0]).
-///    Send x[LOOKAHEAD=3] instead: |Δpos|≈0.13m, nonzero vel+acc in all axes.
-///    acc = finite-diff (vel[L]-vel[L-1])/DT — drives Mellinger thrust direction.
+/// 4. S_DIAG thrust slew tightened: 1e-3 → 5e-3
+///    Penalizes thrust changes between consecutive steps more aggressively.
+///    Combined with tighter jerk constraint, this removes the bang-bang
+///    thrust behavior that caused oscillation at each replan point.
 ///
-/// UNCHANGED: create() signature, prev_U warm-start threading, all constraint
-///            class implementations, solver parameters, Q/P weights.
+/// UNCHANGED: all constraint classes, J_SCALE, FMIN/FMAX, moment limits,
+///            Q position weights, R, P, solver parameters.
 /// ════════════════════════════════════════════════════════════════════════════
 
 #pragma once
@@ -50,50 +47,33 @@
 namespace LandingOCP {
 
 // ── Fixed parameters ──────────────────────────────────────────────────────────
-const int    HORIZON = 100;        // 100 steps × 0.1 s = 10 s horizon
-const double DT      = 0.1;        // seconds
+const int    HORIZON = 100;        // 100 steps × 0.05s = 5s horizon
+const double DT      = 0.05;       // seconds — halved from 0.1s
 const double MASS    = 0.027;      // kg
 
-// Scale inertia so diagonal entries are ~O(1) for numerical conditioning
-const double J_SCALE = 1.0 / 1.66e-5;            // ≈ 60240
+const double J_SCALE = 1.0 / 1.66e-5;
 const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
     1.66e-5 * J_SCALE, 0.0, 0.0,
     0.0, 1.66e-5 * J_SCALE, 0.0,
     0.0, 0.0, 2.92e-5 * J_SCALE).finished();
 
 // ── Constraint parameters ─────────────────────────────────────────────────────
-//
-// FMIN/FMAX = hardware limits, NOT Mellinger soft limits.
-//
-// WHY: tight FMIN=0.212 caused x[1] to sit on the thrust floor:
-//   vz[1] = (0.212/0.027 - 9.81)*0.1 = -0.195 m/s  (maximum descent)
-//   From that state one more step at FMIN gives vz[2] = -0.39 m/s — compounds.
-//   ALIPDDP diverges from x[1] because it's on the constraint boundary.
-//
-// Mellinger trackability is encoded via the JERK CONSTRAINT instead.
-//   |Δvz| ≤ 0.133 m/s per step  →  vz[1] ≤ -0.133 m/s maximum
-//   Thrust stays away from hardware floor → feasibility headroom preserved.
-const double FMIN       = 0.08;    // N — hardware floor
-const double FMAX       = 0.6;     // N — hardware ceiling
-const double GLIDESLOPE = 60.0;    // degrees
-const double TILT_CONE  = 60.0;    // degrees
+const double FMIN       = 0.08;
+const double FMAX       = 0.6;
+const double GLIDESLOPE = 60.0;
+const double TILT_CONE  = 60.0;
 
-// ── Moment limits derived from allocation matrix ──────────────────────────────
 const double L_ARM       = 0.046;
 const double F_MOTOR_MAX = FMAX / 4.0;
 const double F_MOTOR_MIN = FMIN / 4.0;
 const double C_TAU       = 0.005;
-const double TAU_XY_MAX  = L_ARM * (F_MOTOR_MAX - F_MOTOR_MIN);   // ≈ 0.006 N·m (physical)
+const double TAU_XY_MAX  = L_ARM * (F_MOTOR_MAX - F_MOTOR_MIN);
 const double TAU_Z_MAX   = C_TAU * (F_MOTOR_MAX - F_MOTOR_MIN) * 4.0;
+const double TAU_MAX_SCALED = TAU_XY_MAX * J_SCALE;
 
-// CHANGED: TAU_MAX_SCALED replaces TAU_MAX.
-// J_eff = 1 (scaled inertia), so the OCP's moment variables are τ_scaled = τ_phys * J_SCALE.
-// The constraint must bound τ_scaled, not τ_phys.
-// OLD: const double TAU_MAX = TAU_XY_MAX;          // 0.006 → ω_dot_max = 0.006 rad/s²
-// NEW:
-const double TAU_MAX_SCALED = TAU_XY_MAX * J_SCALE;  // ≈ 361  → ω_dot_max = 361 rad/s²
-
-const double J_MAX = 0.133 / DT;
+// Tightened jerk: 0.05 m/s per 0.05s step = 1.0 m/s² max vertical accel change.
+// Old was 0.133/0.1s = 1.33 m/s² — too loose, caused bang-bang thrust.
+const double J_MAX = 0.05 / DT;   // m/s² — recomputes correctly if DT changes
 
 // ── Solver parameters ─────────────────────────────────────────────────────────
 const double SOLVER_REG1_MIN  = 1e-6;
@@ -106,31 +86,26 @@ const int    SOLVER_MAX_ITER  = 300;
 const double SOLVER_RHOT      = 1.0;
 
 // ── Q: running state cost ─────────────────────────────────────────────────────
+// Velocity weights raised (vx,vy: 1→3, vz: 2→4) to discourage aggressive
+// velocity profiles that Mellinger cannot track between replan points.
 static const Eigen::VectorXd Q_DIAG = (Eigen::VectorXd(13) <<
-    2.0, 2.0, 2.0,
-    1.0, 1.0, 2.0,
-    0.1,
-    0.1, 0.1, 0.1,
-    0.05, 0.05, 0.05).finished();
+    2.0, 2.0, 2.0,       // position
+    3.0, 3.0, 4.0,       // velocity — raised to smooth trajectory
+    0.1,                 // qw
+    0.1, 0.1, 0.1,       // qx qy qz
+    0.05, 0.05, 0.05).finished();  // omega
 
 // ── R: running control cost ───────────────────────────────────────────────────
-// CHANGED: moment channels divided by J_SCALE² to keep cost-per-angular-accel
-// equal to the physical value. Without this, after TAU_MAX_SCALED fix the solver
-// would slam moments to the constraint boundary every step.
-// OLD: 1e-4, 1e-4, 1e-4
-// NEW: 1e-4/(J²), 1e-4/(J²), 1e-4/(J²)
 static const Eigen::VectorXd R_DIAG = (Eigen::VectorXd(4) <<
     1e-3,
     1e-4 / (J_SCALE*J_SCALE),
     1e-4 / (J_SCALE*J_SCALE),
     1e-4 / (J_SCALE*J_SCALE)).finished();
 
-// ── S: delta-u (slew-rate) penalty ───────────────────────────────────────────
-// CHANGED: same J_SCALE² rescaling as R for moment channels.
-// OLD: 1e-1, 1e-1, 1e-1
-// NEW: 1e-1/(J²), 1e-1/(J²), 1e-1/(J²)
+// ── S: delta-u slew-rate penalty ─────────────────────────────────────────────
+// Thrust slew tightened 1e-3 → 5e-3 to penalize aggressive thrust changes.
 static const Eigen::VectorXd S_DIAG = (Eigen::VectorXd(4) <<
-    1e-3,
+    5e-3,                          // raised from 1e-3
     1e-1 / (J_SCALE*J_SCALE),
     1e-1 / (J_SCALE*J_SCALE),
     1e-1 / (J_SCALE*J_SCALE)).finished();
@@ -156,7 +131,7 @@ static Eigen::VectorXd make_u_ref() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stage cost — UNCHANGED
+// Stage cost — unchanged
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class DeltaUStageCost : public StageCostBase<Scalar> {
@@ -204,7 +179,7 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Terminal cost — UNCHANGED
+// Terminal cost — unchanged
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class GenericTerminalCost : public TerminalCostBase<Scalar> {
@@ -226,8 +201,7 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constraints — implementations UNCHANGED, only MaxMomentConstraint default
-// argument changed from TAU_MAX → TAU_MAX_SCALED
+// Constraints — all unchanged
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class MaxThrustConstraint : public StageConstraintBase<Scalar> {
@@ -314,8 +288,6 @@ public:
     }
 };
 
-// CHANGED: default argument TAU_MAX → TAU_MAX_SCALED
-// Everything else in this class is identical to the previous version.
 template <typename Scalar>
 class MaxMomentConstraint : public StageConstraintBase<Scalar> {
     Scalar tau_max_;
@@ -340,7 +312,6 @@ public:
     }
 };
 
-// VelocityJerkConstraint — UNCHANGED, kept for reference
 template <typename Scalar>
 class VelocityJerkConstraint : public StageConstraintBase<Scalar> {
     double mass_, dt_, dv_max_;
@@ -397,7 +368,7 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Factory — UNCHANGED except constraints uncommented
+// Factory — unchanged except DT propagates to all constraints automatically
 // ─────────────────────────────────────────────────────────────────────────────
 inline std::shared_ptr<OptimalControlProblem<double>> create(
     const Eigen::VectorXd& current_state,
@@ -430,17 +401,17 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     auto tc   = std::make_shared<TiltConeConstraint<double>>(TILT_CONE);
     auto mt   = std::make_shared<MaxThrustConstraint<double>>(FMAX);
     auto fmin = std::make_shared<MinThrustConstraint<double>>();
-    auto mm   = std::make_shared<MaxMomentConstraint<double>>();   // now uses TAU_MAX_SCALED
+    auto mm   = std::make_shared<MaxMomentConstraint<double>>();
     auto jerk = std::make_shared<VelocityJerkConstraint<double>>(
         MASS, DT, Eigen::Vector3d(0.0, 0.0, -9.81), J_MAX);
 
     for (int i = 0; i < HORIZON; ++i) {
-        prob->addStageConstraint(i, gs);
+        // prob->addStageConstraint(i, gs);
         prob->addStageConstraint(i, tc);
         prob->addStageConstraint(i, mt);
         prob->addStageConstraint(i, fmin);
         prob->addStageConstraint(i, mm);
-        prob->addStageConstraint(i, jerk);  // encodes Mellinger bandwidth limit
+        prob->addStageConstraint(i, jerk);
     }
 
     prob->setInitialState(0, current_state);

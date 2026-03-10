@@ -20,21 +20,25 @@
 //
 //   1. solver_timer_ (solver_rate Hz, e.g. 1-2 Hz)
 //      Runs ALIPDDP, on success: locks mpc_traj_mutex_, stores X into
-//      mpc_traj_, resets mpc_replay_idx_ = 1.
+//      mpc_traj_, sets mpc_replay_idx_ = skip (compensating for solve latency).
 //      Does NOT publish directly.
 //
-//   2. mpc_replay_timer_ (ocp_dt Hz, e.g. 10 Hz for ocp_dt=0.1s)
+//   2. mpc_replay_timer_ (ocp_dt Hz, e.g. 20 Hz for ocp_dt=0.05s)
 //      Every ocp_dt seconds: reads mpc_traj_[mpc_replay_idx_] under lock,
 //      publishes it, increments mpc_replay_idx_.
-//      This implements the paper's "û(t) = u°_{i,j} for t in [t_{i,j}, t_{i,j+1})"
-//      — the drone receives the next node on the committed trajectory while
-//      the solver computes the next solution.
 //
-//   Effect on warm-start quality (paper Lemma 1):
-//      Because the drone is actually moving between solves, by the time
-//      solve k+1 runs, actual state ≈ prev_X_[n_shift].  This shrinks
-//      vel_err, which raises γ in the γ-blend (quadrotor_mpc.cpp), which
-//      lets the warm-start carry more information across solves.
+// ── SOLVE LATENCY COMPENSATION ────────────────────────────────────────────────
+//
+//   Problem: solver takes ~65ms. If we always reset mpc_replay_idx_ = 1,
+//   we publish X[1] which was computed for the state at CAPTURE time, not
+//   at PUBLISH time (65ms later). This produces a backward position jump.
+//
+//   Fix: measure actual solve duration, compute
+//     skip = round(solve_sec / ocp_dt_)
+//   and set mpc_replay_idx_ = skip instead of 1.
+//   This means the first setpoint published after a solve is the node that
+//   corresponds to "now" rather than "when we started solving".
+//
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <rclcpp/rclcpp.hpp>
@@ -169,10 +173,6 @@ public:
         // ── OCP DT and solver rate ─────────────────────────────────────────────
         ocp_dt_ = OCPRegistry::getDT(ocp_type_);
 
-        // solver_rate defaults to 1/ocp_dt (1 shift per solve).
-        // Set lower (e.g. 2 Hz) to let the solver take more time per step.
-        // n_shift = round(solver_period / ocp_dt) — how many OCP nodes
-        // are consumed between solves, determines warm-start shift amount.
         const int default_solver_rate = static_cast<int>(std::round(1.0 / ocp_dt_));
         this->declare_parameter("solver_rate", default_solver_rate);
         solver_rate_ = this->get_parameter("solver_rate").as_int();
@@ -204,11 +204,6 @@ public:
         current_state_(6) = 1.0;
 
         // ── Callback groups ───────────────────────────────────────────────────
-        // sensor_cb_group_: pose/odom callbacks (fast, non-blocking)
-        // solver_cb_group_: MPC solve timer (slow, blocking)
-        // replay_cb_group_: MPC replay timer (fast, non-blocking) — SEPARATE
-        //   from solver so replay continues while solver is running on another
-        //   thread. MutuallyExclusive so only one replay fires at a time.
         sensor_cb_group_ = this->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
         solver_cb_group_ = this->create_callback_group(
@@ -229,17 +224,11 @@ public:
 
         // ── Timer setup ───────────────────────────────────────────────────────
         if (mode_ == "mpc") {
-            // Solver timer: runs at solver_rate Hz (slow — blocks during solve)
             solver_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(1000 / solver_rate_),
                 std::bind(&PlannerNode::solverLoop, this),
                 solver_cb_group_);
 
-            // Replay timer: runs at 1/ocp_dt Hz (fast — just reads and publishes)
-            // This decouples the publish rate from the solve rate.
-            // While the solver is blocked computing the next trajectory,
-            // the replay timer continues advancing through the committed trajectory
-            // so the drone receives a new setpoint every ocp_dt seconds.
             const int replay_period_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
             mpc_replay_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(replay_period_ms),
@@ -399,13 +388,6 @@ private:
 
     // ─────────────────────────────────────────────────────────────────────────
     //  MPC replay tick (runs at ocp_dt rate, separate from solver)
-    //
-    //  Implements Algorithm 1 line 9 from Zhang et al.:
-    //    "output û(t) = u°_{i,j} for t_{i,j} ≤ t < min(t_{i,j+1}, t_{i+1,0})"
-    //
-    //  Between solver re-runs, the drone steps sequentially through the last
-    //  committed trajectory.  When a new trajectory arrives (solver succeeded),
-    //  mpc_replay_idx_ resets to 1 and we start replaying the fresh solution.
     // ─────────────────────────────────────────────────────────────────────────
     void mpcReplayTick()
     {
@@ -417,7 +399,6 @@ private:
             std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
             if (!mpc_traj_.empty()) {
                 const int N = static_cast<int>(mpc_traj_.size()) - 1;
-                // Clamp at last node — hold terminal position if replay runs out
                 const int idx = std::min(mpc_replay_idx_, N);
                 x_cmd      = mpc_traj_[idx];
                 u_cmd      = (idx < (int)mpc_ctrl_.size()) ? mpc_ctrl_[idx]
@@ -430,7 +411,6 @@ private:
         }
 
         if (!have_traj) {
-            // No trajectory yet — hold hover at current measured position
             Eigen::VectorXd x_hover;
             {
                 std::lock_guard<std::mutex> lk(state_mutex_);
@@ -443,10 +423,30 @@ private:
             return;
         }
 
+        // ── Transition blend ──────────────────────────────────────────────
+        // Linearly interpolate from blend_from_ (last point of old trajectory)
+        // to x_cmd (new trajectory) over BLEND_STEPS ticks.
+        // This hides the discontinuity when consecutive solves find different
+        // local optima or when latency compensation leaves a residual gap.
+        {
+            std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
+            if (blend_steps_remaining_ > 0 && blend_from_.size() == x_cmd.size()) {
+                const double alpha = 1.0 -
+                    static_cast<double>(blend_steps_remaining_) / BLEND_STEPS;
+                // Blend position and velocity; leave attitude/omega as-is
+                // (attitude changes are small and blending quaternions needs slerp)
+                Eigen::VectorXd blended = x_cmd;
+                // pos (0-2) and vel (3-5)
+                blended.head(6) = (1.0 - alpha) * blend_from_.head(6)
+                                +        alpha  * x_cmd.head(6);
+                x_cmd = blended;
+                --blend_steps_remaining_;
+            }
+        }
+
         if (platform_ == "crazyflie") publishCrazyflieCommand(x_cmd, Eigen::Vector3d::Zero());
         else                          publishPX4Command(x_cmd, Eigen::Vector3d::Zero());
 
-        // Logging: actual state vs commanded
         if (logging_enabled_ && logging_initialized_) {
             Eigen::VectorXd act;
             { std::lock_guard<std::mutex> lk(state_mutex_); act = current_state_; }
@@ -496,27 +496,54 @@ private:
                 x0(6),x0(7),x0(8),x0(9), x0(10),x0(11),x0(12));
         }
 
-        // ── Solve ─────────────────────────────────────────────────────────────
+        // ── Solve — measure wall time for latency compensation ─────────────────
+        // We time the solve so we can advance mpc_replay_idx_ past the nodes
+        // that elapsed while ALIPDDP was running.  Without this, the first
+        // setpoint after a new solve is X[1] — computed for where the drone
+        // was at capture time, not at publish time — causing a backward jump.
+        const auto t_solve_start = this->now();
         SolverResult result = callSolver(x0);
+        const double solve_sec = (this->now() - t_solve_start).seconds();
 
         if (result.success) {
             const auto& X = result.state_trajectory;
             const auto& U = result.control_trajectory;
 
-            // ── Update committed trajectory for replay timer ───────────────────
-            // Reset replay index to 1 so the replay timer starts at the freshly
-            // computed X[1] on its next tick.
+            // ── Compute latency-compensated start index ────────────────────────
+            // skip = number of OCP steps that elapsed while the solver ran.
+            // Clamped to [1, n_shift-1]: at least 1 (never re-publish X[0]=x0),
+            // at most n_shift-1 (don't consume the entire new horizon).
+            const int N = static_cast<int>(X.size()) - 1;
+            const int skip = std::max(1,
+                std::min(static_cast<int>(std::round(solve_sec / ocp_dt_)),
+                         std::max(1, n_shift_ - 1)));
+
+            RCLCPP_INFO(this->get_logger(),
+                "[solver] solve=%.1fms  latency_skip=%d  replay starts at X[%d]",
+                solve_sec * 1000.0, skip, skip);
+
             {
                 std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
+                // Save the last commanded state before we switch trajectories.
+                // mpcReplayTick will blend from this point to the new traj's
+                // start over BLEND_STEPS ticks, hiding the discontinuity.
+                if (!mpc_traj_.empty()) {
+                    const int cur = std::min(mpc_replay_idx_,
+                                            (int)mpc_traj_.size() - 1);
+                    blend_from_ = mpc_traj_[cur];
+                } else if (X.size() > (size_t)skip) {
+                    blend_from_ = X[skip];   // no previous traj — blend from target itself (no-op)
+                }
+                blend_steps_remaining_ = BLEND_STEPS;
+
                 mpc_traj_ = X;
                 mpc_ctrl_ = U;
-                mpc_replay_idx_ = 1;   // start at X[1]; X[0] = x0_ocp (already passed)
+                mpc_replay_idx_ = skip;
             }
 
             publishTrajectory(X);
 
             if (logging_enabled_ && logging_initialized_) {
-                const Eigen::VectorXd& u0 = U.empty() ? Eigen::VectorXd::Zero(4) : U[0];
                 logSolveTrajectory(X, U, result.solve_time_ms);
             }
 
@@ -525,9 +552,6 @@ private:
         } else {
             RCLCPP_WARN(this->get_logger(), "MPC solve FAILED (%s) — replay continues on stale traj",
                 solver_type_.c_str());
-            // mpc_traj_ is NOT updated — replay timer continues on last good trajectory.
-            // This gives graceful degradation: the drone keeps moving on the previous
-            // plan rather than freezing.
         }
     }
 
@@ -849,29 +873,34 @@ private:
     // Shared publishers/timers
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
     rclcpp::TimerBase::SharedPtr solver_timer_;
-    rclcpp::TimerBase::SharedPtr mpc_replay_timer_;   // NEW — replay at ocp_dt rate
+    rclcpp::TimerBase::SharedPtr mpc_replay_timer_;
     rclcpp::TimerBase::SharedPtr startup_timer_;
-    rclcpp::TimerBase::SharedPtr replay_timer_;       // open_loop mode only
+    rclcpp::TimerBase::SharedPtr replay_timer_;
 
-    // State (sensor callbacks write, solver reads)
+    // State
     Eigen::VectorXd current_state_;
     bool pose_received_ = false;
     bool odom_received_ = false;
     bool is_flying_     = false;
 
-    // MPC committed trajectory — written by solverLoop, read by mpcReplayTick
-    // Protected by mpc_traj_mutex_ (separate from state_mutex_ to avoid
-    // blocking sensor callbacks during replay reads).
+    // MPC committed trajectory
     std::mutex                   mpc_traj_mutex_;
-    std::vector<Eigen::VectorXd> mpc_traj_;   // X[0..N]
-    std::vector<Eigen::VectorXd> mpc_ctrl_;   // U[0..N-1]
-    int                          mpc_replay_idx_ = 0;  // next node to publish
+    std::vector<Eigen::VectorXd> mpc_traj_;
+    std::vector<Eigen::VectorXd> mpc_ctrl_;
+    int                          mpc_replay_idx_ = 0;
+
+    // Transition blend: smooths jumps when consecutive solves find different
+    // local optima.  When a new trajectory arrives we record the last commanded
+    // state and linearly interpolate over BLEND_STEPS replay ticks.
+    static constexpr int         BLEND_STEPS = 6;   // ~300ms at 20 Hz
+    Eigen::VectorXd              blend_from_;
+    int                          blend_steps_remaining_ = 0;
 
     // Threading
     mutable std::mutex               state_mutex_;
     rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
     rclcpp::CallbackGroup::SharedPtr solver_cb_group_;
-    rclcpp::CallbackGroup::SharedPtr replay_cb_group_;   // NEW — replay group
+    rclcpp::CallbackGroup::SharedPtr replay_cb_group_;
 
     // MPC diagnostics
     int diag_count_ = 0;
