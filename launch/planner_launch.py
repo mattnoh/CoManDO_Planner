@@ -71,7 +71,7 @@ def generate_launch_description():
     )
     hover_target_z_arg = DeclareLaunchArgument(
         'hover_target_z',
-        default_value='1.0',
+        default_value='0.1',
         description='Target z position (m) — 0.0 for landing, 1.0 for hover'
     )
 

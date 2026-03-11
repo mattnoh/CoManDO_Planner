@@ -423,22 +423,42 @@ private:
             return;
         }
 
-        // ── Transition blend ──────────────────────────────────────────────
-        // Linearly interpolate from blend_from_ (last point of old trajectory)
-        // to x_cmd (new trajectory) over BLEND_STEPS ticks.
-        // This hides the discontinuity when consecutive solves find different
-        // local optima or when latency compensation leaves a residual gap.
+        // ── Transition blend (full 13D) ───────────────────────────────────
+        // When a new solve arrives, snap-switching to the new trajectory
+        // causes Mellinger to receive a discontinuous command — it then
+        // overshoots trying to track the jump, landing at the wrong position.
+        //
+        // Fix: linearly interpolate the FULL state (pos, vel, attitude, omega)
+        // from the last commanded point to the new trajectory over BLEND_STEPS
+        // ticks. Quaternion is lerp'd then renormalised (valid for small Δq).
+        //
+        // BLEND_STEPS = 12 at 20Hz = 600ms. Long enough to absorb the solve
+        // latency jump and typical inter-solve attitude divergence.
         {
             std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
             if (blend_steps_remaining_ > 0 && blend_from_.size() == x_cmd.size()) {
                 const double alpha = 1.0 -
                     static_cast<double>(blend_steps_remaining_) / BLEND_STEPS;
-                // Blend position and velocity; leave attitude/omega as-is
-                // (attitude changes are small and blending quaternions needs slerp)
+                const double beta = 1.0 - alpha;
+
                 Eigen::VectorXd blended = x_cmd;
-                // pos (0-2) and vel (3-5)
-                blended.head(6) = (1.0 - alpha) * blend_from_.head(6)
-                                +        alpha  * x_cmd.head(6);
+
+                // pos [0:3] and vel [3:6]
+                blended.head(6) = beta * blend_from_.head(6)
+                                + alpha * x_cmd.head(6);
+
+                // quaternion [6:10]: lerp + renormalise
+                Eigen::Vector4d q0 = blend_from_.segment(6, 4);
+                Eigen::Vector4d q1 = x_cmd.segment(6, 4);
+                // Ensure shortest path
+                if (q0.dot(q1) < 0.0) q1 = -q1;
+                Eigen::Vector4d qblend = (beta * q0 + alpha * q1).normalized();
+                blended.segment(6, 4) = qblend;
+
+                // angular rate [10:13]
+                blended.segment(10, 3) = beta * blend_from_.segment(10, 3)
+                                       + alpha * x_cmd.segment(10, 3);
+
                 x_cmd = blended;
                 --blend_steps_remaining_;
             }
@@ -892,7 +912,7 @@ private:
     // Transition blend: smooths jumps when consecutive solves find different
     // local optima.  When a new trajectory arrives we record the last commanded
     // state and linearly interpolate over BLEND_STEPS replay ticks.
-    static constexpr int         BLEND_STEPS = 6;   // ~300ms at 20 Hz
+    static constexpr int         BLEND_STEPS = 12;  // ~600ms at 20Hz
     Eigen::VectorXd              blend_from_;
     int                          blend_steps_remaining_ = 0;
 

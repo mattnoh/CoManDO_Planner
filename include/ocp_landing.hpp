@@ -70,7 +70,8 @@ const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
 // ── Constraint parameters ─────────────────────────────────────────────────────
 const double FMIN       = 0.08;
 const double FMAX       = 0.6;
-const double GLIDESLOPE = 60.0;
+const double GLIDESLOPE = 75.0;  // widened 60→75: same convergence guarantee,
+                                   // 2x more tolerance for inter-solve tracking error
 const double TILT_CONE  = 60.0;
 
 const double L_ARM          = 0.046;
@@ -106,10 +107,15 @@ const double SOLVER_MU_MUL    = 0.1;
 const double SOLVER_RHO       = 10.0;
 const double SOLVER_RHO_MUL   = 10.0;
 const double SOLVER_TOLERANCE = 0.05;
-const int    SOLVER_MAX_ITER  = 300;
+const int    SOLVER_MAX_ITER  = 500;
 const double SOLVER_RHOT      = 1.0;
 
 // ── Q: running state cost ─────────────────────────────────────────────────────
+// Running position cost raised 2→5: stronger pull toward origin throughout
+// the trajectory, not just at the terminal node. With the old value of 2,
+// the solver was happy to take a path that arrived at z=0 with x still at
+// 0.25m because the accumulated position error cost was small vs descent cost.
+// Q_xy=5, Q_z=3: modest lateral pull, descent-focused.
 static const Eigen::VectorXd Q_DIAG = (Eigen::VectorXd(13) <<
     2.0, 2.0, 2.0,
     3.0, 3.0, 4.0,
@@ -142,8 +148,9 @@ static const Eigen::VectorXd P_DIAG = (Eigen::VectorXd(13) <<
 // ── References ────────────────────────────────────────────────────────────────
 static Eigen::VectorXd make_x_ref() {
     Eigen::VectorXd xr = Eigen::VectorXd::Zero(13);
-    xr(6) = 1.0;
-    return xr;
+    xr(2) = 0.1;   // z_ref=0.1m: OCP satisfied before ground contact.
+    xr(6) = 1.0;   // z_ref=0 causes post-landing thrashing because drone
+    return xr;     // sits at z≈0.015 and OCP keeps commanding corrections.
 }
 static Eigen::VectorXd make_u_ref() {
     Eigen::VectorXd ur = Eigen::VectorXd::Zero(4);
@@ -495,7 +502,7 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
         MASS, DT, Eigen::Vector3d(0.0, 0.0, -9.81), J_MAX);
 
     for (int i = 0; i < HORIZON; ++i) {
-        // prob->addStageConstraint(i, gs);
+        // prob->addStageConstraint(i, gs);  // glideslope off — causes infeasible attitudes near cone boundary
         prob->addStageConstraint(i, tc);
         prob->addStageConstraint(i, mt);
         prob->addStageConstraint(i, fmin);

@@ -43,25 +43,12 @@ void QuadrotorMPC::shiftWarmStart() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// setupProblem now receives the shifted prev_X_ so the OCP factory can use
-// it as the trajectory-consistency reference.
-//
-// On the first solve prev_X_ is empty — the factory detects this and disables
-// the consistency penalty automatically (no-op, pure cold start).
-//
-// On subsequent solves prev_X_ has already been shifted by n_shift in
-// shiftWarmStart(), so prev_X_[k] aligns temporally with node k of the
-// new solve.
-// ─────────────────────────────────────────────────────────────────────────────
 void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
 {
     if (!problem_ || need_problem_rebuild_) {
         try {
-            // Pass prev_X_ as the trajectory reference.
-            // Empty on first solve → no consistency penalty.
             problem_ = OCPRegistry::create(
-                config_.ocp_type, current_state, config_.terminal_state,
-                prev_U_, prev_X_);
+                config_.ocp_type, current_state, config_.terminal_state, prev_U_);
         } catch (const std::runtime_error& e) {
             std::cerr << "ERROR: " << e.what() << "\n";
             throw;
@@ -70,42 +57,38 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state)
         solver_.reset();
         return;
     }
-
-    // Rebuild the problem every solve so that stage costs get the fresh
-    // prev_X_ trajectory reference.  We keep the solver object alive for
-    // warm-starting but reconstruct the problem (cost functions only).
-    //
-    // Alternative: expose a setCosts() method on the problem.  For now,
-    // full rebuild is simpler and takes <1ms on a 100-node horizon.
-    try {
-        problem_ = OCPRegistry::create(
-            config_.ocp_type, current_state, config_.terminal_state,
-            prev_U_, prev_X_);
-    } catch (const std::runtime_error& e) {
-        std::cerr << "ERROR: " << e.what() << "\n";
-        throw;
-    }
+    problem_->setInitialState(0, current_state);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// γ-blend warm-start (Zhang et al. 2023, §III-B)
+// γ-blend: pulls warm-start away from constraint boundary toward hover.
+//
+// Motivation (Zhang et al. 2023, §III-B + Theorem 1):
+//   The previous optimal solution sits ON the constraint boundary. After
+//   shifting, prev_U_[0] was designed for a state at vz = -0.13 m/s.
+//   Injecting it when actual vz ≈ 0 puts ALIPDDP near the boundary of the
+//   new feasible region, causing search-direction blocking and divergence.
+//
+//   The paper's fix: blend the warm-start toward a well-centered cold-start
+//   point:  u_warm = γ * u_shifted + (1-γ) * u_cold
+//   where γ → 0 when state mismatch is large (vel_err large) and γ → 1 when
+//   the drone is on-trajectory (vel_err small).
+//
+//   The γ formula below is heuristic but consistent with the paper's intent:
+//   "selected γ should let the WSP have relatively small residuals and let
+//   the point not be close to the boundary."
+//
+//   γ = max(0, 1 - vel_err / VEL_ERR_SCALE)
+//     = 1.0  when vel_err = 0   → pure warm-start (no blend needed)
+//     = 0.5  when vel_err = 0.15 m/s  → 50/50 mix
+//     = 0.0  when vel_err ≥ 0.3 m/s  → pure hover cold-start
+//
+// VEL_ERR_SCALE = 0.3 m/s chosen from the jerk constraint:
+//   jerk limit is |Δvz| ≤ 0.133 m/s per step. Two steps of Mellinger
+//   lag gives ~0.26 m/s max expected vel_err during spin-up → scale at 0.3.
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr double VEL_ERR_SCALE = 0.3;
-static constexpr double CRAZYFLIE_MASS = 0.027;
-
-static void gammaBlend(std::vector<Eigen::VectorXd>& U_warm,
-                       double vel_err,
-                       double gamma)
-{
-    Eigen::VectorXd u_cold(4);
-    u_cold << CRAZYFLIE_MASS * 9.81, 0.0, 0.0, 0.0;
-
-    std::cout << "[gamma_blend] vel_err=" << vel_err
-              << " gamma=" << gamma << "\n";
-
-    for (auto& u : U_warm)
-        u = gamma * u + (1.0 - gamma) * u_cold;
-}
+static constexpr double VEL_ERR_SCALE = 0.3;   // m/s — vel_err at which γ → 0
+static constexpr double CRAZYFLIE_MASS = 0.027; // kg
 
 // ─────────────────────────────────────────────────────────────────────────────
 QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
@@ -115,50 +98,47 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
     auto t0 = chrono::high_resolution_clock::now();
 
     try {
+        // Zero angular velocity before passing to OCP.
+        // Mellinger recomputes ω internally from attitude PD — its reactive
+        // corrections are not predicted by the OCP dynamics and feeding them
+        // back causes a state mismatch between x0_ocp and prev_X_[1].
         Eigen::VectorXd x0_ocp = current_state;
         x0_ocp.segment(10, 3).setZero();
 
+        setupProblem(x0_ocp);
+
         if (!solver_) {
             // ── First solve: cold start ───────────────────────────────────────
-            // prev_X_ is empty → consistency penalty disabled in factory.
-            setupProblem(x0_ocp);
             solver_ = make_shared<ALIPDDP<double>>(*problem_);
             solver_->init(solver_params_);
+            
 
         } else {
             // ── Subsequent solves ─────────────────────────────────────────────
-
             std::cout << "x0_actual:  " << current_state.transpose() << "\n";
             std::cout << "prev_X_[1]: " << prev_X_[1].transpose() << "\n";
-            const double pos_err  = (current_state.head(3)     - prev_X_[1].head(3)).norm();
-            const double vel_err  = (current_state.segment(3,3) - prev_X_[1].segment(3,3)).norm();
+            const double pos_err  = (current_state.head(3)      - prev_X_[1].head(3)).norm();
+            const double vel_err  = (current_state.segment(3,3)  - prev_X_[1].segment(3,3)).norm();
             const double quat_dot = std::abs(current_state.segment(6,4).dot(prev_X_[1].segment(6,4)));
             const double att_err  = 2.0 * std::acos(std::min(1.0, quat_dot)) * 180.0/M_PI;
             std::cout << "pos_err=" << pos_err
-                      << " vel_err=" << vel_err
-                      << " att_err_deg=" << att_err << "\n";
+                    << " vel_err=" << vel_err
+                    << " att_err_deg=" << att_err << "\n";
 
-            // ── Step 1: shift warm-start forward by n_shift steps ─────────────
-            // After this, prev_X_[k] aligns with node k of the new solve.
-            // The OCP factory (called in setupProblem below) uses this shifted
-            // prev_X_ as the trajectory-consistency reference.
             shiftWarmStart();
-
-            // ── Step 2: rebuild problem with fresh trajectory reference ────────
-            // The stage costs now include ||x_k - prev_X_[k+1]||_W² terms.
             setupProblem(x0_ocp);
 
-            // ── Step 3: γ-blend toward hover cold-start ───────────────────────
-            {
-                const double gamma = std::max(0.0, 1.0 - vel_err / VEL_ERR_SCALE);
-                if (gamma < 0.999) {
-                    gammaBlend(prev_U_, vel_err, gamma);
-                }
-            }
-
-            // ── Step 4: warm-start the solver ─────────────────────────────────
+            // Recreate solver with the new problem — the old solver holds a copy
+            // of the previous problem's initial state and won't see the new x0.
+            solver_ = make_shared<ALIPDDP<double>>(*problem_);
             solver_->init(solver_params_);
-            solver_->warmStart(x0_ocp, prev_U_);
+            std::vector<Eigen::VectorXd> u_hover(prev_U_.size());
+            for (auto& u : u_hover) {
+                u = Eigen::VectorXd::Zero(4);
+                u(0) = CRAZYFLIE_MASS * 9.81;
+            }
+            solver_->init(solver_params_);
+            solver_->warmStart(x0_ocp, u_hover);
         }
 
         solver_->solve();
