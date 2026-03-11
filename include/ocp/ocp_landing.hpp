@@ -1,58 +1,35 @@
 /// @file ocp_landing.hpp
-/// @brief OCP formulation for landing problem (for online replanning).
+/// @brief OCP formulation for landing (online replanning).
+///
+/// State  x ∈ ℝ¹³: [pos(3), vel(3), quat(4) qw-first, omega(3)]
+/// Control u ∈ ℝ⁴:  [fz_B (N), Mx (Nm·scaled), My (Nm·scaled), Mz (Nm·scaled)]
 ///
 /// ════════════════════════════════════════════════════════════════════════════
-/// CHANGES — trajectory-consistency penalty
+/// Trajectory-consistency penalty
 /// ════════════════════════════════════════════════════════════════════════════
 ///
 /// ROOT CAUSE OF VELOCITY JUMPS
 /// ─────────────────────────────
-/// Each solve independently minimizes cost to the landing target, so two
-/// consecutive solves from slightly-different x0 (due to tracking error) can
-/// converge to completely different local optima.  The position blend in
-/// planner_node hides the jump visually, but the commanded velocities still
-/// diverge because the underlying trajectories are inconsistent.
+/// Each solve independently minimises cost to the landing target, so two
+/// consecutive solves from slightly-different x0 can converge to completely
+/// different local optima.  The position blend in the bridge hides the jump
+/// visually, but the commanded velocities still diverge.
 ///
-/// FIX: trajectory-consistency penalty
-/// ─────────────────────────────────────
-/// Added a third state-error term to the stage cost:
+/// FIX
+/// ────
+///   q(x,u) = ||x − x_land_ref||_Q²   (landing-target cost)
+///           + ||u − u_hover||_R²      (control cost)
+///           + ||Δu||_S²               (slew-rate cost)
+///           + taper_w * (W_pos * ||pos−pos_prev||² + W_vel * ||vel−vel_prev||²)
 ///
-///   q(x, u) = ||x - x_land_ref||_Q²          (landing-target cost, unchanged)
-///           + ||u - u_hover||_R²              (control cost, unchanged)
-///           + ||Δu||_S²                        (slew-rate cost, unchanged)
-///           + ||x[0:6] - x_prev[0:6]||_W²     (NEW: trajectory-consistency)
-///
-/// W_TRAJ_POS = 0 (position consistency DISABLED).
-///   A nonzero position weight anchors the solver to the first solve's
-///   lateral path, preventing correction to the landing target.
-///
-/// W_TRAJ_VEL = 15.0 — velocity consistency only.
-///   Removes inter-solve velocity jumps without locking the trajectory.
-///
-/// The penalty uses x_prev[k] = the k-th node of the previous solve's
-/// trajectory, shifted by n_shift (so node k of the new solve aligns
-/// temporally with the same physical time as x_prev[k]).
-///
-/// When x_prev is empty (first solve) the penalty is zero — cold start
-/// is unaffected.
-///
-/// W_TRAJ is intentionally tapered near the end of the horizon (last 20
-/// nodes): reduced to 0.1× so the terminal landing constraint is not
-/// compromised by an outdated reference from a different approach path.
-///
-/// OTHER CHANGES
-/// ─────────────
-///  - DT 0.1s → 0.05s (halved)
-///  - J_MAX tightened: 0.05/DT
-///  - Q velocity weights raised
-///  - S thrust slew tightened
+/// W_TRAJ_POS = 0  (position consistency disabled — would lock lateral path).
+/// W_TRAJ_VEL = 0  (also disabled in current tuning — pure QR cost).
+/// Tapering near horizon end prevents stale reference from blocking landing.
 /// ════════════════════════════════════════════════════════════════════════════
 
 #pragma once
 
-#include <Eigen/Dense>
-#include <memory>
-#include "optimal_control_problem.h"
+#include "ocp/ocp_base.hpp"
 
 namespace LandingOCP {
 
@@ -63,15 +40,14 @@ const double MASS    = 0.027;
 
 const double J_SCALE = 1.0 / 1.66e-5;
 const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
-    1.66e-5 * J_SCALE, 0.0, 0.0,
-    0.0, 1.66e-5 * J_SCALE, 0.0,
-    0.0, 0.0, 2.92e-5 * J_SCALE).finished();
+    1.66e-5 * J_SCALE, 0.0,             0.0,
+    0.0,             1.66e-5 * J_SCALE, 0.0,
+    0.0,             0.0,             2.92e-5 * J_SCALE).finished();
 
 // ── Constraint parameters ─────────────────────────────────────────────────────
 const double FMIN       = 0.08;
 const double FMAX       = 0.6;
-const double GLIDESLOPE = 75.0;  // widened 60→75: same convergence guarantee,
-                                   // 2x more tolerance for inter-solve tracking error
+const double GLIDESLOPE = 75.0;
 const double TILT_CONE  = 60.0;
 
 const double L_ARM          = 0.046;
@@ -85,20 +61,10 @@ const double TAU_MAX_SCALED = TAU_XY_MAX * J_SCALE;
 const double J_MAX = 0.05 / DT;
 
 // ── Trajectory-consistency penalty weights ────────────────────────────────────
-// Applied to ||x[0:3] - x_prev[0:3]||² and ||x[3:6] - x_prev[3:6]||².
-// Set to 0 on nodes where no previous trajectory is available (first solve).
-// Tapered to W_TRAJ_TAPER_FACTOR for the last TAPER_NODES nodes so the
-// terminal landing cost is not compromised by a stale reference.
-// W_TRAJ_POS = 0: do NOT penalise position consistency.
-// A nonzero position weight locks the solver onto the first solve's lateral
-// path and prevents correction toward the landing target — the drone lands
-// at the first-solve position, not at origin.
-// Only velocity consistency is penalised: this removes inter-solve velocity
-// jumps (the jaggedness symptom) while letting position converge freely.
-const double W_TRAJ_POS          = 0.0;    // disabled
+const double W_TRAJ_POS          = 0.0;    // disabled — would lock lateral path
 const double W_TRAJ_VEL          = 0.0;    // disabled — pure QR cost
-const double W_TRAJ_TAPER_FACTOR = 0.1;    // multiplier for last TAPER_NODES
-const int    TAPER_NODES         = 40;     // last 40 nodes (2s) get tapered vel weight
+const double W_TRAJ_TAPER_FACTOR = 0.1;
+const int    TAPER_NODES         = 40;
 
 // ── Solver parameters ─────────────────────────────────────────────────────────
 const double SOLVER_REG1_MIN  = 1e-6;
@@ -110,12 +76,7 @@ const double SOLVER_TOLERANCE = 0.05;
 const int    SOLVER_MAX_ITER  = 500;
 const double SOLVER_RHOT      = 1.0;
 
-// ── Q: running state cost ─────────────────────────────────────────────────────
-// Running position cost raised 2→5: stronger pull toward origin throughout
-// the trajectory, not just at the terminal node. With the old value of 2,
-// the solver was happy to take a path that arrived at z=0 with x still at
-// 0.25m because the accumulated position error cost was small vs descent cost.
-// Q_xy=5, Q_z=3: modest lateral pull, descent-focused.
+// ── Cost matrices ─────────────────────────────────────────────────────────────
 static const Eigen::VectorXd Q_DIAG = (Eigen::VectorXd(13) <<
     2.0, 2.0, 2.0,
     3.0, 3.0, 4.0,
@@ -123,21 +84,18 @@ static const Eigen::VectorXd Q_DIAG = (Eigen::VectorXd(13) <<
     0.1, 0.1, 0.1,
     0.05, 0.05, 0.05).finished();
 
-// ── R: running control cost ───────────────────────────────────────────────────
 static const Eigen::VectorXd R_DIAG = (Eigen::VectorXd(4) <<
     1e-3,
     1e-4 / (J_SCALE*J_SCALE),
     1e-4 / (J_SCALE*J_SCALE),
     1e-4 / (J_SCALE*J_SCALE)).finished();
 
-// ── S: delta-u slew-rate penalty ─────────────────────────────────────────────
 static const Eigen::VectorXd S_DIAG = (Eigen::VectorXd(4) <<
     5e-3,
     1e-1 / (J_SCALE*J_SCALE),
     1e-1 / (J_SCALE*J_SCALE),
     1e-1 / (J_SCALE*J_SCALE)).finished();
 
-// ── P: terminal state cost ────────────────────────────────────────────────────
 static const Eigen::VectorXd P_DIAG = (Eigen::VectorXd(13) <<
     1000.0, 1000.0, 1000.0,
      500.0,  500.0,  500.0,
@@ -148,9 +106,9 @@ static const Eigen::VectorXd P_DIAG = (Eigen::VectorXd(13) <<
 // ── References ────────────────────────────────────────────────────────────────
 static Eigen::VectorXd make_x_ref() {
     Eigen::VectorXd xr = Eigen::VectorXd::Zero(13);
-    xr(2) = 0.1;   // z_ref=0.1m: OCP satisfied before ground contact.
-    xr(6) = 1.0;   // z_ref=0 causes post-landing thrashing because drone
-    return xr;     // sits at z≈0.015 and OCP keeps commanding corrections.
+    xr(2) = 0.1;   // z=0.1m: OCP satisfied before ground contact
+    xr(6) = 1.0;
+    return xr;
 }
 static Eigen::VectorXd make_u_ref() {
     Eigen::VectorXd ur = Eigen::VectorXd::Zero(4);
@@ -160,24 +118,15 @@ static Eigen::VectorXd make_u_ref() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage cost with trajectory-consistency penalty
-//
-// cost = ||x - x_land_ref||_Q²
-//      + ||u - u_hover||_R²
-//      + ||Δu||_S²
-//      + taper_w * (W_pos * ||pos - pos_prev||² + W_vel * ||vel - vel_prev||²)
-//
-// x_traj_ref: node k from the PREVIOUS solve's trajectory (shifted by n_shift).
-//             Empty (size 0) on the first solve — penalty is zero.
-// taper_w:    1.0 for early nodes, W_TRAJ_TAPER_FACTOR for last TAPER_NODES.
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class TrajectoryAwareStageCost : public StageCostBase<Scalar> {
     Eigen::VectorXd x_land_ref_, u_ref_;
     Eigen::VectorXd Q_diag_, R_diag_, S_diag_, u_prev_;
-    Eigen::VectorXd x_traj_ref_;   // previous solve's node at this time step
-    double          w_pos_;        // effective W_TRAJ_POS after tapering
-    double          w_vel_;        // effective W_TRAJ_VEL after tapering
-    bool            has_traj_ref_; // false on first solve
+    Eigen::VectorXd x_traj_ref_;
+    double          w_pos_;
+    double          w_vel_;
+    bool            has_traj_ref_;
 
 public:
     TrajectoryAwareStageCost(const Eigen::VectorXd& x_land_ref,
@@ -251,7 +200,7 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Terminal cost — unchanged
+// Terminal cost
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class GenericTerminalCost : public TerminalCostBase<Scalar> {
@@ -259,6 +208,7 @@ class GenericTerminalCost : public TerminalCostBase<Scalar> {
 public:
     GenericTerminalCost(const Eigen::VectorXd& x_ref, const Eigen::VectorXd& P_diag)
         : x_ref_(x_ref), P_diag_(P_diag) {}
+
     Scalar p(const Vector<Scalar>& x) const override {
         Vector<Scalar> e = x - x_ref_;
         return e.dot(P_diag_.asDiagonal() * e);
@@ -267,21 +217,19 @@ public:
         return 2.0 * (P_diag_.asDiagonal() * (x - x_ref_));
     }
     Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
-        (void)x;
-        return (2.0 * P_diag_).asDiagonal();
+        (void)x; return (2.0 * P_diag_).asDiagonal();
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constraints — unchanged
+// Constraints
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Scalar>
 class MaxThrustConstraint : public StageConstraintBase<Scalar> {
     Scalar fmax_;
 public:
     explicit MaxThrustConstraint(Scalar fmax = static_cast<Scalar>(FMAX)) : fmax_(fmax) {
-        this->constraint_type = ConstraintType::NO;
-        this->dim_c = 1;
+        this->constraint_type = ConstraintType::NO; this->dim_c = 1;
     }
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; Vector<Scalar> c_n(1); c_n(0) = u(0) - fmax_; return c_n;
@@ -298,10 +246,7 @@ public:
 template <typename Scalar>
 class MinThrustConstraint : public StageConstraintBase<Scalar> {
 public:
-    MinThrustConstraint() {
-        this->constraint_type = ConstraintType::NO;
-        this->dim_c = 1;
-    }
+    MinThrustConstraint() { this->constraint_type = ConstraintType::NO; this->dim_c = 1; }
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; Vector<Scalar> c_n(1); c_n(0) = FMIN - u(0); return c_n;
     }
@@ -318,10 +263,9 @@ template <typename Scalar>
 class GlideslopeConstraint : public StageConstraintBase<Scalar> {
     Scalar tan_gs_;
 public:
-    explicit GlideslopeConstraint(Scalar glideslope_deg = static_cast<Scalar>(GLIDESLOPE)) {
-        tan_gs_ = std::tan(glideslope_deg * M_PI / 180.0);
-        this->constraint_type = ConstraintType::SOC;
-        this->dim_c = 3;
+    explicit GlideslopeConstraint(Scalar gs_deg = static_cast<Scalar>(GLIDESLOPE)) {
+        tan_gs_ = std::tan(gs_deg * M_PI / 180.0);
+        this->constraint_type = ConstraintType::SOC; this->dim_c = 3;
     }
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)u; Vector<Scalar> c_n(3);
@@ -343,8 +287,7 @@ class TiltConeConstraint : public StageConstraintBase<Scalar> {
 public:
     explicit TiltConeConstraint(Scalar theta_max_deg = static_cast<Scalar>(TILT_CONE)) {
         tilt_limit_ = std::sqrt((1.0 - std::cos(theta_max_deg * M_PI / 180.0)) / 2.0);
-        this->constraint_type = ConstraintType::SOC;
-        this->dim_c = 3;
+        this->constraint_type = ConstraintType::SOC; this->dim_c = 3;
     }
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)u; Vector<Scalar> c_n(3);
@@ -365,10 +308,8 @@ class MaxMomentConstraint : public StageConstraintBase<Scalar> {
     Scalar tau_max_;
 public:
     explicit MaxMomentConstraint(Scalar tau_max = static_cast<Scalar>(TAU_MAX_SCALED))
-        : tau_max_(tau_max)
-    {
-        this->constraint_type = ConstraintType::SOC;
-        this->dim_c = 4;
+        : tau_max_(tau_max) {
+        this->constraint_type = ConstraintType::SOC; this->dim_c = 4;
     }
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         (void)x; Vector<Scalar> c_n(4);
@@ -386,31 +327,26 @@ public:
 
 template <typename Scalar>
 class VelocityJerkConstraint : public StageConstraintBase<Scalar> {
-    double mass_, dt_, dv_max_;
+    double mass_, dt_;
     Eigen::Vector3d gravity_;
+    double dv_max_;
 public:
     VelocityJerkConstraint(double mass, double dt,
                             const Eigen::Vector3d& gravity, double j_max)
-        : mass_(mass), dt_(dt), gravity_(gravity), dv_max_(j_max * dt)
-    {
-        this->constraint_type = ConstraintType::NO;
-        this->dim_c = 6;
+        : mass_(mass), dt_(dt), gravity_(gravity), dv_max_(j_max * dt) {
+        this->constraint_type = ConstraintType::NO; this->dim_c = 6;
     }
     Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        const Eigen::Vector4d q = x.segment(6, 4);
+        const Eigen::Vector4d q = x.segment(6,4);
         const double fz = u(0);
         const Eigen::Matrix3d C = Quad6DOF<Scalar>::calcC(q);
-        const Eigen::Vector3d dv =
-            dt_ * (C * Eigen::Vector3d(0.0, 0.0, fz) / mass_ + gravity_);
+        const Eigen::Vector3d dv = dt_ * (C * Eigen::Vector3d(0.0, 0.0, fz) / mass_ + gravity_);
         Vector<Scalar> c_n(6);
-        for (int i = 0; i < 3; ++i) {
-            c_n(i)     =  dv(i) - dv_max_;
-            c_n(3 + i) = -dv(i) - dv_max_;
-        }
+        for (int i = 0; i < 3; ++i) { c_n(i) = dv(i) - dv_max_; c_n(3+i) = -dv(i) - dv_max_; }
         return c_n;
     }
     Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        const Eigen::Vector4d q = x.segment(6, 4);
+        const Eigen::Vector4d q = x.segment(6,4);
         const double fz = u(0);
         const Eigen::Vector3d f_B(0.0, 0.0, fz);
         Eigen::Matrix3d dCdq0, dCdq1, dCdq2, dCdq3;
@@ -429,7 +365,7 @@ public:
         return J;
     }
     Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        const Eigen::Vector4d q = x.segment(6, 4);
+        const Eigen::Vector4d q = x.segment(6,4);
         const Eigen::Matrix3d C = Quad6DOF<Scalar>::calcC(q);
         const Eigen::Vector3d ddv_dfz = (dt_/mass_) * C.col(2);
         Matrix<Scalar> J = Matrix<Scalar>::Zero(6, u.size());
@@ -441,17 +377,12 @@ public:
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory
-//
-// NEW PARAMETER: prev_X (previous solve's state trajectory, already shifted
-//   by n_shift in quadrotor_mpc.cpp before calling here).
-//   prev_X[k] is used as the trajectory reference for stage k.
-//   Pass empty vector on first solve — penalty is disabled automatically.
 // ─────────────────────────────────────────────────────────────────────────────
 inline std::shared_ptr<OptimalControlProblem<double>> create(
     const Eigen::VectorXd& current_state,
     const Eigen::VectorXd& /* terminal_state */,
     const std::vector<Eigen::VectorXd>& prev_U = {},
-    const std::vector<Eigen::VectorXd>& prev_X = {})   // NEW
+    const std::vector<Eigen::VectorXd>& prev_X = {})
 {
     auto prob = std::make_shared<OptimalControlProblem<double>>(HORIZON);
 
@@ -465,30 +396,23 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
 
     const Eigen::VectorXd x_land_ref = make_x_ref();
     const Eigen::VectorXd u_ref      = make_u_ref();
-    const Eigen::VectorXd empty_traj_ref;   // zero-size → penalty disabled
+    const Eigen::VectorXd empty_traj_ref;
 
     for (int i = 0; i < HORIZON; ++i) {
         const Eigen::VectorXd& u_prev =
             (prev_U.size() > static_cast<size_t>(i)) ? prev_U[i] : u_ref;
 
-        // Trajectory reference for node i.
-        // Node i of the new solve corresponds to node (i + n_shift) of the
-        // old solve — but prev_X was already shifted in quadrotor_mpc.cpp,
-        // so we just index directly.
         const Eigen::VectorXd& x_traj_ref =
             (prev_X.size() > static_cast<size_t>(i + 1))
-                ? prev_X[i + 1]   // +1: node 0 is x0 (constrained), start from node 1
+                ? prev_X[i + 1]
                 : empty_traj_ref;
 
-        // Taper the consistency weight near the end of the horizon so the
-        // terminal landing constraint isn't held hostage to an old path.
         const bool in_taper = (i >= HORIZON - TAPER_NODES);
         const double w_pos  = in_taper ? W_TRAJ_POS * W_TRAJ_TAPER_FACTOR : W_TRAJ_POS;
         const double w_vel  = in_taper ? W_TRAJ_VEL * W_TRAJ_TAPER_FACTOR : W_TRAJ_VEL;
 
         prob->setStageCost(i, std::make_shared<TrajectoryAwareStageCost<double>>(
-            x_land_ref, u_ref, Q_DIAG, R_DIAG, S_DIAG, u_prev,
-            x_traj_ref, w_pos, w_vel));
+            x_land_ref, u_ref, Q_DIAG, R_DIAG, S_DIAG, u_prev, x_traj_ref, w_pos, w_vel));
     }
 
     prob->setTerminalCost(std::make_shared<GenericTerminalCost<double>>(x_land_ref, P_DIAG));
@@ -502,7 +426,7 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
         MASS, DT, Eigen::Vector3d(0.0, 0.0, -9.81), J_MAX);
 
     for (int i = 0; i < HORIZON; ++i) {
-        // prob->addStageConstraint(i, gs);  // glideslope off — causes infeasible attitudes near cone boundary
+        prob->addStageConstraint(i, gs);  // glideslope — disabled: infeasible near cone boundary
         prob->addStageConstraint(i, tc);
         prob->addStageConstraint(i, mt);
         prob->addStageConstraint(i, fmin);
