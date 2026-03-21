@@ -1,55 +1,9 @@
-// planner_node.cpp
-// ─────────────────────────────────────────────────────────────────────────────
-// CoManDO Planner — supports two platforms and two solvers:
-//
-//   platform:  "crazyflie"  (Crazyswarm2 topics, ENU)
-//              "px4"        (PX4 uORB-over-DDS topics, NED↔ENU conversion)
-//
-//   solver:    "alipddp"    (ALIPDDP — augmented Lagrangian IPM DDP)
-//              "acados"     (acados SQP_RTI — code-generated NLP)
-//
-// State layout (13-dim, ENU/FLU internally):
-//   [0-2]   position        x, y, z          (m)
-//   [3-5]   velocity        vx, vy, vz       (m/s)
-//   [6-9]   quaternion      qw, qx, qy, qz   (–)
-//   [10-12] angular rate    wx, wy, wz        (rad/s)
-//
-// ── MPC PUBLISH ARCHITECTURE (Zhang et al. 2023 §III, Algorithm 1 Line 9) ──
-//
-//   Two decoupled timers in MPC mode:
-//
-//   1. solver_timer_ (solver_rate Hz, e.g. 1-2 Hz)
-//      Runs ALIPDDP, on success: locks mpc_traj_mutex_, stores X into
-//      mpc_traj_, sets mpc_replay_idx_ = skip (compensating for solve latency).
-//      Does NOT publish directly.
-//
-//   2. mpc_replay_timer_ (ocp_dt Hz, e.g. 20 Hz for ocp_dt=0.05s)
-//      Every ocp_dt seconds: reads mpc_traj_[mpc_replay_idx_] under lock,
-//      publishes it, increments mpc_replay_idx_.
-//
-// ── SOLVE LATENCY COMPENSATION ────────────────────────────────────────────────
-//
-//   Problem: solver takes ~65ms. If we always reset mpc_replay_idx_ = 1,
-//   we publish X[1] which was computed for the state at CAPTURE time, not
-//   at PUBLISH time (65ms later). This produces a backward position jump.
-//
-//   Fix: measure actual solve duration, compute
-//     skip = round(solve_sec / ocp_dt_)
-//   and set mpc_replay_idx_ = skip instead of 1.
-//   This means the first setpoint published after a solve is the node that
-//   corresponds to "now" rather than "when we started solving".
-//
-// ─────────────────────────────────────────────────────────────────────────────
-
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-
-// ── Crazyflie interface ──────────────────────────────────────────────────────
 #include <crazyflie_interfaces/msg/full_state.hpp>
 
-// ── PX4 interface (conditionally compiled) ───────────────────────────────────
 #ifdef HAS_PX4_MSGS
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
@@ -57,7 +11,6 @@
 #include <px4_msgs/msg/vehicle_command.hpp>
 #endif
 
-// ── Solvers ──────────────────────────────────────────────────────────────────
 #include "quadrotor_mpc.hpp"
 #include "ocp_registry.hpp"
 #ifdef HAS_ACADOS
@@ -65,48 +18,30 @@
 #endif
 
 #include <chrono>
+#include <thread>
 #include <memory>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <cmath>
 #include <mutex>
-#include <atomic>
 #include <Eigen/Dense>
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  NED ↔ ENU frame conversion helpers
-// ═══════════════════════════════════════════════════════════════════════════════
 namespace frame_conv {
-
-inline Eigen::Vector3d ned_to_enu(const Eigen::Vector3d& v_ned) {
-    return {v_ned.y(), v_ned.x(), -v_ned.z()};
-}
-inline Eigen::Vector3d enu_to_ned(const Eigen::Vector3d& v_enu) {
-    return {v_enu.y(), v_enu.x(), -v_enu.z()};
-}
+inline Eigen::Vector3d ned_to_enu(const Eigen::Vector3d& v) { return {v.y(), v.x(), -v.z()}; }
+inline Eigen::Vector3d enu_to_ned(const Eigen::Vector3d& v) { return {v.y(), v.x(), -v.z()}; }
 inline Eigen::Quaterniond quat_ned_to_enu(double w, double x, double y, double z) {
     return Eigen::Quaterniond(w, y, x, -z).normalized();
 }
-inline Eigen::Quaterniond quat_enu_to_ned(const Eigen::Quaterniond& q_enu) {
-    return Eigen::Quaterniond(q_enu.w(), q_enu.y(), q_enu.x(), -q_enu.z()).normalized();
+inline Eigen::Quaterniond quat_enu_to_ned(const Eigen::Quaterniond& q) {
+    return Eigen::Quaterniond(q.w(), q.y(), q.x(), -q.z()).normalized();
 }
-inline Eigen::Vector3d omega_frd_to_flu(const Eigen::Vector3d& w_frd) {
-    return {w_frd.x(), -w_frd.y(), -w_frd.z()};
-}
-inline Eigen::Vector3d omega_flu_to_frd(const Eigen::Vector3d& w_flu) {
-    return {w_flu.x(), -w_flu.y(), -w_flu.z()};
+inline Eigen::Vector3d omega_frd_to_flu(const Eigen::Vector3d& w) { return {w.x(), -w.y(), -w.z()}; }
 }
 
-} // namespace frame_conv
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Unified Result type
-// ═══════════════════════════════════════════════════════════════════════════════
 struct SolverResult {
     bool                          success   = false;
     Eigen::VectorXd               next_state;
@@ -116,15 +51,10 @@ struct SolverResult {
     std::chrono::steady_clock::time_point solve_timestamp;
 };
 
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Planner Node
-// ═══════════════════════════════════════════════════════════════════════════════
 class PlannerNode : public rclcpp::Node {
 public:
     PlannerNode() : Node("comando_planner") {
-        // ── Parameters ────────────────────────────────────────────────────────
-        this->declare_parameter("ocp_type",       std::string("hover"));
+        this->declare_parameter("ocp_type",       std::string("landing"));
         this->declare_parameter("drone_name",     std::string("cf_1"));
         this->declare_parameter("enable_logging", true);
         this->declare_parameter("platform",       std::string("crazyflie"));
@@ -145,47 +75,16 @@ public:
         double ty = this->get_parameter("hover_target_y").as_double();
         double tz = this->get_parameter("hover_target_z").as_double();
 
-        // ── Validate ──────────────────────────────────────────────────────────
-        if (platform_ != "crazyflie" && platform_ != "px4") {
-            RCLCPP_ERROR(this->get_logger(), "Unknown platform '%s'", platform_.c_str());
-            throw std::runtime_error("Invalid platform: " + platform_);
-        }
-        if (solver_type_ != "alipddp" && solver_type_ != "acados") {
-            RCLCPP_ERROR(this->get_logger(), "Unknown solver '%s'", solver_type_.c_str());
-            throw std::runtime_error("Invalid solver: " + solver_type_);
-        }
-        if (mode_ != "mpc" && mode_ != "open_loop") {
-            RCLCPP_ERROR(this->get_logger(), "Unknown mode '%s'", mode_.c_str());
-            throw std::runtime_error("Invalid mode: " + mode_);
-        }
-#ifndef HAS_ACADOS
-        if (solver_type_ == "acados") throw std::runtime_error("Acados not available");
-#endif
-#ifndef HAS_PX4_MSGS
-        if (platform_ == "px4") throw std::runtime_error("PX4 msgs not available");
-#endif
+        ocp_dt_ = OCPRegistry::getDT(ocp_type_);
 
-        // ── Terminal state ────────────────────────────────────────────────────
         Eigen::VectorXd terminal = Eigen::VectorXd::Zero(13);
         terminal(0) = tx; terminal(1) = ty; terminal(2) = tz;
         terminal(6) = 1.0;
 
-        // ── OCP DT and solver rate ─────────────────────────────────────────────
-        ocp_dt_ = OCPRegistry::getDT(ocp_type_);
-
-        const int default_solver_rate = static_cast<int>(std::round(1.0 / ocp_dt_));
-        this->declare_parameter("solver_rate", default_solver_rate);
-        solver_rate_ = this->get_parameter("solver_rate").as_int();
-
-        const double solver_period = 1.0 / static_cast<double>(solver_rate_);
-        n_shift_ = std::max(1, static_cast<int>(std::round(solver_period / ocp_dt_)));
-
-        // ── Create solver ─────────────────────────────────────────────────────
         if (solver_type_ == "alipddp") {
             QuadrotorMPC::Config cfg;
             cfg.ocp_type       = ocp_type_;
             cfg.terminal_state = terminal;
-            cfg.n_shift        = n_shift_;
             alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
         }
 #ifdef HAS_ACADOS
@@ -194,16 +93,13 @@ public:
             cfg.ocp_type       = ocp_type_;
             cfg.terminal_state = terminal;
             cfg.dt             = ocp_dt_;
-            cfg.n_shift        = n_shift_;
             acados_mpc_ = std::make_unique<AcadosMPC>(cfg);
         }
 #endif
 
-        // ── Initial state ─────────────────────────────────────────────────────
         current_state_ = Eigen::VectorXd::Zero(13);
         current_state_(6) = 1.0;
 
-        // ── Callback groups ───────────────────────────────────────────────────
         sensor_cb_group_ = this->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
         solver_cb_group_ = this->create_callback_group(
@@ -211,30 +107,29 @@ public:
         replay_cb_group_ = this->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
 
-        // ── Platform-specific pub/sub ─────────────────────────────────────────
-        if (platform_ == "crazyflie") {
-            setupCrazyflie();
-        } else {
-            setupPX4();
-        }
+        if (platform_ == "crazyflie") setupCrazyflie();
+        else                          setupPX4();
 
-        // ── Trajectory visualisation ──────────────────────────────────────────
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
 
-        // ── Timer setup ───────────────────────────────────────────────────────
         if (mode_ == "mpc") {
+            // Solver timer: runs as fast as possible (1ms), blocks on solve.
+            // When solve finishes: swaps mpc_traj_, resets replay idx to 1.
             solver_timer_ = this->create_wall_timer(
-                std::chrono::milliseconds(1000 / solver_rate_),
+                1ms,
                 std::bind(&PlannerNode::solverLoop, this),
                 solver_cb_group_);
 
-            const int replay_period_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
+            // Replay timer: fires every ocp_dt (50ms) independently.
+            // Streams mpc_traj_[idx++] to the drone with NO gaps.
+            // While the solver is blocked (~160ms), ~3 ticks fire and the
+            // drone gets 3 setpoints. n_shift = round(solve_ms/ocp_dt) to match.
+            const int replay_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
             mpc_replay_timer_ = this->create_wall_timer(
-                std::chrono::milliseconds(replay_period_ms),
+                std::chrono::milliseconds(replay_ms),
                 std::bind(&PlannerNode::mpcReplayTick, this),
                 replay_cb_group_);
-
         } else {
             startup_timer_ = this->create_wall_timer(
                 50ms, std::bind(&PlannerNode::openLoopStartupCheck, this),
@@ -242,36 +137,29 @@ public:
         }
 
         RCLCPP_INFO(this->get_logger(),
-            "Planner ready  mode=%s  platform=%s  solver=%s  ocp=%s  "
-            "solver_rate=%dHz  ocp_dt=%.3fs  n_shift=%d",
-            mode_.c_str(), platform_.c_str(), solver_type_.c_str(), ocp_type_.c_str(),
-            solver_rate_, ocp_dt_, n_shift_);
+            "Ready  mode=%s  platform=%s  solver=%s  ocp=%s  ocp_dt=%.3fs",
+            mode_.c_str(), platform_.c_str(), solver_type_.c_str(),
+            ocp_type_.c_str(), ocp_dt_);
         RCLCPP_INFO(this->get_logger(), "Target: [%.3f, %.3f, %.3f]", tx, ty, tz);
-        RCLCPP_INFO(this->get_logger(), "Waiting for state feedback...");
     }
 
 private:
     // ─────────────────────────────────────────────────────────────────────────
-    //  Platform setup
-    // ─────────────────────────────────────────────────────────────────────────
-
     void setupCrazyflie()
     {
         cf_cmd_pub_ = this->create_publisher<crazyflie_interfaces::msg::FullState>(
             "/" + drone_name_ + "/cmd_full_state", 10);
 
-        rclcpp::SubscriptionOptions sensor_opts;
-        sensor_opts.callback_group = sensor_cb_group_;
+        rclcpp::SubscriptionOptions opts;
+        opts.callback_group = sensor_cb_group_;
 
         pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "/" + drone_name_ + "/pose", 10,
-            std::bind(&PlannerNode::cfPoseCallback, this, std::placeholders::_1),
-            sensor_opts);
+            std::bind(&PlannerNode::cfPoseCallback, this, std::placeholders::_1), opts);
 
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/" + drone_name_ + "/odom", 10,
-            std::bind(&PlannerNode::cfOdomCallback, this, std::placeholders::_1),
-            sensor_opts);
+            std::bind(&PlannerNode::cfOdomCallback, this, std::placeholders::_1), opts);
     }
 
     void setupPX4()
@@ -284,12 +172,11 @@ private:
         px4_cmd_pub_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
             "/fmu/in/vehicle_command", 10);
 
-        rclcpp::SubscriptionOptions sensor_opts;
-        sensor_opts.callback_group = sensor_cb_group_;
+        rclcpp::SubscriptionOptions opts;
+        opts.callback_group = sensor_cb_group_;
         px4_odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
             "/fmu/out/vehicle_odometry", 10,
-            std::bind(&PlannerNode::px4OdomCallback, this, std::placeholders::_1),
-            sensor_opts);
+            std::bind(&PlannerNode::px4OdomCallback, this, std::placeholders::_1), opts);
 
         px4_heartbeat_timer_ = this->create_wall_timer(
             100ms, std::bind(&PlannerNode::px4HeartbeatCallback, this));
@@ -297,9 +184,6 @@ private:
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Crazyflie state callbacks
-    // ─────────────────────────────────────────────────────────────────────────
-
     void cfPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
     {
         std::lock_guard<std::mutex> lk(state_mutex_);
@@ -326,59 +210,42 @@ private:
         odom_received_ = true;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  PX4 callbacks
-    // ─────────────────────────────────────────────────────────────────────────
-
 #ifdef HAS_PX4_MSGS
     void px4OdomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg)
     {
-        Eigen::Vector3d pos_ned(msg->position[0], msg->position[1], msg->position[2]);
-        Eigen::Vector3d vel_ned(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
-        Eigen::Vector3d omega_frd(msg->angular_velocity[0], msg->angular_velocity[1], msg->angular_velocity[2]);
-
-        auto pos_enu   = frame_conv::ned_to_enu(pos_ned);
-        auto vel_enu   = frame_conv::ned_to_enu(vel_ned);
-        auto q_enu     = frame_conv::quat_ned_to_enu(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
-        auto omega_flu = frame_conv::omega_frd_to_flu(omega_frd);
-
+        auto pos = frame_conv::ned_to_enu({msg->position[0], msg->position[1], msg->position[2]});
+        auto vel = frame_conv::ned_to_enu({msg->velocity[0], msg->velocity[1], msg->velocity[2]});
+        auto q   = frame_conv::quat_ned_to_enu(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
+        auto w   = frame_conv::omega_frd_to_flu({msg->angular_velocity[0], msg->angular_velocity[1], msg->angular_velocity[2]});
         std::lock_guard<std::mutex> lk(state_mutex_);
-        current_state_(0)  = pos_enu.x();  current_state_(1)  = pos_enu.y();  current_state_(2)  = pos_enu.z();
-        current_state_(3)  = vel_enu.x();  current_state_(4)  = vel_enu.y();  current_state_(5)  = vel_enu.z();
-        current_state_(6)  = q_enu.w();    current_state_(7)  = q_enu.x();
-        current_state_(8)  = q_enu.y();    current_state_(9)  = q_enu.z();
-        current_state_(10) = omega_flu.x(); current_state_(11) = omega_flu.y(); current_state_(12) = omega_flu.z();
+        current_state_ << pos.x(), pos.y(), pos.z(),
+                          vel.x(), vel.y(), vel.z(),
+                          q.w(), q.x(), q.y(), q.z(),
+                          w.x(), w.y(), w.z();
         pose_received_ = odom_received_ = true;
     }
-
     void px4HeartbeatCallback()
     {
         px4_msgs::msg::OffboardControlMode msg;
-        msg.timestamp    = this->now().nanoseconds() / 1000;
-        msg.position     = true;
-        msg.velocity     = true;
-        msg.acceleration = false;
-        msg.attitude     = false;
-        msg.body_rate    = false;
+        msg.timestamp = this->now().nanoseconds() / 1000;
+        msg.position = msg.velocity = true;
         px4_offboard_pub_->publish(msg);
     }
-
     void px4Arm()
     {
         px4_msgs::msg::VehicleCommand msg;
         msg.timestamp = this->now().nanoseconds() / 1000;
-        msg.command   = 400; msg.param1 = 1.0;
+        msg.command = 400; msg.param1 = 1.0;
         msg.target_system = msg.source_system = 1;
         msg.target_component = msg.source_component = 1;
         msg.from_external = true;
         px4_cmd_pub_->publish(msg);
     }
-
     void px4SetOffboardMode()
     {
         px4_msgs::msg::VehicleCommand msg;
         msg.timestamp = this->now().nanoseconds() / 1000;
-        msg.command   = 176; msg.param1 = 1.0; msg.param2 = 6.0;
+        msg.command = 176; msg.param1 = 1.0; msg.param2 = 6.0;
         msg.target_system = msg.source_system = 1;
         msg.target_component = msg.source_component = 1;
         msg.from_external = true;
@@ -387,76 +254,9 @@ private:
 #endif
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  MPC replay tick (runs at ocp_dt rate, separate from solver)
-    // ─────────────────────────────────────────────────────────────────────────
-    void mpcReplayTick()
-    {
-        Eigen::VectorXd x_cmd;
-        Eigen::VectorXd u_cmd;
-        bool have_traj = false;
-
-        {
-            std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
-            if (!mpc_traj_.empty()) {
-                const int N = static_cast<int>(mpc_traj_.size()) - 1;
-                const int idx = std::min(mpc_replay_idx_, N);
-                x_cmd      = mpc_traj_[idx];
-                u_cmd      = (idx < (int)mpc_ctrl_.size()) ? mpc_ctrl_[idx]
-                                                            : Eigen::VectorXd::Zero(4);
-                have_traj  = true;
-                if (mpc_replay_idx_ < N) {
-                    ++mpc_replay_idx_;
-                }
-            }
-        }
-
-        if (!have_traj) {
-            Eigen::VectorXd x_hover;
-            {
-                std::lock_guard<std::mutex> lk(state_mutex_);
-                x_hover = current_state_;
-            }
-            x_hover.segment(3, 3).setZero();
-            x_hover.segment(10, 3).setZero();
-            if (platform_ == "crazyflie") publishCrazyflieCommand(x_hover, Eigen::Vector3d::Zero());
-            else                          publishPX4Command(x_hover, Eigen::Vector3d::Zero());
-            return;
-        }
-
-        // ── Transition blend ──────────────────────────────────────────────
-        // Linearly interpolate from blend_from_ (last point of old trajectory)
-        // to x_cmd (new trajectory) over BLEND_STEPS ticks.
-        // This hides the discontinuity when consecutive solves find different
-        // local optima or when latency compensation leaves a residual gap.
-        {
-            std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
-            if (blend_steps_remaining_ > 0 && blend_from_.size() == x_cmd.size()) {
-                const double alpha = 1.0 -
-                    static_cast<double>(blend_steps_remaining_) / BLEND_STEPS;
-                // Blend position and velocity; leave attitude/omega as-is
-                // (attitude changes are small and blending quaternions needs slerp)
-                Eigen::VectorXd blended = x_cmd;
-                // pos (0-2) and vel (3-5)
-                blended.head(6) = (1.0 - alpha) * blend_from_.head(6)
-                                +        alpha  * x_cmd.head(6);
-                x_cmd = blended;
-                --blend_steps_remaining_;
-            }
-        }
-
-        if (platform_ == "crazyflie") publishCrazyflieCommand(x_cmd, Eigen::Vector3d::Zero());
-        else                          publishPX4Command(x_cmd, Eigen::Vector3d::Zero());
-
-        if (logging_enabled_ && logging_initialized_) {
-            Eigen::VectorXd act;
-            { std::lock_guard<std::mutex> lk(state_mutex_); act = current_state_; }
-            logActualState(act);
-            logCommandedState(x_cmd, u_cmd);
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Solver loop (runs at solver_rate Hz — may block for 100-500 ms)
+    //  SOLVER LOOP — fires at 1ms, blocks on solve (~160ms).
+    //  While blocked the replay timer keeps sending setpoints every 50ms.
+    //  When done: swap mpc_traj_, reset idx=1.
     // ─────────────────────────────────────────────────────────────────────────
     void solverLoop()
     {
@@ -470,18 +270,15 @@ private:
         }
         if (!have_pose || !have_odom) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "Waiting for state: /pose [%s] /odom [%s]...",
-                have_pose ? "OK" : "MISSING",
-                have_odom ? "OK" : "MISSING");
+                "Waiting for state: pose[%s] odom[%s]",
+                have_pose ? "OK" : "MISSING", have_odom ? "OK" : "MISSING");
             return;
         }
 
         if (!is_flying_) {
             is_flying_ = true;
             RCLCPP_INFO(this->get_logger(),
-                "State feedback received — starting MPC (%s)  replay at %.0f Hz",
-                solver_type_.c_str(), 1.0 / ocp_dt_);
-
+                "State received — starting RH MPC (%s)", solver_type_.c_str());
 #ifdef HAS_PX4_MSGS
             if (platform_ == "px4") { px4SetOffboardMode(); px4Arm(); }
 #endif
@@ -489,74 +286,73 @@ private:
                 setupLogging();
                 logging_initialized_ = true;
             }
-
             RCLCPP_INFO(this->get_logger(),
-                "x0=[%.3f,%.3f,%.3f | %.3f,%.3f,%.3f | %.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f]",
-                x0(0),x0(1),x0(2), x0(3),x0(4),x0(5),
-                x0(6),x0(7),x0(8),x0(9), x0(10),x0(11),x0(12));
+                "x0=[%.3f,%.3f,%.3f | %.3f,%.3f,%.3f]",
+                x0(0),x0(1),x0(2), x0(3),x0(4),x0(5));
         }
 
-        // ── Solve — measure wall time for latency compensation ─────────────────
-        // We time the solve so we can advance mpc_replay_idx_ past the nodes
-        // that elapsed while ALIPDDP was running.  Without this, the first
-        // setpoint after a new solve is X[1] — computed for where the drone
-        // was at capture time, not at publish time — causing a backward jump.
-        const auto t_solve_start = this->now();
+        // Blocks ~160ms. Replay timer keeps firing every 50ms during this.
         SolverResult result = callSolver(x0);
-        const double solve_sec = (this->now() - t_solve_start).seconds();
 
-        if (result.success) {
-            const auto& X = result.state_trajectory;
-            const auto& U = result.control_trajectory;
-
-            // ── Compute latency-compensated start index ────────────────────────
-            // skip = number of OCP steps that elapsed while the solver ran.
-            // Clamped to [1, n_shift-1]: at least 1 (never re-publish X[0]=x0),
-            // at most n_shift-1 (don't consume the entire new horizon).
-            const int N = static_cast<int>(X.size()) - 1;
-            const int skip = std::max(1,
-                std::min(static_cast<int>(std::round(solve_sec / ocp_dt_)),
-                         std::max(1, n_shift_ - 1)));
-
-            RCLCPP_INFO(this->get_logger(),
-                "[solver] solve=%.1fms  latency_skip=%d  replay starts at X[%d]",
-                solve_sec * 1000.0, skip, skip);
-
-            {
-                std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
-                // Save the last commanded state before we switch trajectories.
-                // mpcReplayTick will blend from this point to the new traj's
-                // start over BLEND_STEPS ticks, hiding the discontinuity.
-                if (!mpc_traj_.empty()) {
-                    const int cur = std::min(mpc_replay_idx_,
-                                            (int)mpc_traj_.size() - 1);
-                    blend_from_ = mpc_traj_[cur];
-                } else if (X.size() > (size_t)skip) {
-                    blend_from_ = X[skip];   // no previous traj — blend from target itself (no-op)
-                }
-                blend_steps_remaining_ = BLEND_STEPS;
-
-                mpc_traj_ = X;
-                mpc_ctrl_ = U;
-                mpc_replay_idx_ = skip;
-            }
-
-            publishTrajectory(X);
-
-            if (logging_enabled_ && logging_initialized_) {
-                logSolveTrajectory(X, U, result.solve_time_ms);
-            }
-
-            if (++diag_count_ % 10 == 0) printDiagnostics(result);
-
-        } else {
-            RCLCPP_WARN(this->get_logger(), "MPC solve FAILED (%s) — replay continues on stale traj",
-                solver_type_.c_str());
+        if (!result.success || result.state_trajectory.size() < 2) {
+            RCLCPP_WARN(this->get_logger(), "Solve FAILED — holding");
+            Eigen::VectorXd x_hold = x0;
+            x_hold.segment(3,3).setZero();
+            x_hold.segment(10,3).setZero();
+            publishCommand(x_hold, Eigen::VectorXd::Zero(4));
+            return;
         }
+
+        RCLCPP_INFO(this->get_logger(),
+            "[RH %d] solve=%.1fms  x0=[%.3f,%.3f,%.3f]",
+            solve_count_, result.solve_time_ms,
+            x0(0), x0(1), x0(2));
+
+        // Swap — replay timer picks up from idx=1 on next tick.
+        {
+            std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
+            mpc_traj_       = result.state_trajectory;
+            mpc_ctrl_       = result.control_trajectory;
+            mpc_replay_idx_ = 1;
+        }
+
+        publishTrajectory(result.state_trajectory);
+
+        if (logging_enabled_ && logging_initialized_)
+            logSolveTrajectory(result.state_trajectory,
+                               result.control_trajectory,
+                               result.solve_time_ms);
+        ++solve_count_;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Unified solver call
+    //  REPLAY TICK — fires every 50ms independently of solver.
+    //  Walks mpc_traj_[idx++]. No gaps ever.
+    // ─────────────────────────────────────────────────────────────────────────
+    void mpcReplayTick()
+    {
+        Eigen::VectorXd x_cmd, u_cmd;
+        {
+            std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
+            if (mpc_traj_.empty()) return;
+            const int N   = (int)mpc_traj_.size() - 1;
+            const int idx = std::min(mpc_replay_idx_, N);
+            x_cmd = mpc_traj_[idx];
+            u_cmd = (idx < (int)mpc_ctrl_.size())
+                ? mpc_ctrl_[idx] : Eigen::VectorXd::Zero(4);
+            if (mpc_replay_idx_ < N) ++mpc_replay_idx_;
+        }
+
+        publishCommand(x_cmd, u_cmd);
+
+        if (logging_enabled_ && logging_initialized_) {
+            Eigen::VectorXd act;
+            { std::lock_guard<std::mutex> lk(state_mutex_); act = current_state_; }
+            logActualState(act);
+            logCommandedState(x_cmd, u_cmd);
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     SolverResult callSolver(const Eigen::VectorXd& state)
     {
@@ -584,145 +380,49 @@ private:
         return result;
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    //  MODE: Open-loop — single solve then replay (unchanged)
-    // ═════════════════════════════════════════════════════════════════════════
-
-    void openLoopStartupCheck()
+    // ─────────────────────────────────────────────────────────────────────────
+    void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u)
     {
-        bool have_odom;
-        { std::lock_guard<std::mutex> lk(state_mutex_); have_odom = odom_received_; }
-        if (!have_odom) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "[OpenLoop] Waiting for /odom...");
-            return;
-        }
-        startup_timer_->cancel();
-
-        Eigen::VectorXd x0;
-        { std::lock_guard<std::mutex> lk(state_mutex_); x0 = current_state_; }
-
-        RCLCPP_INFO(this->get_logger(),
-            "[OpenLoop] Running ONE solve (%s)...", solver_type_.c_str());
-
-        SolverResult result = callSolver(x0);
-
-        if (!result.success || result.state_trajectory.size() < 2) {
-            RCLCPP_ERROR(this->get_logger(), "[OpenLoop] Solve FAILED.");
-            return;
-        }
-
-        ol_ref_X_ = result.state_trajectory;
-        ol_ref_U_ = result.control_trajectory;
-
-        RCLCPP_INFO(this->get_logger(),
-            "[OpenLoop] Solve OK in %.1f ms — %zu states, horizon=%.2fs",
-            result.solve_time_ms, ol_ref_X_.size(),
-            (ol_ref_X_.size()-1) * ocp_dt_);
-
-        if (logging_enabled_) {
-            setupLogging(); logging_initialized_ = true;
-            logSolveTrajectory(ol_ref_X_, ol_ref_U_, result.solve_time_ms);
-        }
-        publishTrajectory(ol_ref_X_);
-
-        ol_replay_step_       = 0;
-        ol_replay_start_time_ = Clock::now();
-
-        const int period_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
-        replay_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(period_ms),
-            std::bind(&PlannerNode::openLoopReplayTick, this),
-            solver_cb_group_);
-
-        RCLCPP_INFO(this->get_logger(),
-            "[OpenLoop] Replay started at %dms/step (%zu steps)",
-            period_ms, ol_ref_X_.size());
+        if (platform_ == "crazyflie") publishCrazyflieCommand(s, u);
+        else                          publishPX4Command(s);
     }
 
-    void openLoopReplayTick()
-    {
-        const int N    = static_cast<int>(ol_ref_X_.size()) - 1;
-        const int step = std::min(ol_replay_step_, N);
-        const bool done = (ol_replay_step_ >= N);
-
-        const Eigen::VectorXd& x_cmd = ol_ref_X_[step];
-
-        if (platform_ == "crazyflie") publishCrazyflieCommand(x_cmd, Eigen::Vector3d::Zero());
-        else                          publishPX4Command(x_cmd, Eigen::Vector3d::Zero());
-
-        Eigen::VectorXd act;
-        { std::lock_guard<std::mutex> lk(state_mutex_); act = current_state_; }
-
-        if (logging_enabled_ && logging_initialized_) {
-            logActualState(act);
-            const Eigen::VectorXd u = (step < (int)ol_ref_U_.size())
-                ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4);
-            logCommandedState(x_cmd, u);
-        }
-
-        if (ol_replay_step_ % 10 == 0 || done) {
-            double t_el = std::chrono::duration<double>(Clock::now() - ol_replay_start_time_).count();
-            Eigen::Vector3d err = act.head(3) - x_cmd.head(3);
-            RCLCPP_INFO(this->get_logger(),
-                "[Step %3d/%d | t=%.2fs] cmd=[%.3f,%.3f,%.3f] act=[%.3f,%.3f,%.3f] |err|=%.3fm",
-                step, N, t_el,
-                x_cmd(0),x_cmd(1),x_cmd(2), act(0),act(1),act(2), err.norm());
-        }
-
-        if (done) {
-            if (!ol_done_logged_) {
-                RCLCPP_INFO(this->get_logger(), "[OpenLoop] Trajectory done. Holding X[%d].", N);
-                ol_done_logged_ = true;
-            }
-        } else {
-            ++ol_replay_step_;
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Publishing
-    // ─────────────────────────────────────────────────────────────────────────
-
-    void publishCrazyflieCommand(const Eigen::VectorXd& s, const Eigen::Vector3d& acc_cmd)
+    void publishCrazyflieCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u)
     {
         crazyflie_interfaces::msg::FullState msg;
         msg.header.stamp    = this->now();
         msg.header.frame_id = "world";
-        msg.pose.position.x     = s(0); msg.pose.position.y     = s(1); msg.pose.position.z     = s(2);
-        msg.twist.linear.x      = s(3); msg.twist.linear.y      = s(4); msg.twist.linear.z      = s(5);
-        msg.pose.orientation.w  = s(6); msg.pose.orientation.x  = s(7);
-        msg.pose.orientation.y  = s(8); msg.pose.orientation.z  = s(9);
-        msg.twist.angular.x     = s(10); msg.twist.angular.y    = s(11); msg.twist.angular.z    = s(12);
-        msg.acc.x = acc_cmd(0); msg.acc.y = acc_cmd(1); msg.acc.z = acc_cmd(2);
+        msg.pose.position.x    = s(0); msg.pose.position.y    = s(1); msg.pose.position.z    = s(2);
+        msg.twist.linear.x     = s(3); msg.twist.linear.y     = s(4); msg.twist.linear.z     = s(5);
+        msg.pose.orientation.w = s(6); msg.pose.orientation.x = s(7);
+        msg.pose.orientation.y = s(8); msg.pose.orientation.z = s(9);
+        msg.twist.angular.x    = s(10); msg.twist.angular.y   = s(11); msg.twist.angular.z   = s(12);
+        msg.acc.x = 0; msg.acc.y = 0; msg.acc.z = 0;
         cf_cmd_pub_->publish(msg);
 
         if (published_commands_log_.is_open()) {
             published_commands_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
             for (int i = 0; i < 13; ++i) published_commands_log_ << "," << s(i);
-            published_commands_log_ << "," << acc_cmd(0) << "," << acc_cmd(1) << "," << acc_cmd(2) << "\n";
+            published_commands_log_ << ",0,0,0\n";
             published_commands_log_.flush();
         }
     }
 
-    void publishPX4Command(const Eigen::VectorXd& s,
-                           [[maybe_unused]] const Eigen::Vector3d& acc_cmd)
+    void publishPX4Command(const Eigen::VectorXd& s)
     {
 #ifdef HAS_PX4_MSGS
-        Eigen::Vector3d pos_ned = frame_conv::enu_to_ned({s(0),s(1),s(2)});
-        Eigen::Vector3d vel_ned = frame_conv::enu_to_ned({s(3),s(4),s(5)});
-        Eigen::Quaterniond q_ned = frame_conv::quat_enu_to_ned({s(6),s(7),s(8),s(9)});
-        double yaw_ned = std::atan2(
-            2.0*(q_ned.w()*q_ned.z() + q_ned.x()*q_ned.y()),
-            1.0 - 2.0*(q_ned.y()*q_ned.y() + q_ned.z()*q_ned.z()));
-
+        auto pos = frame_conv::enu_to_ned({s(0),s(1),s(2)});
+        auto vel = frame_conv::enu_to_ned({s(3),s(4),s(5)});
+        auto q   = frame_conv::quat_enu_to_ned(Eigen::Quaterniond(s(6),s(7),s(8),s(9)));
+        double yaw = std::atan2(2*(q.w()*q.z()+q.x()*q.y()),
+                                1-2*(q.y()*q.y()+q.z()*q.z()));
         px4_msgs::msg::TrajectorySetpoint sp;
         sp.timestamp   = this->now().nanoseconds() / 1000;
-        sp.position[0] = pos_ned.x(); sp.position[1] = pos_ned.y(); sp.position[2] = pos_ned.z();
-        sp.velocity[0] = vel_ned.x(); sp.velocity[1] = vel_ned.y(); sp.velocity[2] = vel_ned.z();
+        sp.position[0] = pos.x(); sp.position[1] = pos.y(); sp.position[2] = pos.z();
+        sp.velocity[0] = vel.x(); sp.velocity[1] = vel.y(); sp.velocity[2] = vel.z();
         sp.acceleration[0] = sp.acceleration[1] = sp.acceleration[2] = std::numeric_limits<float>::quiet_NaN();
         sp.jerk[0] = sp.jerk[1] = sp.jerk[2] = std::numeric_limits<float>::quiet_NaN();
-        sp.yaw     = static_cast<float>(yaw_ned);
+        sp.yaw = static_cast<float>(yaw);
         sp.yawspeed = std::numeric_limits<float>::quiet_NaN();
         px4_setpoint_pub_->publish(sp);
 #endif
@@ -744,38 +444,84 @@ private:
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    //  Open-loop mode (unchanged)
+    // ─────────────────────────────────────────────────────────────────────────
+    void openLoopStartupCheck()
+    {
+        bool have_odom;
+        { std::lock_guard<std::mutex> lk(state_mutex_); have_odom = odom_received_; }
+        if (!have_odom) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[OpenLoop] Waiting for /odom...");
+            return;
+        }
+        startup_timer_->cancel();
+        Eigen::VectorXd x0;
+        { std::lock_guard<std::mutex> lk(state_mutex_); x0 = current_state_; }
+        RCLCPP_INFO(this->get_logger(), "[OpenLoop] Solving...");
+        SolverResult result = callSolver(x0);
+        if (!result.success || result.state_trajectory.size() < 2) {
+            RCLCPP_ERROR(this->get_logger(), "[OpenLoop] FAILED"); return;
+        }
+        ol_ref_X_ = result.state_trajectory;
+        ol_ref_U_ = result.control_trajectory;
+        if (logging_enabled_) { setupLogging(); logging_initialized_ = true;
+            logSolveTrajectory(ol_ref_X_, ol_ref_U_, result.solve_time_ms); }
+        publishTrajectory(ol_ref_X_);
+        ol_replay_step_ = 0;
+        ol_replay_start_time_ = Clock::now();
+        const int period_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
+        replay_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(period_ms),
+            std::bind(&PlannerNode::openLoopReplayTick, this),
+            solver_cb_group_);
+        RCLCPP_INFO(this->get_logger(), "[OpenLoop] Replaying %zu steps", ol_ref_X_.size());
+    }
+
+    void openLoopReplayTick()
+    {
+        const int N = (int)ol_ref_X_.size() - 1;
+        const int step = std::min(ol_replay_step_, N);
+        publishCommand(ol_ref_X_[step],
+            (step < (int)ol_ref_U_.size()) ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4));
+        if (logging_enabled_ && logging_initialized_) {
+            Eigen::VectorXd act; { std::lock_guard<std::mutex> lk(state_mutex_); act = current_state_; }
+            logActualState(act); logCommandedState(ol_ref_X_[step],
+                (step < (int)ol_ref_U_.size()) ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4));
+        }
+        if (ol_replay_step_ < N) ++ol_replay_step_;
+        else if (!ol_done_logged_) {
+            RCLCPP_INFO(this->get_logger(), "[OpenLoop] Done. Holding.");
+            ol_done_logged_ = true;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     //  Logging
     // ─────────────────────────────────────────────────────────────────────────
-
     void setupLogging()
     {
         auto now = std::chrono::system_clock::now();
         auto t   = std::chrono::system_clock::to_time_t(now);
         std::stringstream ts;
         ts << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S");
-
         std::string folder = "./logs/" + drone_name_ + "_" + ocp_type_ + "_"
                            + mode_ + "_" + solver_type_ + "_" + ts.str();
         std::filesystem::create_directories(folder);
         log_folder_ = folder;
-
         commanded_state_log_.open(folder + "/commanded_state.csv");
         if (commanded_state_log_.is_open())
             commanded_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,fz,mx,my,mz\n";
-
         actual_state_log_.open(folder + "/actual_state.csv");
         if (actual_state_log_.is_open())
             actual_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
-
         all_solves_log_.open(folder + "/all_solves.csv");
         if (all_solves_log_.is_open())
             all_solves_log_ << "solve_num,solve_time_ms,node,t,"
                                "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,fz,mx,my,mz\n";
-
         published_commands_log_.open(folder + "/published_commands.csv");
         if (published_commands_log_.is_open())
             published_commands_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,acc_x,acc_y,acc_z\n";
-
         RCLCPP_INFO(this->get_logger(), "Logging to: %s", folder.c_str());
     }
 
@@ -801,7 +547,6 @@ private:
             all_solves_log_ << "\n";
         }
         all_solves_log_.flush();
-        ++solve_count_;
     }
 
     void logActualState(const Eigen::VectorXd& state)
@@ -818,50 +563,28 @@ private:
         if (!commanded_state_log_.is_open() || s.size() < 13) return;
         commanded_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
         for (int i = 0; i < 13; ++i) commanded_state_log_ << "," << s(i);
-        if (u.size() >= 4) commanded_state_log_ << "," << u(0) << "," << u(1) << "," << u(2) << "," << u(3);
+        if (u.size() >= 4) commanded_state_log_ << "," << u(0) << "," << u(1)
+                                                 << "," << u(2) << "," << u(3);
         else commanded_state_log_ << ",0,0,0,0";
         commanded_state_log_ << "\n";
         commanded_state_log_.flush();
     }
 
-    void printDiagnostics(const SolverResult& result)
-    {
-        Eigen::VectorXd snap;
-        { std::lock_guard<std::mutex> lk(state_mutex_); snap = current_state_; }
-        int replay_idx;
-        { std::lock_guard<std::mutex> lk(mpc_traj_mutex_); replay_idx = mpc_replay_idx_; }
-        double thrust = result.control_trajectory.empty() ? 0.0 : result.control_trajectory[0](0);
-        RCLCPP_INFO(this->get_logger(),
-            "[%s] %.1fms | pos[%.3f,%.3f,%.3f] vel[%.3f,%.3f,%.3f] "
-            "w[%.3f,%.3f,%.3f]rad/s | T=%.3fN | replay_idx=%d",
-            solver_type_.c_str(), result.solve_time_ms,
-            snap(0),snap(1),snap(2), snap(3),snap(4),snap(5),
-            snap(10),snap(11),snap(12), thrust, replay_idx);
-    }
-
     // ─────────────────────────────────────────────────────────────────────────
-    //  Members
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // Config
     std::string ocp_type_, platform_, solver_type_, mode_, drone_name_;
     bool        logging_enabled_;
-    int         solver_rate_;
-    double      ocp_dt_  = 0.1;
-    int         n_shift_ = 1;
+    double      ocp_dt_ = 0.05;
+    int         n_replay_ = 4;   // nodes replayed between solves == n_shift
 
-    // Solvers
     std::unique_ptr<QuadrotorMPC> alipddp_mpc_;
 #ifdef HAS_ACADOS
     std::unique_ptr<AcadosMPC>    acados_mpc_;
 #endif
 
-    // Crazyflie
     rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr cf_cmd_pub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr   pose_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr           odom_sub_;
 
-    // PX4
 #ifdef HAS_PX4_MSGS
     rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr  px4_setpoint_pub_;
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr px4_offboard_pub_;
@@ -870,55 +593,33 @@ private:
     rclcpp::TimerBase::SharedPtr                                     px4_heartbeat_timer_;
 #endif
 
-    // Shared publishers/timers
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
     rclcpp::TimerBase::SharedPtr solver_timer_;
-    rclcpp::TimerBase::SharedPtr mpc_replay_timer_;
     rclcpp::TimerBase::SharedPtr startup_timer_;
     rclcpp::TimerBase::SharedPtr replay_timer_;
 
-    // State
     Eigen::VectorXd current_state_;
     bool pose_received_ = false;
     bool odom_received_ = false;
     bool is_flying_     = false;
 
-    // MPC committed trajectory
-    std::mutex                   mpc_traj_mutex_;
-    std::vector<Eigen::VectorXd> mpc_traj_;
-    std::vector<Eigen::VectorXd> mpc_ctrl_;
-    int                          mpc_replay_idx_ = 0;
-
-    // Transition blend: smooths jumps when consecutive solves find different
-    // local optima.  When a new trajectory arrives we record the last commanded
-    // state and linearly interpolate over BLEND_STEPS replay ticks.
-    static constexpr int         BLEND_STEPS = 6;   // ~300ms at 20 Hz
-    Eigen::VectorXd              blend_from_;
-    int                          blend_steps_remaining_ = 0;
-
-    // Threading
     mutable std::mutex               state_mutex_;
     rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
     rclcpp::CallbackGroup::SharedPtr solver_cb_group_;
-    rclcpp::CallbackGroup::SharedPtr replay_cb_group_;
 
-    // MPC diagnostics
-    int diag_count_ = 0;
+    int solve_count_ = 0;
 
-    // Open-loop
     std::vector<Eigen::VectorXd> ol_ref_X_, ol_ref_U_;
     int ol_replay_step_ = 0;
     bool ol_done_logged_ = false;
     Clock::time_point ol_replay_start_time_;
 
-    // Logging
     bool          logging_initialized_ = false;
     std::string   log_folder_;
-    std::ofstream commanded_state_log_, actual_state_log_, all_solves_log_, published_commands_log_;
-    int           solve_count_ = 0;
+    std::ofstream commanded_state_log_, actual_state_log_,
+                  all_solves_log_, published_commands_log_;
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);

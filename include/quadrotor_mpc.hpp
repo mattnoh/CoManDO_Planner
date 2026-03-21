@@ -58,10 +58,12 @@ public:
 
     void   setTerminalState(const Eigen::VectorXd& terminal);
     double getOcpDt() const;
+    double last_solve_ms_ = 0.0;
+
 
 private:
     void setupProblem(const Eigen::VectorXd& current_state);
-    void shiftWarmStart();
+    void shiftWarmStart(int n_shift);          // was shiftWarmStart()
 
     Config                                         config_;
     std::shared_ptr<OptimalControlProblem<double>> problem_;
@@ -70,9 +72,5 @@ private:
 
     std::vector<Eigen::VectorXd>  prev_X_;
     std::vector<Eigen::VectorXd>  prev_U_;
-    bool                          has_prev_solution_   = false;
-    // Rebuilt on the first solve and whenever setTerminalState() is called.
-    // Avoids re-running create() on every tick — the cost landscape is
-    // identical between solves for the same target.
     bool                          need_problem_rebuild_ = true;
 };
