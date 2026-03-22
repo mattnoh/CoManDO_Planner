@@ -25,6 +25,7 @@
 #include <iomanip>
 #include <cmath>
 #include <mutex>
+#include <atomic>
 #include <Eigen/Dense>
 
 using namespace std::chrono_literals;
@@ -42,12 +43,25 @@ inline Eigen::Quaterniond quat_enu_to_ned(const Eigen::Quaterniond& q) {
 inline Eigen::Vector3d omega_frd_to_flu(const Eigen::Vector3d& w) { return {w.x(), -w.y(), -w.z()}; }
 }
 
+// Compute world-frame acceleration from state + thrust control.
+// a = R * [0; 0; fz/m] + [0; 0; -9.81]
+static Eigen::Vector3d computeAcc(const Eigen::VectorXd& s, double fz,
+                                  double mass = 0.027)
+{
+    Eigen::Quaterniond q(s(6), s(7), s(8), s(9));
+    Eigen::Vector3d thrust_body(0.0, 0.0, fz / mass);
+    Eigen::Vector3d acc = q.toRotationMatrix() * thrust_body;
+    acc(2) -= 9.81;
+    return acc;
+}
+
 struct SolverResult {
-    bool                          success   = false;
+    bool                          success       = false;
     Eigen::VectorXd               next_state;
     std::vector<Eigen::VectorXd>  state_trajectory;
     std::vector<Eigen::VectorXd>  control_trajectory;
     double                        solve_time_ms = 0.0;
+    int                           solve_iters   = 0;
     std::chrono::steady_clock::time_point solve_timestamp;
 };
 
@@ -63,11 +77,11 @@ public:
         this->declare_parameter("hover_target_x", 0.0);
         this->declare_parameter("hover_target_y", 0.0);
         this->declare_parameter("hover_target_z", 1.0);
-        // Fixed number of trajectory nodes to replay between solves.
-        // During replay the drone tracks X[1..n_replay] at ocp_dt spacing.
-        // n_shift in QuadrotorMPC is set to the same value so warm-start
-        // U alignment is exact.
-        // At ocp_dt=0.05s: n_replay=4 → 200ms of tracking per solve cycle.
+        // n_replay: exact number of replay ticks that must fire after each solve
+        // before the next solve is allowed to start. This is also the warm-start
+        // shift applied to prev_U. Both must be the same integer — do not derive
+        // either from wall-clock time.
+        // At ocp_dt=0.05s: n_replay=4 → 200ms between solves.
         this->declare_parameter("n_replay", 4);
 
         ocp_type_        = this->get_parameter("ocp_type").as_string();
@@ -92,7 +106,7 @@ public:
             QuadrotorMPC::Config cfg;
             cfg.ocp_type       = ocp_type_;
             cfg.terminal_state = terminal;
-            cfg.n_shift        = n_replay_;   // fixed: matches replay count
+            cfg.n_shift        = n_replay_;
             alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
         }
 #ifdef HAS_ACADOS
@@ -109,6 +123,11 @@ public:
         current_state_ = Eigen::VectorXd::Zero(13);
         current_state_(6) = 1.0;
 
+        // Initialise to n_replay_ so the very first solverLoop call fires
+        // immediately without waiting for ticks. Must match n_replay_ exactly —
+        // hardcoding 4 here was the bug when n_replay != 4.
+        replay_ticks_since_solve_.store(n_replay_);
+
         sensor_cb_group_ = this->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
         solver_cb_group_ = this->create_callback_group(
@@ -123,15 +142,15 @@ public:
             "/" + drone_name_ + "/planned_trajectory", 10);
 
         if (mode_ == "mpc") {
-            // Solver timer: runs as fast as possible, blocks on each solve.
-            // When done swaps mpc_traj_ and resets replay idx to 1.
+            // Solver timer: polls at 1ms but only actually solves once
+            // replay_ticks_since_solve_ >= n_replay_.
             solver_timer_ = this->create_wall_timer(
                 1ms,
                 std::bind(&PlannerNode::solverLoop, this),
                 solver_cb_group_);
 
-            // Replay timer: fires every ocp_dt (50ms) independently.
-            // Streams mpc_traj_[idx++] with no gaps — no sleep in solver.
+            // Replay timer: fires every ocp_dt, streams mpc_traj_[idx++],
+            // increments replay_ticks_since_solve_.
             const int replay_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
             mpc_replay_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(replay_ms),
@@ -182,6 +201,7 @@ private:
 
         rclcpp::SubscriptionOptions opts;
         opts.callback_group = sensor_cb_group_;
+
         px4_odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
             "/fmu/out/vehicle_odometry", 10,
             std::bind(&PlannerNode::px4OdomCallback, this, std::placeholders::_1), opts);
@@ -224,7 +244,9 @@ private:
         auto pos = frame_conv::ned_to_enu({msg->position[0], msg->position[1], msg->position[2]});
         auto vel = frame_conv::ned_to_enu({msg->velocity[0], msg->velocity[1], msg->velocity[2]});
         auto q   = frame_conv::quat_ned_to_enu(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
-        auto w   = frame_conv::omega_frd_to_flu({msg->angular_velocity[0], msg->angular_velocity[1], msg->angular_velocity[2]});
+        auto w   = frame_conv::omega_frd_to_flu({msg->angular_velocity[0],
+                                                  msg->angular_velocity[1],
+                                                  msg->angular_velocity[2]});
         std::lock_guard<std::mutex> lk(state_mutex_);
         current_state_ << pos.x(), pos.y(), pos.z(),
                           vel.x(), vel.y(), vel.z(),
@@ -262,8 +284,11 @@ private:
 #endif
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  SOLVER LOOP — blocks on solve, then swaps trajectory buffer.
-    //  No sleep. Replay timer handles all command streaming independently.
+    //  SOLVER LOOP — polls at 1ms but only solves once n_replay_ ticks have
+    //  fired since the last solve completed. This guarantees:
+    //    (a) the replay window is fully served before the next trajectory is issued
+    //    (b) the warm-start shift in QuadrotorMPC::solve() is exactly n_replay_
+    //        steps, matching how many steps were actually executed
     // ─────────────────────────────────────────────────────────────────────────
     void solverLoop()
     {
@@ -282,6 +307,11 @@ private:
             return;
         }
 
+        // Gate: don't solve until n_replay_ ticks have fired since last solve.
+        // First solve is gated the same way: replay_ticks_since_solve_ starts
+        // at n_replay_ so the very first call goes through immediately.
+        if (replay_ticks_since_solve_.load() < n_replay_) return;
+
         if (!is_flying_) {
             is_flying_ = true;
             RCLCPP_INFO(this->get_logger(),
@@ -298,7 +328,8 @@ private:
                 x0(0),x0(1),x0(2), x0(3),x0(4),x0(5));
         }
 
-        // Blocks for solve duration. Replay timer keeps firing during this time.
+        // Blocks for solve duration. Replay timer keeps firing during this time
+        // but the buffer has not been swapped yet so it holds at the last node.
         SolverResult result = callSolver(x0);
 
         if (!result.success || result.state_trajectory.size() < 2) {
@@ -307,59 +338,76 @@ private:
             x_hold.segment(3,3).setZero();
             x_hold.segment(10,3).setZero();
             publishCommand(x_hold, Eigen::VectorXd::Zero(4));
+            // Do not reset tick counter — try again next n_replay_ ticks.
             return;
         }
 
         RCLCPP_INFO(this->get_logger(),
-            "[RH %d] %.1fms  x0=[%.3f,%.3f,%.3f]",
-            solve_count_, result.solve_time_ms,
+            "[RH %d] %.1fms  iters=%d  x0=[%.3f,%.3f,%.3f]",
+            solve_count_, result.solve_time_ms, result.solve_iters,
             x0(0), x0(1), x0(2));
 
-        // Swap — replay timer picks up from idx=1 on next tick.
+        // Swap buffer and reset replay state atomically.
+        // replay_ticks_since_solve_ is reset to 0 AFTER the swap so the replay
+        // timer immediately starts consuming the new trajectory from idx=1.
         {
             std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
-            mpc_traj_       = result.state_trajectory;
-            mpc_ctrl_       = result.control_trajectory;
-            mpc_replay_idx_ = 1;
+            mpc_traj_            = result.state_trajectory;
+            mpc_ctrl_            = result.control_trajectory;
+            mpc_replay_idx_      = 1;
+            mpc_active_solve_num_ = solve_count_;
         }
+        replay_ticks_since_solve_.store(0);
 
         publishTrajectory(result.state_trajectory);
 
         if (logging_enabled_ && logging_initialized_)
             logSolveTrajectory(result.state_trajectory,
                                result.control_trajectory,
-                               result.solve_time_ms);
+                               result.solve_time_ms,
+                               result.solve_iters);
 
         ++solve_count_;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  REPLAY TICK — fires every ocp_dt (50ms), streams mpc_traj_[idx++].
-    //  Runs independent of solver — no gaps ever.
+    //  REPLAY TICK — fires every ocp_dt, streams mpc_traj_[idx++].
+    //  Increments replay_ticks_since_solve_ so solverLoop knows when to fire.
     // ─────────────────────────────────────────────────────────────────────────
     void mpcReplayTick()
     {
         Eigen::VectorXd x_cmd, u_cmd;
+        int active_solve_num = -1;
         {
             std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
-            if (mpc_traj_.empty()) return;
+            if (mpc_traj_.empty()) {
+                // No trajectory yet — still count the tick so the first solve
+                // fires as soon as state is available.
+                replay_ticks_since_solve_.fetch_add(1);
+                return;
+            }
 
             const int N   = (int)mpc_traj_.size() - 1;
             const int idx = std::min(mpc_replay_idx_, N);
-            x_cmd = mpc_traj_[idx];
-            u_cmd = (idx < (int)mpc_ctrl_.size())
-                ? mpc_ctrl_[idx] : Eigen::VectorXd::Zero(4);
+            x_cmd          = mpc_traj_[idx];
+            u_cmd          = (idx < (int)mpc_ctrl_.size())
+                           ? mpc_ctrl_[idx] : Eigen::VectorXd::Zero(4);
+            active_solve_num = mpc_active_solve_num_;
 
             if (mpc_replay_idx_ < N) ++mpc_replay_idx_;
         }
+
+        // Count tick AFTER reading the buffer so the solver doesn't start
+        // before we've actually sent the setpoint for this step.
+        replay_ticks_since_solve_.fetch_add(1);
 
         publishCommand(x_cmd, u_cmd);
 
         if (logging_enabled_ && logging_initialized_) {
             Eigen::VectorXd act;
             { std::lock_guard<std::mutex> lk(state_mutex_); act = current_state_; }
-            logActualState(act);
-            logCommandedState(x_cmd, u_cmd);
+            logActualState(act, active_solve_num);
+            logCommandedState(x_cmd, u_cmd, active_solve_num);
         }
     }
 
@@ -374,6 +422,7 @@ private:
             result.state_trajectory   = r.state_trajectory;
             result.control_trajectory = r.control_trajectory;
             result.solve_time_ms      = r.solve_time_ms;
+            result.solve_iters        = r.solve_iters;
             result.solve_timestamp    = r.solve_timestamp;
         }
 #ifdef HAS_ACADOS
@@ -399,6 +448,9 @@ private:
 
     void publishCrazyflieCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u)
     {
+        const double fz = (u.size() >= 1) ? u(0) : 0.0;
+        Eigen::Vector3d acc = computeAcc(s, fz);
+
         crazyflie_interfaces::msg::FullState msg;
         msg.header.stamp    = this->now();
         msg.header.frame_id = "world";
@@ -407,15 +459,10 @@ private:
         msg.pose.orientation.w = s(6); msg.pose.orientation.x = s(7);
         msg.pose.orientation.y = s(8); msg.pose.orientation.z = s(9);
         msg.twist.angular.x    = s(10); msg.twist.angular.y   = s(11); msg.twist.angular.z   = s(12);
-        msg.acc.x = 0; msg.acc.y = 0; msg.acc.z = 0;
+        msg.acc.x = static_cast<float>(acc.x());
+        msg.acc.y = static_cast<float>(acc.y());
+        msg.acc.z = static_cast<float>(acc.z());
         cf_cmd_pub_->publish(msg);
-
-        if (published_commands_log_.is_open()) {
-            published_commands_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
-            for (int i = 0; i < 13; ++i) published_commands_log_ << "," << s(i);
-            published_commands_log_ << ",0,0,0\n";
-            published_commands_log_.flush();
-        }
     }
 
     void publishPX4Command(const Eigen::VectorXd& s)
@@ -430,7 +477,8 @@ private:
         sp.timestamp   = this->now().nanoseconds() / 1000;
         sp.position[0] = pos.x(); sp.position[1] = pos.y(); sp.position[2] = pos.z();
         sp.velocity[0] = vel.x(); sp.velocity[1] = vel.y(); sp.velocity[2] = vel.z();
-        sp.acceleration[0] = sp.acceleration[1] = sp.acceleration[2] = std::numeric_limits<float>::quiet_NaN();
+        sp.acceleration[0] = sp.acceleration[1] = sp.acceleration[2] =
+            std::numeric_limits<float>::quiet_NaN();
         sp.jerk[0] = sp.jerk[1] = sp.jerk[2] = std::numeric_limits<float>::quiet_NaN();
         sp.yaw = static_cast<float>(yaw);
         sp.yawspeed = std::numeric_limits<float>::quiet_NaN();
@@ -475,8 +523,11 @@ private:
         }
         ol_ref_X_ = result.state_trajectory;
         ol_ref_U_ = result.control_trajectory;
-        if (logging_enabled_) { setupLogging(); logging_initialized_ = true;
-            logSolveTrajectory(ol_ref_X_, ol_ref_U_, result.solve_time_ms); }
+        if (logging_enabled_) {
+            setupLogging(); logging_initialized_ = true;
+            logSolveTrajectory(ol_ref_X_, ol_ref_U_,
+                               result.solve_time_ms, result.solve_iters);
+        }
         publishTrajectory(ol_ref_X_);
         ol_replay_step_ = 0;
         ol_replay_start_time_ = Clock::now();
@@ -490,14 +541,17 @@ private:
 
     void openLoopReplayTick()
     {
-        const int N = (int)ol_ref_X_.size() - 1;
+        const int N    = (int)ol_ref_X_.size() - 1;
         const int step = std::min(ol_replay_step_, N);
-        publishCommand(ol_ref_X_[step],
-            (step < (int)ol_ref_U_.size()) ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4));
+        const Eigen::VectorXd& x_cmd = ol_ref_X_[step];
+        const Eigen::VectorXd  u_cmd = (step < (int)ol_ref_U_.size())
+                                     ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4);
+        publishCommand(x_cmd, u_cmd);
         if (logging_enabled_ && logging_initialized_) {
-            Eigen::VectorXd act; { std::lock_guard<std::mutex> lk(state_mutex_); act = current_state_; }
-            logActualState(act); logCommandedState(ol_ref_X_[step],
-                (step < (int)ol_ref_U_.size()) ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4));
+            Eigen::VectorXd act;
+            { std::lock_guard<std::mutex> lk(state_mutex_); act = current_state_; }
+            logActualState(act, 0);
+            logCommandedState(x_cmd, u_cmd, 0);
         }
         if (ol_replay_step_ < N) ++ol_replay_step_;
         else if (!ol_done_logged_) {
@@ -519,19 +573,31 @@ private:
                            + mode_ + "_" + solver_type_ + "_" + ts.str();
         std::filesystem::create_directories(folder);
         log_folder_ = folder;
-        commanded_state_log_.open(folder + "/commanded_state.csv");
-        if (commanded_state_log_.is_open())
-            commanded_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,fz,mx,my,mz\n";
-        actual_state_log_.open(folder + "/actual_state.csv");
-        if (actual_state_log_.is_open())
-            actual_state_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
+
+        // all_solves: one row per trajectory node per solve
+        // columns: solve_num, solve_time_ms, solve_iters, node, t, state(13), control(4)
         all_solves_log_.open(folder + "/all_solves.csv");
         if (all_solves_log_.is_open())
-            all_solves_log_ << "solve_num,solve_time_ms,node,t,"
-                               "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,fz,mx,my,mz\n";
-        published_commands_log_.open(folder + "/published_commands.csv");
-        if (published_commands_log_.is_open())
-            published_commands_log_ << "timestamp,x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,acc_x,acc_y,acc_z\n";
+            all_solves_log_ << "solve_num,solve_time_ms,solve_iters,node,t,"
+                               "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
+                               "fz,mx,my,mz\n";
+
+        // commanded_state: one row per replay tick (merged with published_commands)
+        // columns: timestamp, solve_num, state(13), control(4), acc(3)
+        commanded_state_log_.open(folder + "/commanded_state.csv");
+        if (commanded_state_log_.is_open())
+            commanded_state_log_ << "timestamp,solve_num,"
+                                    "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
+                                    "fz,mx,my,mz,"
+                                    "acc_x,acc_y,acc_z\n";
+
+        // actual_state: one row per replay tick (measured state)
+        // columns: timestamp, solve_num, state(13)
+        actual_state_log_.open(folder + "/actual_state.csv");
+        if (actual_state_log_.is_open())
+            actual_state_log_ << "timestamp,solve_num,"
+                                 "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
+
         RCLCPP_INFO(this->get_logger(), "Logging to: %s", folder.c_str());
     }
 
@@ -541,41 +607,60 @@ private:
 
     void logSolveTrajectory(const std::vector<Eigen::VectorXd>& traj,
                             const std::vector<Eigen::VectorXd>& ctrls,
-                            double solve_time_ms)
+                            double solve_time_ms,
+                            int    solve_iters)
     {
         if (!all_solves_log_.is_open()) return;
         for (int i = 0; i < (int)traj.size(); ++i) {
             const auto& s = traj[i];
             if (s.size() < 13) continue;
             all_solves_log_ << std::fixed << std::setprecision(6)
-                << solve_count_ << "," << solve_time_ms << "," << i << "," << (i * ocp_dt_);
+                << solve_count_ << ","
+                << solve_time_ms << ","
+                << solve_iters << ","
+                << i << ","
+                << (i * ocp_dt_);
             for (int j = 0; j < 13; ++j) all_solves_log_ << "," << s(j);
             if (i < (int)ctrls.size() && ctrls[i].size() >= 4)
                 all_solves_log_ << "," << ctrls[i](0) << "," << ctrls[i](1)
                                 << "," << ctrls[i](2) << "," << ctrls[i](3);
-            else all_solves_log_ << ",0,0,0,0";
+            else
+                all_solves_log_ << ",0,0,0,0";
             all_solves_log_ << "\n";
         }
         all_solves_log_.flush();
     }
 
-    void logActualState(const Eigen::VectorXd& state)
+    // actual_state: logged with the solve_num of the trajectory currently
+    // being replayed, so you can align measured vs commanded per-solve.
+    void logActualState(const Eigen::VectorXd& state, int solve_num)
     {
         if (!actual_state_log_.is_open()) return;
-        actual_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
+        actual_state_log_ << std::fixed << std::setprecision(6)
+            << wallTimeSec() << "," << solve_num;
         for (int i = 0; i < 13; ++i) actual_state_log_ << "," << state(i);
         actual_state_log_ << "\n";
         actual_state_log_.flush();
     }
 
-    void logCommandedState(const Eigen::VectorXd& s, const Eigen::VectorXd& u)
+    // commanded_state: state + control + computed acceleration, all in one row.
+    // Replaces the old split commanded_state + published_commands logs.
+    void logCommandedState(const Eigen::VectorXd& s, const Eigen::VectorXd& u,
+                           int solve_num)
     {
         if (!commanded_state_log_.is_open() || s.size() < 13) return;
-        commanded_state_log_ << std::fixed << std::setprecision(6) << wallTimeSec();
+        const double fz = (u.size() >= 1) ? u(0) : 0.0;
+        Eigen::Vector3d acc = computeAcc(s, fz);
+
+        commanded_state_log_ << std::fixed << std::setprecision(6)
+            << wallTimeSec() << "," << solve_num;
         for (int i = 0; i < 13; ++i) commanded_state_log_ << "," << s(i);
-        if (u.size() >= 4) commanded_state_log_ << "," << u(0) << "," << u(1)
-                                                 << "," << u(2) << "," << u(3);
-        else commanded_state_log_ << ",0,0,0,0";
+        if (u.size() >= 4)
+            commanded_state_log_ << "," << u(0) << "," << u(1)
+                                 << "," << u(2) << "," << u(3);
+        else
+            commanded_state_log_ << ",0,0,0,0";
+        commanded_state_log_ << "," << acc.x() << "," << acc.y() << "," << acc.z();
         commanded_state_log_ << "\n";
         commanded_state_log_.flush();
     }
@@ -583,8 +668,8 @@ private:
     // ─────────────────────────────────────────────────────────────────────────
     std::string ocp_type_, platform_, solver_type_, mode_, drone_name_;
     bool        logging_enabled_;
-    double      ocp_dt_ = 0.05;
-    int         n_replay_ = 4;   // nodes replayed between solves == n_shift
+    double      ocp_dt_   = 0.05;
+    int         n_replay_ = 4;
 
     std::unique_ptr<QuadrotorMPC> alipddp_mpc_;
 #ifdef HAS_ACADOS
@@ -609,11 +694,16 @@ private:
     rclcpp::TimerBase::SharedPtr startup_timer_;
     rclcpp::TimerBase::SharedPtr replay_timer_;
 
-    // Shared trajectory buffer between solver and replay timer
+    // ── MPC trajectory buffer (solver ↔ replay timer) ────────────────────────
     std::mutex                   mpc_traj_mutex_;
     std::vector<Eigen::VectorXd> mpc_traj_;
     std::vector<Eigen::VectorXd> mpc_ctrl_;
-    int                          mpc_replay_idx_ = 1;
+    int                          mpc_replay_idx_       = 1;
+    int                          mpc_active_solve_num_ = -1; // solve that owns current buffer
+
+    // Tick counter: replay timer increments this; solverLoop gates on n_replay_.
+    // Initialised to n_replay_ so the very first solve fires without waiting.
+    std::atomic<int>             replay_ticks_since_solve_{0}; // set to n_replay_ in ctor
 
     Eigen::VectorXd current_state_;
     bool pose_received_ = false;
@@ -627,6 +717,7 @@ private:
 
     int solve_count_ = 0;
 
+    // Open-loop state
     std::vector<Eigen::VectorXd> ol_ref_X_, ol_ref_U_;
     int ol_replay_step_ = 0;
     bool ol_done_logged_ = false;
@@ -634,8 +725,9 @@ private:
 
     bool          logging_initialized_ = false;
     std::string   log_folder_;
-    std::ofstream commanded_state_log_, actual_state_log_,
-                  all_solves_log_, published_commands_log_;
+    std::ofstream commanded_state_log_;   // commanded state + control + acc (merged)
+    std::ofstream actual_state_log_;      // measured state with solve_num tag
+    std::ofstream all_solves_log_;        // full trajectory per solve with iters
 };
 
 int main(int argc, char** argv)

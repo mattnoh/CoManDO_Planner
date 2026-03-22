@@ -14,7 +14,6 @@ public:
     struct Config {
         std::string ocp_type = "hover";
 
-        // Physical parameters (kept for compatibility, OCPs also have their own)
         int              horizon   = 30;
         double           dt        = 0.02;
         double           mass      = 0.027;
@@ -26,44 +25,39 @@ public:
         Eigen::VectorXd  terminal_state;
         double           max_thrust = 0.6;
 
-        // How many OCP steps to shift the warm-start forward on each solve.
-        // Should equal round( solver_period / ocp_dt ).
-        // When solver_rate == 1/ocp_dt (the recommended setting), this is 1.
-        // Set via PlannerNode at construction time — not changed per-call.
+        // n_shift: how many U steps to shift the warm-start on each solve.
+        // Set once by PlannerNode to n_replay_ — do not compute from solve time.
         int n_shift = 1;
 
         Config() {
             terminal_state = Eigen::VectorXd::Zero(13);
-            terminal_state(2) = 1.0;   // hover at z=1 m
-            terminal_state(6) = 1.0;   // upright quaternion
+            terminal_state(2) = 1.0;
+            terminal_state(6) = 1.0;
         }
     };
 
     struct Result {
-        bool                          success   = false;
+        bool                          success       = false;
         Eigen::VectorXd               next_state;
         std::vector<Eigen::VectorXd>  state_trajectory;
         std::vector<Eigen::VectorXd>  control_trajectory;
         double                        solve_time_ms = 0.0;
+        int                           solve_iters   = 0;   // ALIPDDP iteration count
         std::chrono::steady_clock::time_point solve_timestamp;
     };
 
     explicit QuadrotorMPC(const Config& config = Config());
     ~QuadrotorMPC() = default;
 
-    // solve() signature is unchanged — n_shift is read from config_.n_shift.
-    // PX4 pattern: the caller sets n_shift once at construction via Config,
-    // not on every solve call.
     Result solve(const Eigen::VectorXd& current_state);
 
     void   setTerminalState(const Eigen::VectorXd& terminal);
     double getOcpDt() const;
     double last_solve_ms_ = 0.0;
 
-
 private:
     void setupProblem(const Eigen::VectorXd& current_state);
-    void shiftWarmStart(int n_shift);          // was shiftWarmStart()
+    void shiftWarmStart(int n_shift);
 
     Config                                         config_;
     std::shared_ptr<OptimalControlProblem<double>> problem_;
@@ -72,5 +66,4 @@ private:
 
     std::vector<Eigen::VectorXd>  prev_X_;
     std::vector<Eigen::VectorXd>  prev_U_;
-    bool                          need_problem_rebuild_ = true;
 };

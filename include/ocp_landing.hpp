@@ -105,8 +105,8 @@ const double SOLVER_REG2_MIN  = 1e-2;
 const double SOLVER_MU_MUL    = 0.1;
 const double SOLVER_RHO       = 10.0;
 const double SOLVER_RHO_MUL   = 10.0;
-const double SOLVER_TOLERANCE = 0.05;
-const int    SOLVER_MAX_ITER  = 300;
+const double SOLVER_TOLERANCE = 1e-6;
+const int    SOLVER_MAX_ITER  = 500;
 const double SOLVER_RHOT      = 1.0;
 
 // ── Q: running state cost ─────────────────────────────────────────────────────
@@ -505,32 +505,17 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
 
     prob->setInitialState(0, current_state);
 
-    // Seed initial controls AND states by rolling out dynamics with prev_U.
-    // Without state guesses at nodes 1..N the solver cold-starts the state
-    // trajectory every solve even when controls are warm — ~155ms every time.
-    // With a consistent (x,u) rollout the solver converges in ~14ms.
-    // On cold start prev_U is empty — hover thrust rollout is used instead.
+    // Set initial controls ONLY — do NOT set states for nodes 1..N.
+    // ALIPDDP::init() performs its own internal forward rollout from x0 using
+    // these controls to produce a dynamically consistent state trajectory.
+    // Any setInitialState(i+1) we call here is either overwritten by init()
+    // or — if our integrator differs from the solver's — hands it inconsistent
+    // (x, u) pairs that corrupt the first backward pass.
     const Eigen::VectorXd u_hover = make_u_ref();
-
-    // Build a temporary dynamics object for the rollout
-    auto dyn_rollout = std::make_shared<Quad6DOF<double>>();
-    dyn_rollout->setMass(MASS);
-    dyn_rollout->setGravity(Eigen::Vector3d(0.0, 0.0, -9.81));
-    dyn_rollout->setJb(INERTIA);
-    dyn_rollout->setDt(DT);
-
-    Eigen::VectorXd x_sim = current_state;
     for (int i = 0; i < HORIZON; ++i) {
-        const Eigen::VectorXd& u0 =
+        const Eigen::VectorXd& u_ctrl =
             (prev_U.size() > static_cast<size_t>(i)) ? prev_U[i] : u_hover;
-        prob->setInitialControl(i, u0);
-
-        // Propagate one step and set next state guess
-        Eigen::VectorXd x_next = dyn_rollout->f(x_sim, u0);
-        // Clamp z >= 0
-        if (x_next(2) < 0.0) x_next(2) = 0.0;
-        prob->setInitialState(i + 1, x_next);
-        x_sim = x_next;
+        prob->setInitialControl(i, u_ctrl);
     }
 
     return prob;
