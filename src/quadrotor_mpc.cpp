@@ -26,11 +26,9 @@ void QuadrotorMPC::shiftWarmStart(int n_shift) {
     const int Nu = (int)prev_U_.size();
     n_shift = std::max(1, std::min(n_shift, Nu - 1));
 
-    // Shift only U — NOT X.
-    // Shifting X without the corresponding IPM dual variables creates an
-    // inconsistent warm-start. The solver rolls out X from x0 during init(),
-    // using the shifted U as the primal warm-start. That gives ~14ms solves.
-    // Shifting X as well keeps solves at ~155ms every time.
+    // Shift U only — not X.
+    // The solver rolls out X internally from x0 during init().
+    // Shifting a stale X overwrites that rollout and kills warm-start.
     std::vector<Eigen::VectorXd> su(Nu);
     for (int i = 0; i < Nu; ++i)
         su[i] = prev_U_[std::min(i + n_shift, Nu - 1)];
@@ -39,8 +37,6 @@ void QuadrotorMPC::shiftWarmStart(int n_shift) {
 
 void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state) {
     try {
-        // Pass prev_U_ only. prev_X_ is not passed — trajectory consistency
-        // penalty is disabled and passing a shifted X breaks warm-start.
         problem_ = OCPRegistry::create(
             config_.ocp_type, current_state, config_.terminal_state,
             prev_U_, {});
@@ -58,19 +54,23 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
     Result result;
     result.success = false;
     auto t0 = chrono::high_resolution_clock::now();
-    const double ocp_dt_ms = OCPRegistry::getDT(config_.ocp_type) * 1000.0;
 
     try {
         Eigen::VectorXd x0_ocp = current_state;
         x0_ocp.segment(10, 3).setZero();
 
         if (!prev_U_.empty()) {
+            // n_shift is fixed = config_.n_shift = n_replay_ (set by PlannerNode).
+            // This is the number of replay ticks that fire between solves, so it
+            // is constant regardless of actual solve wall-time.
+            // Using last_solve_ms_ to compute this dynamically was wrong: when
+            // solve time drifts from n_replay_*ocp_dt the warm-start U is shifted
+            // by a different amount than the replay timer has actually advanced,
+            // producing a misaligned (corrupted) warm-start every subsequent solve.
             shiftWarmStart(config_.n_shift);
         }
 
-        // Rebuild OCP with fresh x0 and shifted prev_U as primal warm-start.
-        // prev_X_ intentionally NOT passed — trajectory consistency penalty
-        // is disabled (W_TRAJ=0) and shifting X breaks warm-start alignment.
+        // Rebuild problem with shifted warm-start.
         setupProblem(x0_ocp);
 
         // Recreate solver from the NEW problem every solve.
@@ -96,9 +96,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
             prev_X_                   = X_result;
             prev_U_                   = U_result;
             std::cout << "[MPC] solve took " << result.solve_time_ms
-                      << "ms  n_shift_next="
-                      << std::max(1, (int)std::round(result.solve_time_ms / ocp_dt_ms))
-                      << "\n";
+                      << "ms  n_shift=" << config_.n_shift << "\n";
         } else {
             std::cerr << "ERROR: Empty trajectory\n";
             last_solve_ms_ = 0.0;

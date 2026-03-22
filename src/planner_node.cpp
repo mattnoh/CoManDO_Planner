@@ -63,6 +63,12 @@ public:
         this->declare_parameter("hover_target_x", 0.0);
         this->declare_parameter("hover_target_y", 0.0);
         this->declare_parameter("hover_target_z", 1.0);
+        // Fixed number of trajectory nodes to replay between solves.
+        // During replay the drone tracks X[1..n_replay] at ocp_dt spacing.
+        // n_shift in QuadrotorMPC is set to the same value so warm-start
+        // U alignment is exact.
+        // At ocp_dt=0.05s: n_replay=4 → 200ms of tracking per solve cycle.
+        this->declare_parameter("n_replay", 4);
 
         ocp_type_        = this->get_parameter("ocp_type").as_string();
         drone_name_      = this->get_parameter("drone_name").as_string();
@@ -70,6 +76,7 @@ public:
         platform_        = this->get_parameter("platform").as_string();
         solver_type_     = this->get_parameter("solver").as_string();
         mode_            = this->get_parameter("mode").as_string();
+        n_replay_        = this->get_parameter("n_replay").as_int();
 
         double tx = this->get_parameter("hover_target_x").as_double();
         double ty = this->get_parameter("hover_target_y").as_double();
@@ -85,6 +92,7 @@ public:
             QuadrotorMPC::Config cfg;
             cfg.ocp_type       = ocp_type_;
             cfg.terminal_state = terminal;
+            cfg.n_shift        = n_replay_;   // fixed: matches replay count
             alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
         }
 #ifdef HAS_ACADOS
@@ -93,6 +101,7 @@ public:
             cfg.ocp_type       = ocp_type_;
             cfg.terminal_state = terminal;
             cfg.dt             = ocp_dt_;
+            cfg.n_shift        = n_replay_;
             acados_mpc_ = std::make_unique<AcadosMPC>(cfg);
         }
 #endif
@@ -114,17 +123,15 @@ public:
             "/" + drone_name_ + "/planned_trajectory", 10);
 
         if (mode_ == "mpc") {
-            // Solver timer: runs as fast as possible (1ms), blocks on solve.
-            // When solve finishes: swaps mpc_traj_, resets replay idx to 1.
+            // Solver timer: runs as fast as possible, blocks on each solve.
+            // When done swaps mpc_traj_ and resets replay idx to 1.
             solver_timer_ = this->create_wall_timer(
                 1ms,
                 std::bind(&PlannerNode::solverLoop, this),
                 solver_cb_group_);
 
             // Replay timer: fires every ocp_dt (50ms) independently.
-            // Streams mpc_traj_[idx++] to the drone with NO gaps.
-            // While the solver is blocked (~160ms), ~3 ticks fire and the
-            // drone gets 3 setpoints. n_shift = round(solve_ms/ocp_dt) to match.
+            // Streams mpc_traj_[idx++] with no gaps — no sleep in solver.
             const int replay_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
             mpc_replay_timer_ = this->create_wall_timer(
                 std::chrono::milliseconds(replay_ms),
@@ -137,9 +144,10 @@ public:
         }
 
         RCLCPP_INFO(this->get_logger(),
-            "Ready  mode=%s  platform=%s  solver=%s  ocp=%s  ocp_dt=%.3fs",
+            "Ready  mode=%s  platform=%s  solver=%s  ocp=%s  "
+            "ocp_dt=%.3fs  n_replay=%d  replay_period=%.0fms",
             mode_.c_str(), platform_.c_str(), solver_type_.c_str(),
-            ocp_type_.c_str(), ocp_dt_);
+            ocp_type_.c_str(), ocp_dt_, n_replay_, n_replay_ * ocp_dt_ * 1000.0);
         RCLCPP_INFO(this->get_logger(), "Target: [%.3f, %.3f, %.3f]", tx, ty, tz);
     }
 
@@ -254,9 +262,8 @@ private:
 #endif
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  SOLVER LOOP — fires at 1ms, blocks on solve (~160ms).
-    //  While blocked the replay timer keeps sending setpoints every 50ms.
-    //  When done: swap mpc_traj_, reset idx=1.
+    //  SOLVER LOOP — blocks on solve, then swaps trajectory buffer.
+    //  No sleep. Replay timer handles all command streaming independently.
     // ─────────────────────────────────────────────────────────────────────────
     void solverLoop()
     {
@@ -291,7 +298,7 @@ private:
                 x0(0),x0(1),x0(2), x0(3),x0(4),x0(5));
         }
 
-        // Blocks ~160ms. Replay timer keeps firing every 50ms during this.
+        // Blocks for solve duration. Replay timer keeps firing during this time.
         SolverResult result = callSolver(x0);
 
         if (!result.success || result.state_trajectory.size() < 2) {
@@ -304,7 +311,7 @@ private:
         }
 
         RCLCPP_INFO(this->get_logger(),
-            "[RH %d] solve=%.1fms  x0=[%.3f,%.3f,%.3f]",
+            "[RH %d] %.1fms  x0=[%.3f,%.3f,%.3f]",
             solve_count_, result.solve_time_ms,
             x0(0), x0(1), x0(2));
 
@@ -322,12 +329,13 @@ private:
             logSolveTrajectory(result.state_trajectory,
                                result.control_trajectory,
                                result.solve_time_ms);
+
         ++solve_count_;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  REPLAY TICK — fires every 50ms independently of solver.
-    //  Walks mpc_traj_[idx++]. No gaps ever.
+    //  REPLAY TICK — fires every ocp_dt (50ms), streams mpc_traj_[idx++].
+    //  Runs independent of solver — no gaps ever.
     // ─────────────────────────────────────────────────────────────────────────
     void mpcReplayTick()
     {
@@ -335,11 +343,13 @@ private:
         {
             std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
             if (mpc_traj_.empty()) return;
+
             const int N   = (int)mpc_traj_.size() - 1;
             const int idx = std::min(mpc_replay_idx_, N);
             x_cmd = mpc_traj_[idx];
             u_cmd = (idx < (int)mpc_ctrl_.size())
                 ? mpc_ctrl_[idx] : Eigen::VectorXd::Zero(4);
+
             if (mpc_replay_idx_ < N) ++mpc_replay_idx_;
         }
 
@@ -595,8 +605,15 @@ private:
 
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
     rclcpp::TimerBase::SharedPtr solver_timer_;
+    rclcpp::TimerBase::SharedPtr mpc_replay_timer_;
     rclcpp::TimerBase::SharedPtr startup_timer_;
     rclcpp::TimerBase::SharedPtr replay_timer_;
+
+    // Shared trajectory buffer between solver and replay timer
+    std::mutex                   mpc_traj_mutex_;
+    std::vector<Eigen::VectorXd> mpc_traj_;
+    std::vector<Eigen::VectorXd> mpc_ctrl_;
+    int                          mpc_replay_idx_ = 1;
 
     Eigen::VectorXd current_state_;
     bool pose_received_ = false;
@@ -606,6 +623,7 @@ private:
     mutable std::mutex               state_mutex_;
     rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
     rclcpp::CallbackGroup::SharedPtr solver_cb_group_;
+    rclcpp::CallbackGroup::SharedPtr replay_cb_group_;
 
     int solve_count_ = 0;
 
