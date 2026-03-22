@@ -44,13 +44,27 @@ void QuadrotorMPC::shiftWarmStart(int n_shift) {
 
 void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state) {
     try {
-        // LandingOCP::create receives prev_U and prev_X and internally:
-        //   - rolls out dynamics from current_state with prev_U to seed
-        //     setInitialState(k) for all nodes (warm state trajectory)
-        //   - sets setInitialControl(k) = prev_U[k] for all nodes
-        //   - uses prev_X[k] as trajectory-consistency reference in stage cost
-        // Do NOT call setInitialControl again here — it would be redundant and
-        // was previously masking the fact that the rollout was using the wrong U.
+        // CRITICAL: destroy the old solver BEFORE replacing the old problem.
+        //
+        // In every working single-file test (quad_cf_rh.cpp etc.) the solver
+        // and problem are stack-allocated in the same scope, so C++ LIFO rules
+        // guarantee the solver is destroyed FIRST (declared last), then the
+        // problem is destroyed. Our shared_ptr members produce the REVERSE order:
+        //
+        //   problem_ = new_ocp  → old OCP ref-count drops to 0 → old OCP freed
+        //   solver_  = new_slv  → old solver destructs AFTER old OCP already gone
+        //
+        // If ALIPDDP holds any raw pointer or reference into the OCP's stage
+        // objects (dynamics, costs, constraints), its destructor accesses freed
+        // memory — undefined behaviour that silently corrupts the heap and
+        // poisons the newly constructed ALIPDDP on every subsequent solve.
+        //
+        // Resetting solver_ here forces the correct order:
+        //   old solver freed (old OCP still alive)
+        //   → old OCP freed
+        //   → new OCP created
+        solver_.reset();
+
         problem_ = OCPRegistry::create(
             config_.ocp_type, current_state, config_.terminal_state,
             prev_U_, prev_X_);

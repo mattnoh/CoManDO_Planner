@@ -142,6 +142,7 @@ static const Eigen::VectorXd P_DIAG = (Eigen::VectorXd(13) <<
 // ── References ────────────────────────────────────────────────────────────────
 static Eigen::VectorXd make_x_ref() {
     Eigen::VectorXd xr = Eigen::VectorXd::Zero(13);
+    xr(2) = 0.1;
     xr(6) = 1.0;
     return xr;
 }
