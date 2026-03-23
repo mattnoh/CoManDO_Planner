@@ -354,7 +354,9 @@ private:
             std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
             mpc_traj_            = result.state_trajectory;
             mpc_ctrl_            = result.control_trajectory;
-            mpc_replay_idx_      = 1;
+            const int k = static_cast<int>(std::round(result.solve_time_ms / (ocp_dt_ * 1000.0)));
+            const int N = static_cast<int>(result.state_trajectory.size()) - 1;
+            mpc_replay_idx_ = std::min(1 + k, N);
             mpc_active_solve_num_ = solve_count_;
         }
         replay_ticks_since_solve_.store(0);
