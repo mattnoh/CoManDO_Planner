@@ -22,10 +22,7 @@
 #include "quadrotor_mpc.hpp"
 #include "ocp_registry.hpp"
 #include "platform/crazyflie.hpp"
-
-#ifdef HAS_PX4_MSGS
 #include "platform/px4.hpp"
-#endif
 
 #ifdef HAS_ACADOS
 #include "acados_solver.hpp"
@@ -129,24 +126,20 @@ public:
         replay_cb_group_ = this->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
 
-        // Setup platform-specific subscriptions and publishers
-        // IMPORTANT: Direct subscribe/publish, no intermediate bridge node
-        if (platform_ == "crazyflie") {
-            platform::crazyflie::setup(
-                this, sensor_cb_group_, drone_name_,
-                cf_state_, state_mutex_, cf_handles_);
-        }
-#ifdef HAS_PX4_MSGS
-        else if (platform_ == "px4") {
-            platform::px4::setup(
-                this, sensor_cb_group_,
-                px4_state_, state_mutex_, px4_handles_);
-        }
-#endif
-        else {
-            RCLCPP_ERROR(this->get_logger(), "Unknown platform: %s", platform_.c_str());
-            throw std::runtime_error("Unknown platform: " + platform_);
-        }
+// Setup platform-specific subscriptions and publishers
+// IMPORTANT: Direct subscribe/publish, no intermediate bridge node
+if (platform_ == "crazyflie") {
+    platform::crazyflie::setup(
+        this, sensor_cb_group_, drone_name_,
+        cf_state_, state_mutex_, cf_handles_);
+} else if (platform_ == "px4") {
+    platform::px4::setup(
+        this, sensor_cb_group_,
+        px4_state_, state_mutex_, px4_handles_);
+} else {
+    RCLCPP_ERROR(this->get_logger(), "Unknown platform: %s", platform_.c_str());
+    throw std::runtime_error("Unknown platform: " + platform_);
+}
 
         // Trajectory publisher (for visualization)
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
@@ -183,30 +176,24 @@ private:
     // ─────────────────────────────────────────────────────────────────────────
     // Check if state is available (platform-agnostic)
     // ─────────────────────────────────────────────────────────────────────────
-    bool hasState() const {
-        if (platform_ == "crazyflie") {
-            return cf_state_.hasFullState();
-        }
-#ifdef HAS_PX4_MSGS
-        else if (platform_ == "px4") {
-            return px4_state_.hasFullState();
-        }
-#endif
-        return false;
+bool hasState() const {
+    if (platform_ == "crazyflie") {
+        return cf_state_.hasFullState();
+    } else if (platform_ == "px4") {
+        return px4_state_.hasFullState();
     }
+    return false;
+}
 
-    Eigen::VectorXd getCurrentState() const {
-        std::lock_guard<std::mutex> lk(state_mutex_);
-        if (platform_ == "crazyflie") {
-            return cf_state_.current;
-        }
-#ifdef HAS_PX4_MSGS
-        else if (platform_ == "px4") {
-            return px4_state_.current;
-        }
-#endif
-        return current_state_;
+Eigen::VectorXd getCurrentState() const {
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    if (platform_ == "crazyflie") {
+        return cf_state_.current;
+    } else if (platform_ == "px4") {
+        return px4_state_.current;
     }
+    return current_state_;
+}
 
     // ─────────────────────────────────────────────────────────────────────────
     // SOLVER LOOP - polls at 1ms but only solves once n_replay_ ticks fired
@@ -222,16 +209,14 @@ private:
 
         Eigen::VectorXd x0 = getCurrentState();
 
-        if (!is_flying_) {
-            is_flying_ = true;
-            RCLCPP_INFO(this->get_logger(),
-                "State received — starting RH MPC (%s)", solver_type_.c_str());
-#ifdef HAS_PX4_MSGS
-            if (platform_ == "px4") {
-                platform::px4::arm(this, px4_handles_);
-            }
-#endif
-            if (logging_enabled_ && !logging_initialized_) {
+if (!is_flying_) {
+    is_flying_ = true;
+    RCLCPP_INFO(this->get_logger(),
+        "State received — starting RH MPC (%s)", solver_type_.c_str());
+    if (platform_ == "px4") {
+        platform::px4::arm(this, px4_handles_);
+    }
+    if (logging_enabled_ && !logging_initialized_) {
                 setupLogging();
                 logging_initialized_ = true;
             }
@@ -339,16 +324,13 @@ private:
     // ─────────────────────────────────────────────────────────────────────────
     // PUBLISH COMMAND - delegates to platform-specific implementation
     // ─────────────────────────────────────────────────────────────────────────
-    void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
-        if (platform_ == "crazyflie") {
-            platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
-        }
-#ifdef HAS_PX4_MSGS
-        else if (platform_ == "px4") {
-            platform::px4::publishCommand(this, px4_handles_, s);
-        }
-#endif
+void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
+    if (platform_ == "crazyflie") {
+        platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
+    } else if (platform_ == "px4") {
+        platform::px4::publishCommand(this, px4_handles_, s);
     }
+}
 
     void publishTrajectory(const std::vector<Eigen::VectorXd>& traj) {
         nav_msgs::msg::Path path;
@@ -533,13 +515,11 @@ private:
     std::unique_ptr<AcadosMPC> acados_mpc_;
 #endif
 
-    // Platform state (each platform has its own state struct)
-    platform::crazyflie::State cf_state_;
-    platform::crazyflie::Handles cf_handles_;
-#ifdef HAS_PX4_MSGS
-    platform::px4::State px4_state_;
-    platform::px4::Handles px4_handles_;
-#endif
+// Platform state (each platform has its own state struct)
+platform::crazyflie::State cf_state_;
+platform::crazyflie::Handles cf_handles_;
+platform::px4::State px4_state_;
+platform::px4::Handles px4_handles_;
 
     // Legacy state (kept for compatibility)
     Eigen::VectorXd current_state_;

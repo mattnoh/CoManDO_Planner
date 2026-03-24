@@ -200,4 +200,49 @@ inline void arm(rclcpp::Node* node, Handles& handles) {
 } // namespace px4
 } // namespace platform
 
+#else // HAS_PX4_MSGS not defined - provide empty stubs
+
+#include <Eigen/Dense>
+#include <mutex>
+#include <stdexcept>
+#include <rclcpp/rclcpp.hpp>
+
+namespace platform {
+namespace px4 {
+
+// Empty stubs - allow compilation without px4_msgs
+// Runtime error if PX4 platform is requested but not compiled in
+
+struct State {
+    Eigen::VectorXd current = Eigen::VectorXd::Zero(13);
+    bool hasFullState() const { return false; }
+};
+
+struct Handles {};
+
+inline void setup(
+    rclcpp::Node*,
+    rclcpp::CallbackGroup::SharedPtr,
+    State&,
+    std::mutex&,
+    Handles&)
+{
+    throw std::runtime_error("PX4 platform not compiled - install px4_msgs and rebuild");
+}
+
+inline void publishCommand(
+    rclcpp::Node*,
+    Handles&,
+    const Eigen::VectorXd&)
+{
+    throw std::runtime_error("PX4 platform not compiled - install px4_msgs and rebuild");
+}
+
+inline void arm(rclcpp::Node*, Handles&) {
+    throw std::runtime_error("PX4 platform not compiled - install px4_msgs and rebuild");
+}
+
+} // namespace px4
+} // namespace platform
+
 #endif // HAS_PX4_MSGS
