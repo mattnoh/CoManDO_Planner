@@ -3,7 +3,7 @@
 <package format="3">
   <name>comando_planner</name>
   <version>0.1.0</version>
-  <description>CoManDO MPC planner — ALIPDDP and acados solvers, Crazyflie and PX4 platforms</description>
+  <description>CoManDO MPC planner — ALIPDDP solver, Crazyflie and PX4 platforms</description>
   <maintainer email="your_email@example.com">Your Name</maintainer>
   <license>MIT</license>
   <buildtool_depend>ament_cmake</buildtool_depend>

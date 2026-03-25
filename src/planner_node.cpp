@@ -25,9 +25,6 @@
 #include "platform/px4.hpp"
 #include "platform/target_tracker.hpp"
 
-#ifdef HAS_ACADOS
-#include "acados_solver.hpp"
-#endif
 
 #include <chrono>
 #include <memory>
@@ -87,6 +84,11 @@ public:
         this->declare_parameter("mass_kg", 0.027);
         this->declare_parameter("target_odom_topic", std::string("/target/odom"));
         this->declare_parameter("target_accel_topic", std::string("/target/accel"));
+        this->declare_parameter("enable_terminal_freeze", true);
+        this->declare_parameter("terminal_freeze_enter_pos", 0.20);
+        this->declare_parameter("terminal_freeze_enter_vel", 0.10);
+        this->declare_parameter("terminal_freeze_require_vel", false);
+        this->declare_parameter("terminal_freeze_exit_pos", 0.20);
 
         // Get parameters
         ocp_type_ = this->get_parameter("ocp_type").as_string();
@@ -99,6 +101,11 @@ public:
         mass_kg_ = this->get_parameter("mass_kg").as_double();
         target_odom_topic_ = this->get_parameter("target_odom_topic").as_string();
         target_accel_topic_ = this->get_parameter("target_accel_topic").as_string();
+        enable_terminal_freeze_ = this->get_parameter("enable_terminal_freeze").as_bool();
+        terminal_freeze_enter_pos_ = this->get_parameter("terminal_freeze_enter_pos").as_double();
+        terminal_freeze_enter_vel_ = this->get_parameter("terminal_freeze_enter_vel").as_double();
+        terminal_freeze_require_vel_ = this->get_parameter("terminal_freeze_require_vel").as_bool();
+        terminal_freeze_exit_pos_ = this->get_parameter("terminal_freeze_exit_pos").as_double();
 
         double tx = this->get_parameter("hover_target_x").as_double();
         double ty = this->get_parameter("hover_target_y").as_double();
@@ -109,27 +116,18 @@ public:
         Eigen::VectorXd terminal = Eigen::VectorXd::Zero(13);
         terminal(0) = tx; terminal(1) = ty; terminal(2) = tz;
         terminal(6) = 1.0;
+        terminal_position_abs_ << tx, ty, tz;
 
-        // Initialize MPC solver
-        if (solver_type_ == "alipddp") {
-            QuadrotorMPC::Config cfg;
-            cfg.ocp_type = ocp_type_;
-            cfg.terminal_state = terminal;
-            cfg.n_shift = n_replay_;
-            alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
-        }
-#ifdef HAS_ACADOS
-        else if (solver_type_ == "acados") {
-            AcadosMPC::Config cfg;
-            cfg.ocp_type = ocp_type_;
-            cfg.terminal_state = terminal;
-            cfg.dt = ocp_dt_;
-            cfg.n_shift = n_replay_;
-            acados_mpc_ = std::make_unique<AcadosMPC>(cfg);
-        }
-#endif
+  // Initialize MPC solver
+    if (solver_type_ == "alipddp") {
+        QuadrotorMPC::Config cfg;
+        cfg.ocp_type = ocp_type_;
+        cfg.terminal_state = terminal;
+        cfg.n_shift = n_replay_;
+        alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
+    }
 
-        // Initialize state
+  // Initialize state
         current_state_ = Eigen::VectorXd::Zero(13);
         current_state_(6) = 1.0;
 
@@ -269,6 +267,32 @@ Eigen::VectorXd getCurrentState() const {
             x0.segment(6, 7) = x0_abs.segment(6, 7);
         }
 
+        const double pos_err = (ocp_type_ == "stateswitch")
+            ? x0.segment(0, 3).norm()
+            : (x0_abs.segment(0, 3) - terminal_position_abs_).norm();
+        const double vel_err = (ocp_type_ == "stateswitch")
+            ? x0.segment(3, 3).norm()
+            : x0_abs.segment(3, 3).norm();
+
+        if (terminal_freeze_.load()) {
+            if (pos_err > terminal_freeze_exit_pos_) {
+                terminal_freeze_.store(false);
+                RCLCPP_INFO(this->get_logger(),
+                    "Terminal freeze released: pos_err=%.3f", pos_err);
+            } else {
+                return;
+            }
+        }
+
+        const bool freeze_condition = (pos_err < terminal_freeze_enter_pos_) &&
+            (!terminal_freeze_require_vel_ || vel_err < terminal_freeze_enter_vel_);
+        if (enable_terminal_freeze_ && is_primed_.load() && freeze_condition) {
+            terminal_freeze_.store(true);
+            RCLCPP_INFO(this->get_logger(),
+                "Terminal freeze engaged: pos_err=%.3f vel_err=%.3f", pos_err, vel_err);
+            return;
+        }
+
 if (!is_flying_) {
     is_flying_ = true;
     RCLCPP_INFO(this->get_logger(),
@@ -324,6 +348,7 @@ if (!is_flying_) {
             last_solve_wall_time_ = result.solve_timestamp;
         }
         replay_ticks_since_solve_.store(0);
+        is_primed_.store(true);
 
         publishTrajectory(result.state_trajectory);
 
@@ -335,24 +360,95 @@ if (!is_flying_) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // REPLAY TICK - fires every ocp_dt, streams mpc_traj_[idx++]
+    // REPLAY TICK - time-indexed replay for variable-step stateswitch
     // ─────────────────────────────────────────────────────────────────────────
     void mpcReplayTick() {
-        Eigen::VectorXd x_cmd, u_cmd;
+        constexpr int IDX_DT = 13;
+
+        if (!is_primed_.load()) return;
+
+        const Clock::time_point now_wall = Clock::now();
+        Eigen::VectorXd x_cmd = Eigen::VectorXd::Zero(13);
+        Eigen::VectorXd u_cmd = Eigen::VectorXd::Zero(4);
         int active_solve_num = -1;
+
+        bool plan_is_relative = false;
+        double elapsed = 0.0;
+        double horizon_end = 0.0;
+        Eigen::VectorXd x_rel_k;
+
         {
             std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
             if (mpc_traj_.empty()) {
                 replay_ticks_since_solve_.fetch_add(1);
                 return;
             }
-            const int N = static_cast<int>(mpc_traj_.size()) - 1;
-            const int idx = std::min(mpc_replay_idx_, N);
-            x_cmd = mpc_traj_[idx];
-            u_cmd = (idx < static_cast<int>(mpc_ctrl_.size()))
-                ? mpc_ctrl_[idx] : Eigen::VectorXd::Zero(4);
+
             active_solve_num = mpc_active_solve_num_;
-            if (mpc_replay_idx_ < N) ++mpc_replay_idx_;
+            plan_is_relative = last_plan_is_relative_;
+
+            if (!plan_is_relative) {
+                const int N = static_cast<int>(mpc_traj_.size()) - 1;
+                elapsed = std::chrono::duration<double>(now_wall - last_solve_wall_time_).count();
+                int idx = std::min(static_cast<int>(elapsed / ocp_dt_), N);
+                idx = std::max(0, idx);
+                mpc_replay_idx_ = idx;
+
+                if (mpc_traj_[idx].size() >= 13) x_cmd = mpc_traj_[idx].head(13);
+                if (!mpc_ctrl_.empty()) {
+                    const int u_idx = std::min(idx, static_cast<int>(mpc_ctrl_.size()) - 1);
+                    u_cmd = mpc_ctrl_[u_idx];
+                }
+                horizon_end = N * ocp_dt_;
+            } else {
+                elapsed = std::chrono::duration<double>(now_wall - last_solve_wall_time_).count();
+
+                const int N = static_cast<int>(mpc_traj_.size()) - 1;
+                int idx = 0;
+                while (idx + 1 < static_cast<int>(mpc_traj_.size()) &&
+                       mpc_traj_[idx].size() > IDX_DT &&
+                       mpc_traj_[idx](IDX_DT) < elapsed) {
+                    ++idx;
+                }
+                idx = std::min(idx, N);
+                mpc_replay_idx_ = idx;
+
+                x_rel_k = mpc_traj_[idx];
+                if (!mpc_ctrl_.empty()) {
+                    const int u_idx = std::min(idx, static_cast<int>(mpc_ctrl_.size()) - 1);
+                    u_cmd = mpc_ctrl_[u_idx];
+                }
+
+                if (!mpc_traj_.empty() && mpc_traj_.back().size() > IDX_DT) {
+                    horizon_end = mpc_traj_.back()(IDX_DT);
+                }
+            }
+        }
+
+        if (plan_is_relative) {
+            if (elapsed > horizon_end + 0.2) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Stateswitch trajectory stale (elapsed=%.3fs, horizon=%.3fs), clamping to terminal",
+                    elapsed, horizon_end);
+            }
+
+            Eigen::Vector3d tgt_pos_now = Eigen::Vector3d::Zero();
+            Eigen::Vector3d tgt_vel_now = Eigen::Vector3d::Zero();
+            {
+                std::lock_guard<std::mutex> lk(target_mutex_);
+                tgt_pos_now = target_state_.position;
+                tgt_vel_now = target_state_.velocity;
+            }
+
+            if (x_rel_k.size() >= 13) {
+                x_cmd.segment(0, 3) = x_rel_k.segment(0, 3) + tgt_pos_now;
+                x_cmd.segment(3, 3) = x_rel_k.segment(3, 3) + tgt_vel_now;
+                x_cmd.segment(6, 7) = x_rel_k.segment(6, 7);
+            }
+        } else if (elapsed > horizon_end + 0.2) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Trajectory stale (elapsed=%.3fs, horizon=%.3fs), clamping to terminal",
+                elapsed, horizon_end);
         }
 
         replay_ticks_since_solve_.fetch_add(1);
@@ -382,18 +478,6 @@ if (!is_flying_) {
             result.solve_timestamp = r.solve_timestamp;
             result.is_relative_plan = (ocp_type_ == "stateswitch");
         }
-#ifdef HAS_ACADOS
-        else if (solver_type_ == "acados" && acados_mpc_) {
-            auto r = acados_mpc_->solve(state);
-            result.success = r.success;
-            result.next_state = r.next_state;
-            result.state_trajectory = r.state_trajectory;
-            result.control_trajectory = r.control_trajectory;
-            result.solve_time_ms = r.solve_time_ms;
-            result.solve_timestamp = r.solve_timestamp;
-            result.is_relative_plan = (ocp_type_ == "stateswitch");
-        }
-#endif
         return result;
     }
 
@@ -582,6 +666,11 @@ void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
     std::string ocp_type_, platform_, solver_type_, mode_, drone_name_;
     std::string target_odom_topic_ = "/target/odom";
     std::string target_accel_topic_ = "/target/accel";
+    bool enable_terminal_freeze_ = true;
+    double terminal_freeze_enter_pos_ = 0.20;
+    double terminal_freeze_enter_vel_ = 0.10;
+    bool terminal_freeze_require_vel_ = false;
+    double terminal_freeze_exit_pos_ = 0.20;
     bool logging_enabled_;
     double ocp_dt_ = 0.05;
     double mass_kg_ = 0.027;
@@ -589,11 +678,8 @@ void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
 
     // MPC solver
     std::unique_ptr<QuadrotorMPC> alipddp_mpc_;
-#ifdef HAS_ACADOS
-    std::unique_ptr<AcadosMPC> acados_mpc_;
-#endif
 
-// Platform state (each platform has its own state struct)
+    // Platform state (each platform has its own state struct)
 platform::crazyflie::State cf_state_;
 platform::crazyflie::Handles cf_handles_;
 platform::px4::State px4_state_;
@@ -638,6 +724,9 @@ platform::px4::Handles px4_handles_;
     // State flags
     bool is_flying_ = false;
     int solve_count_ = 0;
+    std::atomic<bool> is_primed_{false};
+    std::atomic<bool> terminal_freeze_{false};
+    Eigen::Vector3d terminal_position_abs_ = Eigen::Vector3d::Zero();
 
     // Open-loop state
     std::vector<Eigen::VectorXd> ol_ref_X_, ol_ref_U_;

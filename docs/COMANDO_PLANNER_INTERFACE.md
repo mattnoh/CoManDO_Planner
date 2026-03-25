@@ -417,8 +417,9 @@ Measured state for comparison.
 |------|---------|
 | `include/quadrotor_mpc.hpp` | MPC class interface |
 | `include/ocp_registry.hpp` | OCP factory and parameter lookup |
-| `include/ocp_landing.hpp` | Landing problem formulation |
-| `include/ocp_hover.hpp` | Hover problem formulation |
+| `include/ocp/ocp_landing.hpp` | Landing problem formulation |
+| `include/ocp/ocp_hover.hpp` | Hover problem formulation |
+| `include/ocp/ocp_stateswitch.hpp` | State-switch problem formulation |
 | `include/platform/crazyflie.hpp` | Crazyflie I/O abstraction |
 
 ### Launch Files
@@ -433,20 +434,25 @@ Measured state for comparison.
 
 ### Adding a New OCP Type
 
-1. **Create OCP header** (`include/ocp_new.hpp`):
-   - Define constants (HORIZON, DT, MASS, etc.)
-   - Implement stage cost class
-   - Implement terminal cost class
-   - Implement constraint classes
-   - Implement `create()` factory function
+1. **Create OCP header** (`include/ocp/ocp_new.hpp`):
+ - Define constants (HORIZON, DT, MASS, etc.)
+ - Define solver parameters (SOLVER_REG1_MIN, SOLVER_REG2_MIN, etc.)
+ - Implement `getSolverParams()` function that returns a `Param` struct
+ - Implement stage cost class
+ - Implement terminal cost class
+ - Implement constraint classes
+ - Implement `create()` factory function
 
 2. **Register in OCPRegistry** (`include/ocp_registry.hpp`):
-   - Add to `getDT()` switch
-   - Add to `getSolverParams()` switch
-   - Add to `create()` factory
+ - Add include: `#include "ocp/ocp_new.hpp"`
+ - Add to `getDT()` switch
+ - Add to `getSolverParams()` switch: `if (ocp_type == "new") return NewOCP::getSolverParams();`
+ - Add to `create()` factory
 
-3. **Add solver parameters**:
-   - Define SOLVER_REG1_MIN, SOLVER_REG2_MIN
+3. **Solver parameters are now defined inside each OCP namespace**:
+ - Each OCP defines its own `SOLVER_REG1_MIN`, `SOLVER_REG2_MIN`, `SOLVER_RHO`, etc.
+ - The `getSolverParams()` function assembles these into a `Param` struct
+ - No parameters are stored in the registry - it only delegates to each OCP
    - Define SOLVER_RHO, SOLVER_RHO_MUL
    - Define SOLVER_TOLERANCE, SOLVER_MAX_ITER
 
