@@ -1,5 +1,7 @@
 #include "quadrotor_mpc.hpp"
 #include "ocp_registry.hpp"
+
+#include <algorithm>
 #include <iostream>
 
 using namespace std;
@@ -16,81 +18,120 @@ QuadrotorMPC::QuadrotorMPC(const Config& config) : config_(config) {
 double QuadrotorMPC::getOcpDt() const {
     try {
         return OCPRegistry::getDT(config_.ocp_type);
-    } catch (const std::runtime_error& e) {
+    } catch (const std::runtime_error&) {
         return config_.dt;
     }
 }
 
-void QuadrotorMPC::shiftWarmStart(int n_shift) {
-    if (prev_U_.empty()) return;
-    const int Nu = (int)prev_U_.size();
-    const int Nx = (int)prev_X_.size();
-    n_shift = std::max(1, std::min(n_shift, Nu - 1));
+std::vector<Eigen::VectorXd> QuadrotorMPC::makeUwarm(int n_shift) const {
+    if (prev_U_.empty()) return {};
 
-    // Shift U
-    std::vector<Eigen::VectorXd> su(Nu);
-    for (int i = 0; i < Nu; ++i)
-        su[i] = prev_U_[std::min(i + n_shift, Nu - 1)];
-    prev_U_ = std::move(su);
+    const int N = static_cast<int>(prev_U_.size());
+    if (N == 1) return prev_U_;
 
-    // Shift X — same tail-hold logic
-    if (Nx > 0) {
-        std::vector<Eigen::VectorXd> sx(Nx);
-        for (int i = 0; i < Nx; ++i)
-            sx[i] = prev_X_[std::min(i + n_shift, Nx - 1)];
-        prev_X_ = std::move(sx);
+    const int NEX = std::max(1, std::min(n_shift, N - 1));
+
+    Eigen::VectorXd u_tail = prev_U_[N - 1 - NEX];
+    if (u_tail.size() >= 4) {
+        u_tail(1) = 0.0;
+        u_tail(2) = 0.0;
+        u_tail(3) = 0.0;
     }
+
+    std::vector<Eigen::VectorXd> uw(N);
+    for (int i = 0; i < N; ++i) {
+        if (i + NEX < N - NEX) {
+            uw[i] = prev_U_[i + NEX];
+        } else {
+            uw[i] = u_tail;
+        }
+    }
+    return uw;
 }
 
-void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state) {
+std::vector<Eigen::VectorXd> QuadrotorMPC::makeXshifted(int n_shift) const {
+    if (prev_X_.empty()) return {};
+
+    const int Nx = static_cast<int>(prev_X_.size());
+    const int NEX = std::max(1, n_shift);
+
+    std::vector<Eigen::VectorXd> xs(Nx);
+    for (int i = 0; i < Nx; ++i) {
+        xs[i] = prev_X_[std::min(i + NEX, Nx - 1)];
+    }
+    return xs;
+}
+
+std::vector<Eigen::MatrixXd> QuadrotorMPC::makeKshifted(int n_shift) const {
+    if (prev_K_.empty()) return {};
+
+    const int Nk = static_cast<int>(prev_K_.size());
+    const int NEX = std::max(1, n_shift);
+
+    std::vector<Eigen::MatrixXd> ks(Nk);
+    for (int i = 0; i < Nk; ++i) {
+        ks[i] = prev_K_[std::min(i + NEX, Nk - 1)];
+    }
+    return ks;
+}
+
+void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state,
+                                const std::vector<Eigen::VectorXd>& warm_u,
+                                const std::vector<Eigen::VectorXd>& warm_x,
+                                const std::vector<Eigen::MatrixXd>& warm_k) {
     try {
-        // CRITICAL: destroy the old solver BEFORE replacing the old problem.
-        //
-        // In every working single-file test (quad_cf_rh.cpp etc.) the solver
-        // and problem are stack-allocated in the same scope, so C++ LIFO rules
-        // guarantee the solver is destroyed FIRST (declared last), then the
-        // problem is destroyed. Our shared_ptr members produce the REVERSE order:
-        //
-        //   problem_ = new_ocp  → old OCP ref-count drops to 0 → old OCP freed
-        //   solver_  = new_slv  → old solver destructs AFTER old OCP already gone
-        //
-        // If ALIPDDP holds any raw pointer or reference into the OCP's stage
-        // objects (dynamics, costs, constraints), its destructor accesses freed
-        // memory — undefined behaviour that silently corrupts the heap and
-        // poisons the newly constructed ALIPDDP on every subsequent solve.
-        //
-        // Resetting solver_ here forces the correct order:
-        //   old solver freed (old OCP still alive)
-        //   → old OCP freed
-        //   → new OCP created
         solver_.reset();
 
         problem_ = OCPRegistry::create(
             config_.ocp_type, current_state, config_.terminal_state,
-            prev_U_, prev_X_);
+            warm_u, warm_x, target_accel_, warm_k);
     } catch (const std::runtime_error& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         throw;
     }
 }
 
-QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
+QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
+                                         const Eigen::Vector3d& target_accel)
 {
     Result result;
     result.success = false;
     auto t0 = chrono::high_resolution_clock::now();
 
     try {
-        // Pass the full measured state to the OCP — do NOT zero omega.
-        // All working test cases (quad_cf_rh.cpp, quad_cf_rh_testing.cpp)
-        // pass x_meas directly. Zeroing omega makes x0 inconsistent with
-        // prev_U_ which was solved for a state that had real angular rates,
-        // causing divergence on every warm-started solve after the first.
+        target_accel_ = target_accel;
+
+        std::vector<Eigen::VectorXd> warm_u = prev_U_;
+        std::vector<Eigen::VectorXd> warm_x = prev_X_;
+        std::vector<Eigen::MatrixXd> warm_k = prev_K_;
+
         if (!prev_U_.empty()) {
-            shiftWarmStart(config_.n_shift);
+            if (config_.ocp_type == "stateswitch") {
+                warm_u = makeUwarm(config_.n_shift);
+                warm_x = makeXshifted(config_.n_shift);
+                warm_k = makeKshifted(config_.n_shift);
+            } else {
+                const int Nu = static_cast<int>(prev_U_.size());
+                const int Nx = static_cast<int>(prev_X_.size());
+                const int shift = std::max(1, std::min(config_.n_shift, std::max(1, Nu - 1)));
+
+                std::vector<Eigen::VectorXd> su(Nu);
+                for (int i = 0; i < Nu; ++i) {
+                    su[i] = prev_U_[std::min(i + shift, Nu - 1)];
+                }
+                warm_u = std::move(su);
+
+                if (Nx > 0) {
+                    std::vector<Eigen::VectorXd> sx(Nx);
+                    for (int i = 0; i < Nx; ++i) {
+                        sx[i] = prev_X_[std::min(i + shift, Nx - 1)];
+                    }
+                    warm_x = std::move(sx);
+                }
+            }
         }
 
-        setupProblem(current_state);
+        setupProblem(current_state, warm_u, warm_x, warm_k);
 
         solver_ = make_shared<ALIPDDP<double>>(*problem_);
         solver_->init(solver_params_);
@@ -98,20 +139,29 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state)
 
         auto X_result = solver_->getResX();
         auto U_result = solver_->getResU();
+        auto K_result = solver_->getResK();
 
-        result.solve_time_ms   = chrono::duration<double, milli>(
+        result.solve_time_ms = chrono::duration<double, milli>(
             chrono::high_resolution_clock::now() - t0).count();
         result.solve_timestamp = chrono::steady_clock::now();
-        result.solve_iters     = static_cast<int>(solver_->getAllCost().size());
-        last_solve_ms_         = result.solve_time_ms;
+        result.solve_iters = static_cast<int>(solver_->getAllCost().size());
+        last_solve_ms_ = result.solve_time_ms;
 
         if (X_result.size() > 1) {
-            result.next_state         = X_result[1];
-            result.state_trajectory   = X_result;
+            if (config_.ocp_type == "stateswitch" && X_result[1].size() >= 13) {
+                result.next_state = X_result[1].head(13);
+            } else {
+                result.next_state = X_result[1];
+            }
+            result.state_trajectory = X_result;
             result.control_trajectory = U_result;
-            result.success            = true;
-            prev_X_                   = X_result;
-            prev_U_                   = U_result;
+            result.feedback_gains = K_result;
+            result.success = true;
+
+            prev_X_ = X_result;
+            prev_U_ = U_result;
+            prev_K_ = K_result;
+
             std::cout << "[MPC] solve " << result.solve_time_ms
                       << "ms  iters=" << result.solve_iters
                       << "  n_shift=" << config_.n_shift << "\n";
@@ -134,6 +184,7 @@ void QuadrotorMPC::setTerminalState(const Eigen::VectorXd& terminal) {
         solver_.reset();
         prev_U_.clear();
         prev_X_.clear();
+        prev_K_.clear();
         last_solve_ms_ = 0.0;
     }
 }

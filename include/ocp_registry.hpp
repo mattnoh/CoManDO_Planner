@@ -5,6 +5,7 @@
 
 #include "ocp_hover.hpp"
 #include "ocp_landing.hpp"
+#include "ocp_stateswitch.hpp"
 // future: #include "ocp_tracking.hpp"
 // future: #include "ocp_avoid.hpp"
 
@@ -18,8 +19,9 @@ namespace OCPRegistry {
 
 // ── Per-OCP DT lookup ────────────────────────────────────────────────────────
 inline double getDT(const std::string& ocp_type) {
-    if (ocp_type == "hover")   return HoverOCP::DT;
-    if (ocp_type == "landing") return LandingOCP::DT;
+    if (ocp_type == "hover")      return HoverOCP::DT;
+    if (ocp_type == "landing")    return LandingOCP::DT;
+    if (ocp_type == "stateswitch") return StateswitchOCP::TH_INIT;
     throw std::runtime_error("Unknown OCP type: " + ocp_type);
 }
 
@@ -45,6 +47,16 @@ inline Param getSolverParams(const std::string& ocp_type) {
         p.max_iter  = LandingOCP::SOLVER_MAX_ITER;
         p.rhoT      = LandingOCP::SOLVER_RHOT;
         p.is_quaternion_in_state = false;  // all working tests set this false
+    } else if (ocp_type == "stateswitch") {
+        p.reg1_min = 1e-2;
+        p.reg2_min = 0.5;
+        p.mu_mul   = 0.1;
+        p.rho      = 10.0;
+        p.rhoT     = 1.0;
+        p.rho_mul  = 10.0;
+        p.tolerance = 1e-4;
+        p.max_iter = 500;
+        p.is_quaternion_in_state = false;
     } else {
         throw std::runtime_error("Unknown OCP type: " + ocp_type);
     }
@@ -62,7 +74,9 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     const Eigen::VectorXd& current_state,
     const Eigen::VectorXd& terminal_state = Eigen::VectorXd(),
     const std::vector<Eigen::VectorXd>& prev_U = {},
-    const std::vector<Eigen::VectorXd>& prev_X = {})
+    const std::vector<Eigen::VectorXd>& prev_X = {},
+    const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero(),
+    const std::vector<Eigen::MatrixXd>& prev_K = {})
 {
     if (ocp_type == "hover")
         return HoverOCP::create(current_state, terminal_state);
@@ -70,6 +84,9 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
         // NOTE: LandingOCP::create signature is (current, terminal, prev_U, prev_X).
         // Pass them in the correct order — prev_U first, prev_X second.
         return LandingOCP::create(current_state, terminal_state, prev_U, prev_X);
+    if (ocp_type == "stateswitch")
+        return StateswitchOCP::create(current_state, terminal_state, prev_U, prev_X,
+                                      target_accel, prev_K);
     throw std::runtime_error("Unknown OCP type: " + ocp_type);
 }
 

@@ -26,7 +26,7 @@ public:
         double           max_thrust = 0.6;
 
         // n_shift: how many U steps to shift the warm-start on each solve.
-        // Set once by PlannerNode to n_replay_ — do not compute from solve time.
+        // Set once by PlannerNode to n_replay_.
         int n_shift = 1;
 
         Config() {
@@ -41,29 +41,39 @@ public:
         Eigen::VectorXd               next_state;
         std::vector<Eigen::VectorXd>  state_trajectory;
         std::vector<Eigen::VectorXd>  control_trajectory;
+        std::vector<Eigen::MatrixXd>  feedback_gains;
         double                        solve_time_ms = 0.0;
-        int                           solve_iters   = 0;   // ALIPDDP iteration count
+        int                           solve_iters   = 0;
         std::chrono::steady_clock::time_point solve_timestamp;
     };
 
     explicit QuadrotorMPC(const Config& config = Config());
     ~QuadrotorMPC() = default;
 
-    Result solve(const Eigen::VectorXd& current_state);
+    Result solve(const Eigen::VectorXd& current_state,
+                 const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero());
 
     void   setTerminalState(const Eigen::VectorXd& terminal);
     double getOcpDt() const;
     double last_solve_ms_ = 0.0;
 
 private:
-    void setupProblem(const Eigen::VectorXd& current_state);
-    void shiftWarmStart(int n_shift);
+    void setupProblem(const Eigen::VectorXd& current_state,
+                      const std::vector<Eigen::VectorXd>& warm_u,
+                      const std::vector<Eigen::VectorXd>& warm_x,
+                      const std::vector<Eigen::MatrixXd>& warm_k);
+
+    std::vector<Eigen::VectorXd> makeUwarm(int n_shift) const;
+    std::vector<Eigen::VectorXd> makeXshifted(int n_shift) const;
+    std::vector<Eigen::MatrixXd> makeKshifted(int n_shift) const;
 
     Config                                         config_;
     std::shared_ptr<OptimalControlProblem<double>> problem_;
     std::shared_ptr<ALIPDDP<double>>               solver_;
     Param                                          solver_params_;
 
-    std::vector<Eigen::VectorXd>  prev_X_;
-    std::vector<Eigen::VectorXd>  prev_U_;
+    std::vector<Eigen::VectorXd> prev_X_;
+    std::vector<Eigen::VectorXd> prev_U_;
+    std::vector<Eigen::MatrixXd> prev_K_;
+    Eigen::Vector3d              target_accel_ = Eigen::Vector3d::Zero();
 };
