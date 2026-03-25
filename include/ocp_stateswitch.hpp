@@ -189,8 +189,9 @@ class ZFloorCon:public StageConstraintBase<Scalar>{public:
         return(Vector<Scalar>(1)<<-x(2)).finished();}
     Matrix<Scalar> cx(const Vector<Scalar>& x,const Vector<Scalar>&)const override{
         Matrix<Scalar> J=Matrix<Scalar>::Zero(1,x.size());J(0,2)=Scalar(-1);return J;}
-    Matrix<Scalar> cu(const Vector<Scalar>&, const Vector<Scalar>&)const override{
-        return Matrix<Scalar>::Zero(1, u.size());} };
+    Matrix<Scalar> cu(const Vector<Scalar>&, const Vector<Scalar>& u) const override{
+        return Matrix<Scalar>::Zero(1, u.size());}
+};
 
 template<typename Scalar>
 class VzMinCon:public StageConstraintBase<Scalar>{Scalar vz_min_;public:
@@ -200,8 +201,9 @@ class VzMinCon:public StageConstraintBase<Scalar>{Scalar vz_min_;public:
         return(Vector<Scalar>(1)<<vz_min_-x(5)).finished();}
     Matrix<Scalar> cx(const Vector<Scalar>& x,const Vector<Scalar>&)const override{
         Matrix<Scalar> J=Matrix<Scalar>::Zero(1,x.size());J(0,5)=Scalar(-1);return J;}
-    Matrix<Scalar> cu(const Vector<Scalar>&, const Vector<Scalar>&)const override{
-        return Matrix<Scalar>::Zero(1, u.size());} };
+    Matrix<Scalar> cu(const Vector<Scalar>&, const Vector<Scalar>& u) const override{
+        return Matrix<Scalar>::Zero(1, u.size());}
+};
 
 // SOC glideslope in relative frame. Cone apex at origin (target).
 template<typename Scalar>
@@ -226,7 +228,7 @@ public:
         J(2,1) = Scalar(-1.0);
         return J;
     }
-    Matrix<Scalar> cu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
+    Matrix<Scalar> cu(const Vector<Scalar>&, const Vector<Scalar>& u) const override {
         return Matrix<Scalar>::Zero(3, u.size());
     }
 };

@@ -108,6 +108,13 @@ add_executable(comando_planner
 )
 configure_target(comando_planner)
 
+# ── Executable 2: stateswitch OCP test
+add_executable(test_stateswitch_ocp
+  src/test_stateswitch_ocp.cpp
+  
+)
+configure_target(test_stateswitch_ocp)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner
