@@ -11,6 +11,11 @@
 ///
 /// This header creates subscriptions and publishers directly in the planner node,
 /// avoiding the extra ROS2 hop that caused tracking issues in the CoManDO version.
+///
+/// EXPECTED ROS GRAPH (Crazyflie):
+/// - Planner node: `/comando_planner`
+/// - Input topics (from crazyswarm2): `/<drone_name>/pose`, `/<drone_name>/odom`
+/// - Output topic (to crazyswarm2): `/<drone_name>/cmd_full_state`
 
 #pragma once
 

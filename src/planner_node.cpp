@@ -23,6 +23,7 @@
 #include "ocp_registry.hpp"
 #include "platform/crazyflie.hpp"
 #include "platform/px4.hpp"
+#include "platform/target_tracker.hpp"
 
 #ifdef HAS_ACADOS
 #include "acados_solver.hpp"
@@ -51,6 +52,19 @@ struct SolverResult {
     double solve_time_ms = 0.0;
     int solve_iters = 0;
     std::chrono::steady_clock::time_point solve_timestamp;
+
+    bool is_relative_plan = false;
+    Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
+    Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
+    Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
+};
+
+struct TargetSnapshot {
+    bool valid = false;
+    Eigen::Vector3d position = Eigen::Vector3d::Zero();
+    Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+    Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
+    rclcpp::Time timestamp{0, 0, RCL_ROS_TIME};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +85,8 @@ public:
         this->declare_parameter("hover_target_z", 1.0);
         this->declare_parameter("n_replay", 4);
         this->declare_parameter("mass_kg", 0.027);
+        this->declare_parameter("target_odom_topic", std::string("/target/odom"));
+        this->declare_parameter("target_accel_topic", std::string("/target/accel"));
 
         // Get parameters
         ocp_type_ = this->get_parameter("ocp_type").as_string();
@@ -81,6 +97,8 @@ public:
         mode_ = this->get_parameter("mode").as_string();
         n_replay_ = this->get_parameter("n_replay").as_int();
         mass_kg_ = this->get_parameter("mass_kg").as_double();
+        target_odom_topic_ = this->get_parameter("target_odom_topic").as_string();
+        target_accel_topic_ = this->get_parameter("target_accel_topic").as_string();
 
         double tx = this->get_parameter("hover_target_x").as_double();
         double ty = this->get_parameter("hover_target_y").as_double();
@@ -141,6 +159,12 @@ if (platform_ == "crazyflie") {
     throw std::runtime_error("Unknown platform: " + platform_);
 }
 
+if (ocp_type_ == "stateswitch") {
+    platform::target_tracker::setup(
+        this, sensor_cb_group_, target_odom_topic_, target_accel_topic_,
+        target_state_, target_mutex_, target_handles_);
+}
+
         // Trajectory publisher (for visualization)
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
@@ -185,6 +209,28 @@ bool hasState() const {
     return false;
 }
 
+bool hasFreshTargetState() const {
+    if (ocp_type_ != "stateswitch") return true;
+    std::lock_guard<std::mutex> lk(target_mutex_);
+    return target_state_.isFresh(this->now(), target_state_max_age_sec_);
+}
+
+TargetSnapshot getTargetSnapshot() const {
+    TargetSnapshot s;
+    if (ocp_type_ != "stateswitch") {
+        s.valid = true;
+        return s;
+    }
+
+    std::lock_guard<std::mutex> lk(target_mutex_);
+    s.position = target_state_.position;
+    s.velocity = target_state_.velocity;
+    s.acceleration = target_state_.acceleration;
+    s.timestamp = target_state_.timestamp;
+    s.valid = target_state_.isFresh(this->now(), target_state_max_age_sec_);
+    return s;
+}
+
 Eigen::VectorXd getCurrentState() const {
     std::lock_guard<std::mutex> lk(state_mutex_);
     if (platform_ == "crazyflie") {
@@ -205,9 +251,23 @@ Eigen::VectorXd getCurrentState() const {
             return;
         }
 
+        if (!hasFreshTargetState()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Waiting for fresh target state...");
+            return;
+        }
+
         if (replay_ticks_since_solve_.load() < n_replay_) return;
 
-        Eigen::VectorXd x0 = getCurrentState();
+        Eigen::VectorXd x0_abs = getCurrentState();
+        TargetSnapshot target_snapshot = getTargetSnapshot();
+        Eigen::VectorXd x0 = x0_abs;
+        if (ocp_type_ == "stateswitch") {
+            x0 = Eigen::VectorXd::Zero(13);
+            x0.segment(0, 3) = x0_abs.segment(0, 3) - target_snapshot.position;
+            x0.segment(3, 3) = x0_abs.segment(3, 3) - target_snapshot.velocity;
+            x0.segment(6, 7) = x0_abs.segment(6, 7);
+        }
 
 if (!is_flying_) {
     is_flying_ = true;
@@ -225,11 +285,19 @@ if (!is_flying_) {
                 x0(0), x0(1), x0(2), x0(3), x0(4), x0(5));
         }
 
-        SolverResult result = callSolver(x0);
+        const Eigen::Vector3d target_accel =
+            (ocp_type_ == "stateswitch") ? target_snapshot.acceleration : Eigen::Vector3d::Zero();
+        SolverResult result = callSolver(x0, target_accel);
+        if (ocp_type_ == "stateswitch") {
+            result.is_relative_plan = true;
+            result.target_snapshot_pos = target_snapshot.position;
+            result.target_snapshot_vel = target_snapshot.velocity;
+            result.target_snapshot_acc = target_snapshot.acceleration;
+        }
 
         if (!result.success || result.state_trajectory.size() < 2) {
             RCLCPP_WARN(this->get_logger(), "Solve FAILED — holding");
-            Eigen::VectorXd x_hold = x0;
+            Eigen::VectorXd x_hold = x0_abs;
             x_hold.segment(3, 3).setZero();
             x_hold.segment(10, 3).setZero();
             publishCommand(x_hold, Eigen::VectorXd::Zero(4));
@@ -249,6 +317,11 @@ if (!is_flying_) {
             const int N = static_cast<int>(result.state_trajectory.size()) - 1;
             mpc_replay_idx_ = std::min(1 + k, N);
             mpc_active_solve_num_ = solve_count_;
+            last_plan_is_relative_ = result.is_relative_plan;
+            last_target_snapshot_pos_ = result.target_snapshot_pos;
+            last_target_snapshot_vel_ = result.target_snapshot_vel;
+            last_target_snapshot_acc_ = result.target_snapshot_acc;
+            last_solve_wall_time_ = result.solve_timestamp;
         }
         replay_ticks_since_solve_.store(0);
 
@@ -295,10 +368,11 @@ if (!is_flying_) {
     // ─────────────────────────────────────────────────────────────────────────
     // SOLVER CALL
     // ─────────────────────────────────────────────────────────────────────────
-    SolverResult callSolver(const Eigen::VectorXd& state) {
+    SolverResult callSolver(const Eigen::VectorXd& state,
+                            const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero()) {
         SolverResult result;
         if (solver_type_ == "alipddp" && alipddp_mpc_) {
-            auto r = alipddp_mpc_->solve(state);
+            auto r = alipddp_mpc_->solve(state, target_accel);
             result.success = r.success;
             result.next_state = r.next_state;
             result.state_trajectory = r.state_trajectory;
@@ -306,6 +380,7 @@ if (!is_flying_) {
             result.solve_time_ms = r.solve_time_ms;
             result.solve_iters = r.solve_iters;
             result.solve_timestamp = r.solve_timestamp;
+            result.is_relative_plan = (ocp_type_ == "stateswitch");
         }
 #ifdef HAS_ACADOS
         else if (solver_type_ == "acados" && acados_mpc_) {
@@ -316,6 +391,7 @@ if (!is_flying_) {
             result.control_trajectory = r.control_trajectory;
             result.solve_time_ms = r.solve_time_ms;
             result.solve_timestamp = r.solve_timestamp;
+            result.is_relative_plan = (ocp_type_ == "stateswitch");
         }
 #endif
         return result;
@@ -504,6 +580,8 @@ void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
     // MEMBERS - Configuration
     // ─────────────────────────────────────────────────────────────────────────
     std::string ocp_type_, platform_, solver_type_, mode_, drone_name_;
+    std::string target_odom_topic_ = "/target/odom";
+    std::string target_accel_topic_ = "/target/accel";
     bool logging_enabled_;
     double ocp_dt_ = 0.05;
     double mass_kg_ = 0.027;
@@ -546,6 +624,12 @@ platform::px4::Handles px4_handles_;
     // State mutex (shared across platforms)
     mutable std::mutex state_mutex_;
 
+    // Target-tracker state (used by stateswitch OCP only)
+    platform::target_tracker::TargetState target_state_;
+    platform::target_tracker::Handles target_handles_;
+    mutable std::mutex target_mutex_;
+    double target_state_max_age_sec_ = 0.2;
+
     // Callback groups
     rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
     rclcpp::CallbackGroup::SharedPtr solver_cb_group_;
@@ -557,6 +641,13 @@ platform::px4::Handles px4_handles_;
 
     // Open-loop state
     std::vector<Eigen::VectorXd> ol_ref_X_, ol_ref_U_;
+
+    // Last solve snapshot (for stateswitch replay/log reconstruction)
+    bool last_plan_is_relative_ = false;
+    Eigen::Vector3d last_target_snapshot_pos_ = Eigen::Vector3d::Zero();
+    Eigen::Vector3d last_target_snapshot_vel_ = Eigen::Vector3d::Zero();
+    Eigen::Vector3d last_target_snapshot_acc_ = Eigen::Vector3d::Zero();
+    Clock::time_point last_solve_wall_time_{};
     int ol_replay_step_ = 0;
     bool ol_done_logged_ = false;
     Clock::time_point ol_replay_start_time_;

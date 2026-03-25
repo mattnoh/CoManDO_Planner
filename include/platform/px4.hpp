@@ -11,6 +11,12 @@
 /// Frame conversions:
 /// - Position: ENU (x=E, y=N, z=Up) ↔ NED (x=N, y=E, z=Down)
 /// - Rotation: q_ENU ↔ q_NED via quaternion transform
+///
+/// EXPECTED ROS GRAPH (PX4):
+/// - Planner node: `/comando_planner`
+/// - Input topic (from PX4 bridge): `/fmu/out/vehicle_odometry`
+/// - Output topics (to PX4 bridge): `/fmu/in/trajectory_setpoint`,
+///   `/fmu/in/offboard_control_mode`, `/fmu/in/vehicle_command`
 
 #pragma once
 
