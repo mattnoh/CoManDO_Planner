@@ -25,6 +25,7 @@
 #include "platform/px4.hpp"
 #include "platform/target_tracker.hpp"
 #include "state_monitor.hpp"
+#include "trajectory_replayer.hpp"
 
 #include <chrono>
 #include <memory>
@@ -296,20 +297,14 @@ if (!is_flying_) {
             solve_count_, result.solve_time_ms, result.solve_iters,
             x0(0), x0(1), x0(2));
 
-        {
-            std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
-            mpc_traj_ = result.state_trajectory;
-            mpc_ctrl_ = result.control_trajectory;
-            const int k = static_cast<int>(std::round(result.solve_time_ms / (ocp_dt_ * 1000.0)));
-            const int N = static_cast<int>(result.state_trajectory.size()) - 1;
-            mpc_replay_idx_ = std::min(1 + k, N);
-            mpc_active_solve_num_ = solve_count_;
-            last_plan_is_relative_ = result.is_relative_plan;
-            last_target_snapshot_pos_ = result.target_snapshot_pos;
-            last_target_snapshot_vel_ = result.target_snapshot_vel;
-            last_target_snapshot_acc_ = result.target_snapshot_acc;
-            last_solve_wall_time_ = result.solve_timestamp;
-        }
+        trajectory_replayer_.updatePlan(
+            result.state_trajectory,
+            result.control_trajectory,
+            result.solve_time_ms,
+            solve_count_,
+            result.is_relative_plan,
+            result.solve_timestamp,
+            ocp_dt_);
         replay_ticks_since_solve_.store(0);
         is_primed_.store(true);
 
@@ -326,67 +321,21 @@ if (!is_flying_) {
     // REPLAY TICK - time-indexed replay for variable-step stateswitch
     // ─────────────────────────────────────────────────────────────────────────
     void mpcReplayTick() {
-        constexpr int IDX_DT = 13;
-
         if (!is_primed_.load()) return;
 
-        const Clock::time_point now_wall = Clock::now();
-        Eigen::VectorXd x_cmd = Eigen::VectorXd::Zero(13);
-        Eigen::VectorXd u_cmd = Eigen::VectorXd::Zero(4);
-        int active_solve_num = -1;
-
-        bool plan_is_relative = false;
-        double elapsed = 0.0;
-        double horizon_end = 0.0;
-        Eigen::VectorXd x_rel_k;
-
-        {
-            std::lock_guard<std::mutex> lk(mpc_traj_mutex_);
-            if (mpc_traj_.empty()) {
-                replay_ticks_since_solve_.fetch_add(1);
-                return;
-            }
-
-            active_solve_num = mpc_active_solve_num_;
-            plan_is_relative = last_plan_is_relative_;
-
-            if (!plan_is_relative) {
-                const int N = static_cast<int>(mpc_traj_.size()) - 1;
-                elapsed = std::chrono::duration<double>(now_wall - last_solve_wall_time_).count();
-                int idx = std::min(static_cast<int>(elapsed / ocp_dt_), N);
-                idx = std::max(0, idx);
-                mpc_replay_idx_ = idx;
-
-                if (mpc_traj_[idx].size() >= 13) x_cmd = mpc_traj_[idx].head(13);
-                if (!mpc_ctrl_.empty()) {
-                    const int u_idx = std::min(idx, static_cast<int>(mpc_ctrl_.size()) - 1);
-                    u_cmd = mpc_ctrl_[u_idx];
-                }
-                horizon_end = N * ocp_dt_;
-            } else {
-                elapsed = std::chrono::duration<double>(now_wall - last_solve_wall_time_).count();
-
-                const int N = static_cast<int>(mpc_traj_.size()) - 1;
-                int idx = 0;
-                while (idx + 1 < static_cast<int>(mpc_traj_.size()) &&
-                       mpc_traj_[idx].size() > IDX_DT &&
-                       mpc_traj_[idx](IDX_DT) < elapsed) {
-                    ++idx;
-                }
-                idx = std::min(idx, N);
-                mpc_replay_idx_ = idx;
-
-                x_rel_k = mpc_traj_[idx];
-                if (!mpc_ctrl_.empty()) {
-                    const int u_idx = std::min(idx, static_cast<int>(mpc_ctrl_.size()) - 1);
-                    u_cmd = mpc_ctrl_[u_idx];
-                }
-
-                if (!mpc_traj_.empty() && mpc_traj_.back().size() > IDX_DT) {
-                    horizon_end = mpc_traj_.back()(IDX_DT);
-                }
-            }
+        auto replay = trajectory_replayer_.sample(Clock::now(), ocp_dt_);
+        if (!replay.has_plan) {
+            replay_ticks_since_solve_.fetch_add(1);
+            return;
         }
+
+        int active_solve_num = replay.active_solve_num;
+        bool plan_is_relative = replay.plan_is_relative;
+        double elapsed = replay.elapsed;
+        double horizon_end = replay.horizon_end;
+        Eigen::VectorXd x_cmd = replay.x_cmd;
+        Eigen::VectorXd u_cmd = replay.u_cmd;
+        Eigen::VectorXd x_rel_k = replay.x_rel_k;
 
         if (plan_is_relative) {
             if (elapsed > horizon_end + 0.2) {
@@ -649,12 +598,8 @@ void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
     // Trajectory publisher
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
 
-    // MPC trajectory buffer
-    std::mutex mpc_traj_mutex_;
-    std::vector<Eigen::VectorXd> mpc_traj_;
-    std::vector<Eigen::VectorXd> mpc_ctrl_;
-    int mpc_replay_idx_ = 1;
-    int mpc_active_solve_num_ = -1;
+    // Replay buffer and sampler
+    TrajectoryReplayer trajectory_replayer_;
 
     // Tick counter
     std::atomic<int> replay_ticks_since_solve_{0};
@@ -680,12 +625,6 @@ void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
     // Open-loop state
     std::vector<Eigen::VectorXd> ol_ref_X_, ol_ref_U_;
 
-    // Last solve snapshot (for stateswitch replay/log reconstruction)
-    bool last_plan_is_relative_ = false;
-    Eigen::Vector3d last_target_snapshot_pos_ = Eigen::Vector3d::Zero();
-    Eigen::Vector3d last_target_snapshot_vel_ = Eigen::Vector3d::Zero();
-    Eigen::Vector3d last_target_snapshot_acc_ = Eigen::Vector3d::Zero();
-    Clock::time_point last_solve_wall_time_{};
     int ol_replay_step_ = 0;
     bool ol_done_logged_ = false;
     Clock::time_point ol_replay_start_time_;
