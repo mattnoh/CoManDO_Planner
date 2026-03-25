@@ -14,19 +14,10 @@ public:
     struct Config {
         std::string ocp_type = "hover";
 
-        int              horizon   = 30;
-        double           dt        = 0.02;
-        double           mass      = 0.027;
-        Eigen::Matrix3d  inertia   = (Eigen::Matrix3d() <<
-            1.66e-5, 0.0, 0.0,
-            0.0, 1.66e-5, 0.0,
-            0.0, 0.0, 2.92e-5).finished();
+        // Planner-provided terminal state for OCPs that use it.
+        Eigen::VectorXd terminal_state;
 
-        Eigen::VectorXd  terminal_state;
-        double           max_thrust = 0.6;
-
-        // n_shift: how many U steps to shift the warm-start on each solve.
-        // Set once by PlannerNode to n_replay_.
+        // Warm-start shift count (PlannerNode sets this from replay settings).
         int n_shift = 1;
 
         Config() {

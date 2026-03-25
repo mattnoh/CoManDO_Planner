@@ -16,11 +16,7 @@ QuadrotorMPC::QuadrotorMPC(const Config& config) : config_(config) {
 }
 
 double QuadrotorMPC::getOcpDt() const {
-    try {
-        return OCPRegistry::getDT(config_.ocp_type);
-    } catch (const std::runtime_error&) {
-        return config_.dt;
-    }
+    return OCPRegistry::getDT(config_.ocp_type);
 }
 
 std::vector<Eigen::VectorXd> QuadrotorMPC::makeUwarm(int n_shift) const {

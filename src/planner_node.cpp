@@ -26,6 +26,7 @@
 #include "platform/target_tracker.hpp"
 #include "state_monitor.hpp"
 #include "trajectory_replayer.hpp"
+#include "planner_runtime_config.hpp"
 
 #include <chrono>
 #include <memory>
@@ -63,48 +64,29 @@ struct SolverResult {
 class PlannerNode : public rclcpp::Node {
 public:
     PlannerNode() : Node("comando_planner") {
-        // Declare parameters
-        this->declare_parameter("ocp_type", std::string("landing"));
-        this->declare_parameter("drone_name", std::string("cf_1"));
-        this->declare_parameter("enable_logging", true);
-        this->declare_parameter("platform", std::string("crazyflie"));
-        this->declare_parameter("solver", std::string("alipddp"));
-        this->declare_parameter("mode", std::string("mpc"));
-        this->declare_parameter("hover_target_x", 0.0);
-        this->declare_parameter("hover_target_y", 0.0);
-        this->declare_parameter("hover_target_z", 1.0);
-        this->declare_parameter("n_replay", 4);
-        this->declare_parameter("mass_kg", 0.027);
-        this->declare_parameter("target_odom_topic", std::string("/target/odom"));
-        this->declare_parameter("target_accel_topic", std::string("/target/accel"));
-        this->declare_parameter("enable_terminal_freeze", true);
-        this->declare_parameter("terminal_freeze_enter_pos", 0.20);
-        this->declare_parameter("terminal_freeze_enter_vel", 0.10);
-        this->declare_parameter("terminal_freeze_require_vel", false);
-        this->declare_parameter("terminal_freeze_exit_pos", 0.20);
+        const PlannerRuntimeConfig runtime_cfg = loadPlannerRuntimeConfig(this);
 
-        // Get parameters
-        ocp_type_ = this->get_parameter("ocp_type").as_string();
-        drone_name_ = this->get_parameter("drone_name").as_string();
-        logging_enabled_ = this->get_parameter("enable_logging").as_bool();
-        platform_ = this->get_parameter("platform").as_string();
-        solver_type_ = this->get_parameter("solver").as_string();
-        mode_ = this->get_parameter("mode").as_string();
-        n_replay_ = this->get_parameter("n_replay").as_int();
-        mass_kg_ = this->get_parameter("mass_kg").as_double();
-        target_odom_topic_ = this->get_parameter("target_odom_topic").as_string();
-        target_accel_topic_ = this->get_parameter("target_accel_topic").as_string();
-        enable_terminal_freeze_ = this->get_parameter("enable_terminal_freeze").as_bool();
-        terminal_freeze_enter_pos_ = this->get_parameter("terminal_freeze_enter_pos").as_double();
-        terminal_freeze_enter_vel_ = this->get_parameter("terminal_freeze_enter_vel").as_double();
-        terminal_freeze_require_vel_ = this->get_parameter("terminal_freeze_require_vel").as_bool();
-        terminal_freeze_exit_pos_ = this->get_parameter("terminal_freeze_exit_pos").as_double();
+        ocp_type_ = runtime_cfg.ocp_type;
+        drone_name_ = runtime_cfg.drone_name;
+        logging_enabled_ = runtime_cfg.enable_logging;
+        platform_ = runtime_cfg.platform;
+        solver_type_ = runtime_cfg.solver;
+        mode_ = runtime_cfg.mode;
+        n_replay_ = runtime_cfg.n_replay;
+        mass_kg_ = runtime_cfg.mass_kg;
+        target_odom_topic_ = runtime_cfg.target_odom_topic;
+        target_accel_topic_ = runtime_cfg.target_accel_topic;
+        enable_terminal_freeze_ = runtime_cfg.enable_terminal_freeze;
+        terminal_freeze_enter_pos_ = runtime_cfg.terminal_freeze_enter_pos;
+        terminal_freeze_enter_vel_ = runtime_cfg.terminal_freeze_enter_vel;
+        terminal_freeze_require_vel_ = runtime_cfg.terminal_freeze_require_vel;
+        terminal_freeze_exit_pos_ = runtime_cfg.terminal_freeze_exit_pos;
 
-        double tx = this->get_parameter("hover_target_x").as_double();
-        double ty = this->get_parameter("hover_target_y").as_double();
-        double tz = this->get_parameter("hover_target_z").as_double();
+        const double tx = runtime_cfg.hover_target.x();
+        const double ty = runtime_cfg.hover_target.y();
+        const double tz = runtime_cfg.hover_target.z();
 
-        ocp_dt_ = OCPRegistry::getDT(ocp_type_);
+        ocp_dt_ = runtime_cfg.ocp_dt;
 
         Eigen::VectorXd terminal = Eigen::VectorXd::Zero(13);
         terminal(0) = tx; terminal(1) = ty; terminal(2) = tz;

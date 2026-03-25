@@ -6,6 +6,7 @@
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <mutex>
 #include <vector>
