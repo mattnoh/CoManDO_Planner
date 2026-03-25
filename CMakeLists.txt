@@ -111,7 +111,7 @@ configure_target(comando_planner)
 # ── Executable 2: stateswitch OCP test
 add_executable(test_stateswitch_ocp
   src/test_stateswitch_ocp.cpp
-  
+  ${SHARED_SOURCES}
 )
 configure_target(test_stateswitch_ocp)
 
