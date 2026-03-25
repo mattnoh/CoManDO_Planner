@@ -28,6 +28,8 @@ static constexpr double THH = 0.2;
 
 // ── Vehicle parameters ───────────────────────────────────────────────────────
 static constexpr double MASS = 0.027;
+static constexpr int DEFAULT_N_REPLAY = 7;
+static constexpr double DEFAULT_MASS_KG = MASS;
 static constexpr double IXX = 1.66e-5;
 static constexpr double IYY = 1.66e-5;
 static constexpr double IZZ = 2.92e-5;

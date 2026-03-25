@@ -13,6 +13,16 @@
 
 class TrajectoryReplayer {
 public:
+    void clear() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        state_trajectory_.clear();
+        control_trajectory_.clear();
+        replay_idx_ = 1;
+        active_solve_num_ = -1;
+        plan_is_relative_ = false;
+        last_solve_wall_time_ = std::chrono::steady_clock::time_point{};
+    }
+
     struct ReplaySample {
         bool has_plan = false;
         int active_solve_num = -1;

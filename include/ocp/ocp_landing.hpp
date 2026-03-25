@@ -14,6 +14,8 @@ namespace LandingOCP {
 const int HORIZON = 100;
 const double DT = 0.05;
 const double MASS = 0.027;
+const int DEFAULT_N_REPLAY = 4;
+const double DEFAULT_MASS_KG = MASS;
 
 const double J_SCALE = 1.0 / 1.66e-5;
 const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<

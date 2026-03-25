@@ -1,59 +1,74 @@
 from launch import LaunchDescription
-from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
 
 def generate_launch_description():
     """
-    CoManDO Planner launch file.
-    Parameters:
-    - drone_name:      Name of the drone         (default: cf_1)
-    - enable_logging:  Enable CSV logging         (default: true)
-    - ocp_type:        OCP formulation            (default: landing)
-    - n_replay:        Setpoints sent between solves (default: 4 → 200ms at ocp_dt=50ms)
-                       Change to 10 for 500ms between solves.
-                       n_replay * ocp_dt = solve interval.
-    - platform:        Hardware platform           (default: crazyflie)
-    - solver:          Solver backend              (default: alipddp)
-    - mode:            Execution mode              (default: mpc)
-    - hover_target_x:  Target x                   (default: 0.0)
-    - hover_target_y:  Target y                   (default: 0.0)
-    - hover_target_z:  Target z (0.0=land, 1.0=hover) (default: 0.0)
+    Solver-ready launcher.
+
+    Starts /comando_planner with subscriptions/publishers active and solver paused.
+    Use ocp_launch.py to push an OCP profile and trigger command_seq.
     """
 
     args = [
-        DeclareLaunchArgument('drone_name',     default_value='cf_1'),
+        DeclareLaunchArgument('drone_name', default_value='cf_1'),
+        DeclareLaunchArgument('platform', default_value='crazyflie'),
+        DeclareLaunchArgument('solver', default_value='alipddp'),
         DeclareLaunchArgument('enable_logging', default_value='true'),
-        DeclareLaunchArgument('ocp_type',       default_value='landing'),
-        DeclareLaunchArgument('n_replay',       default_value='4',
-            description='Setpoints sent per solve cycle. '
-                        'n_replay * ocp_dt_ms = solve interval in ms. '
-                        'ocp_dt=50ms: n_replay=4→200ms, n_replay=10→500ms.'),
-        DeclareLaunchArgument('platform',       default_value='crazyflie'),
-        DeclareLaunchArgument('solver',         default_value='alipddp'),
-        DeclareLaunchArgument('mode',           default_value='mpc'),
+
+        DeclareLaunchArgument('target_odom_topic', default_value='/target/odom'),
+        DeclareLaunchArgument('target_accel_topic', default_value='/target/accel'),
+
+        DeclareLaunchArgument('enable_terminal_freeze', default_value='true'),
+        DeclareLaunchArgument('terminal_freeze_enter_pos', default_value='0.20'),
+        DeclareLaunchArgument('terminal_freeze_enter_vel', default_value='0.10'),
+        DeclareLaunchArgument('terminal_freeze_require_vel', default_value='false'),
+        DeclareLaunchArgument('terminal_freeze_exit_pos', default_value='0.20'),
+
+        # Baseline defaults used before an OCP is commanded.
+        DeclareLaunchArgument('ocp_type', default_value='landing'),
+        DeclareLaunchArgument('mode', default_value='mpc'),
         DeclareLaunchArgument('hover_target_x', default_value='0.0'),
         DeclareLaunchArgument('hover_target_y', default_value='0.0'),
         DeclareLaunchArgument('hover_target_z', default_value='0.0'),
+        DeclareLaunchArgument('n_replay', default_value='4'),
+        DeclareLaunchArgument('mass_kg', default_value='0.027'),
     ]
 
-    planner_node = Node(
+    node = Node(
         package='comando_planner',
         executable='comando_planner',
         name='comando_planner',
         output='screen',
         parameters=[{
-            'drone_name':      LaunchConfiguration('drone_name'),
-            'enable_logging':  LaunchConfiguration('enable_logging'),
-            'ocp_type':        LaunchConfiguration('ocp_type'),
-            'n_replay':        LaunchConfiguration('n_replay'),
-            'platform':        LaunchConfiguration('platform'),
-            'solver':          LaunchConfiguration('solver'),
-            'mode':            LaunchConfiguration('mode'),
-            'hover_target_x':  LaunchConfiguration('hover_target_x'),
-            'hover_target_y':  LaunchConfiguration('hover_target_y'),
-            'hover_target_z':  LaunchConfiguration('hover_target_z'),
+            'drone_name': LaunchConfiguration('drone_name'),
+            'platform': LaunchConfiguration('platform'),
+            'solver': LaunchConfiguration('solver'),
+            'enable_logging': LaunchConfiguration('enable_logging'),
+
+            'target_odom_topic': LaunchConfiguration('target_odom_topic'),
+            'target_accel_topic': LaunchConfiguration('target_accel_topic'),
+
+            'enable_terminal_freeze': LaunchConfiguration('enable_terminal_freeze'),
+            'terminal_freeze_enter_pos': LaunchConfiguration('terminal_freeze_enter_pos'),
+            'terminal_freeze_enter_vel': LaunchConfiguration('terminal_freeze_enter_vel'),
+            'terminal_freeze_require_vel': LaunchConfiguration('terminal_freeze_require_vel'),
+            'terminal_freeze_exit_pos': LaunchConfiguration('terminal_freeze_exit_pos'),
+
+            'ocp_type': LaunchConfiguration('ocp_type'),
+            'mode': LaunchConfiguration('mode'),
+            'hover_target_x': LaunchConfiguration('hover_target_x'),
+            'hover_target_y': LaunchConfiguration('hover_target_y'),
+            'hover_target_z': LaunchConfiguration('hover_target_z'),
+            'n_replay': LaunchConfiguration('n_replay'),
+            'mass_kg': LaunchConfiguration('mass_kg'),
+
+            # Solver starts ready but paused.
+            'start_paused': True,
+            'command_seq': 0,
         }]
     )
 
-    return LaunchDescription(args + [planner_node])
+    return LaunchDescription(args + [node])

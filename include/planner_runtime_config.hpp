@@ -17,8 +17,8 @@ struct PlannerRuntimeConfig {
 
     Eigen::Vector3d hover_target = Eigen::Vector3d(0.0, 0.0, 1.0);
 
-    int n_replay = 4;
-    double mass_kg = 0.027;
+    int n_replay = 0;
+    double mass_kg = 0.0;
 
     std::string target_odom_topic = "/target/odom";
     std::string target_accel_topic = "/target/accel";
@@ -29,13 +29,22 @@ struct PlannerRuntimeConfig {
     bool terminal_freeze_require_vel = false;
     double terminal_freeze_exit_pos = 0.20;
 
-    double ocp_dt = 0.05;
+    bool start_paused = true;
+    int command_seq = 0;
+
+    double ocp_dt = 0.0;
 };
 
 inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     PlannerRuntimeConfig cfg;
 
     node->declare_parameter("ocp_type", cfg.ocp_type);
+    cfg.ocp_type = node->get_parameter("ocp_type").as_string();
+
+    cfg.ocp_dt = OCPRegistry::getDT(cfg.ocp_type);
+    cfg.n_replay = OCPRegistry::getDefaultNReplay(cfg.ocp_type);
+    cfg.mass_kg = OCPRegistry::getDefaultMassKg(cfg.ocp_type);
+
     node->declare_parameter("drone_name", cfg.drone_name);
     node->declare_parameter("enable_logging", cfg.enable_logging);
     node->declare_parameter("platform", cfg.platform);
@@ -58,7 +67,9 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     node->declare_parameter("terminal_freeze_require_vel", cfg.terminal_freeze_require_vel);
     node->declare_parameter("terminal_freeze_exit_pos", cfg.terminal_freeze_exit_pos);
 
-    cfg.ocp_type = node->get_parameter("ocp_type").as_string();
+    node->declare_parameter("start_paused", cfg.start_paused);
+    node->declare_parameter("command_seq", cfg.command_seq);
+
     cfg.drone_name = node->get_parameter("drone_name").as_string();
     cfg.enable_logging = node->get_parameter("enable_logging").as_bool();
     cfg.platform = node->get_parameter("platform").as_string();
@@ -81,6 +92,8 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     cfg.terminal_freeze_require_vel = node->get_parameter("terminal_freeze_require_vel").as_bool();
     cfg.terminal_freeze_exit_pos = node->get_parameter("terminal_freeze_exit_pos").as_double();
 
-    cfg.ocp_dt = OCPRegistry::getDT(cfg.ocp_type);
+    cfg.start_paused = node->get_parameter("start_paused").as_bool();
+    cfg.command_seq = node->get_parameter("command_seq").as_int();
+
     return cfg;
 }
