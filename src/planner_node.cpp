@@ -24,7 +24,7 @@
 #include "platform/crazyflie.hpp"
 #include "platform/px4.hpp"
 #include "platform/target_tracker.hpp"
-
+#include "state_monitor.hpp"
 
 #include <chrono>
 #include <memory>
@@ -54,14 +54,6 @@ struct SolverResult {
     Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
-};
-
-struct TargetSnapshot {
-    bool valid = false;
-    Eigen::Vector3d position = Eigen::Vector3d::Zero();
-    Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
-    Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
-    rclcpp::Time timestamp{0, 0, RCL_ROS_TIME};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -127,10 +119,6 @@ public:
         alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
     }
 
-  // Initialize state
-        current_state_ = Eigen::VectorXd::Zero(13);
-        current_state_(6) = 1.0;
-
         // Initialize replay tick counter to n_replay_ so first solve fires immediately
         replay_ticks_since_solve_.store(n_replay_);
 
@@ -147,11 +135,11 @@ public:
 if (platform_ == "crazyflie") {
     platform::crazyflie::setup(
         this, sensor_cb_group_, drone_name_,
-        cf_state_, state_mutex_, cf_handles_);
+        state_monitor_.crazyflieState(), state_monitor_.stateMutex(), cf_handles_);
 } else if (platform_ == "px4") {
     platform::px4::setup(
         this, sensor_cb_group_,
-        px4_state_, state_mutex_, px4_handles_);
+        state_monitor_.px4State(), state_monitor_.stateMutex(), px4_handles_);
 } else {
     RCLCPP_ERROR(this->get_logger(), "Unknown platform: %s", platform_.c_str());
     throw std::runtime_error("Unknown platform: " + platform_);
@@ -160,7 +148,7 @@ if (platform_ == "crazyflie") {
 if (ocp_type_ == "stateswitch") {
     platform::target_tracker::setup(
         this, sensor_cb_group_, target_odom_topic_, target_accel_topic_,
-        target_state_, target_mutex_, target_handles_);
+        state_monitor_.targetState(), state_monitor_.targetMutex(), target_handles_);
 }
 
         // Trajectory publisher (for visualization)
@@ -199,44 +187,19 @@ private:
     // Check if state is available (platform-agnostic)
     // ─────────────────────────────────────────────────────────────────────────
 bool hasState() const {
-    if (platform_ == "crazyflie") {
-        return cf_state_.hasFullState();
-    } else if (platform_ == "px4") {
-        return px4_state_.hasFullState();
-    }
-    return false;
+    return state_monitor_.hasState(platform_);
 }
 
 bool hasFreshTargetState() const {
-    if (ocp_type_ != "stateswitch") return true;
-    std::lock_guard<std::mutex> lk(target_mutex_);
-    return target_state_.isFresh(this->now(), target_state_max_age_sec_);
+    return state_monitor_.hasFreshTargetState(ocp_type_, this->now());
 }
 
 TargetSnapshot getTargetSnapshot() const {
-    TargetSnapshot s;
-    if (ocp_type_ != "stateswitch") {
-        s.valid = true;
-        return s;
-    }
-
-    std::lock_guard<std::mutex> lk(target_mutex_);
-    s.position = target_state_.position;
-    s.velocity = target_state_.velocity;
-    s.acceleration = target_state_.acceleration;
-    s.timestamp = target_state_.timestamp;
-    s.valid = target_state_.isFresh(this->now(), target_state_max_age_sec_);
-    return s;
+    return state_monitor_.getTargetSnapshot(ocp_type_, this->now());
 }
 
 Eigen::VectorXd getCurrentState() const {
-    std::lock_guard<std::mutex> lk(state_mutex_);
-    if (platform_ == "crazyflie") {
-        return cf_state_.current;
-    } else if (platform_ == "px4") {
-        return px4_state_.current;
-    }
-    return current_state_;
+    return state_monitor_.getCurrentState(platform_);
 }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -432,13 +395,7 @@ if (!is_flying_) {
                     elapsed, horizon_end);
             }
 
-            Eigen::Vector3d tgt_pos_now = Eigen::Vector3d::Zero();
-            Eigen::Vector3d tgt_vel_now = Eigen::Vector3d::Zero();
-            {
-                std::lock_guard<std::mutex> lk(target_mutex_);
-                tgt_pos_now = target_state_.position;
-                tgt_vel_now = target_state_.velocity;
-            }
+            const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
 
             if (x_rel_k.size() >= 13) {
                 x_cmd.segment(0, 3) = x_rel_k.segment(0, 3) + tgt_pos_now;
@@ -679,14 +636,9 @@ void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
     // MPC solver
     std::unique_ptr<QuadrotorMPC> alipddp_mpc_;
 
-    // Platform state (each platform has its own state struct)
-platform::crazyflie::State cf_state_;
-platform::crazyflie::Handles cf_handles_;
-platform::px4::State px4_state_;
-platform::px4::Handles px4_handles_;
-
-    // Legacy state (kept for compatibility)
-    Eigen::VectorXd current_state_;
+    // Platform handles
+    platform::crazyflie::Handles cf_handles_;
+    platform::px4::Handles px4_handles_;
 
     // Timers
     rclcpp::TimerBase::SharedPtr solver_timer_;
@@ -707,14 +659,11 @@ platform::px4::Handles px4_handles_;
     // Tick counter
     std::atomic<int> replay_ticks_since_solve_{0};
 
-    // State mutex (shared across platforms)
-    mutable std::mutex state_mutex_;
+    // State and target ownership (thread-safe copy-out API)
+    StateMonitor state_monitor_;
 
-    // Target-tracker state (used by stateswitch OCP only)
-    platform::target_tracker::TargetState target_state_;
+    // Target-tracker handles
     platform::target_tracker::Handles target_handles_;
-    mutable std::mutex target_mutex_;
-    double target_state_max_age_sec_ = 0.2;
 
     // Callback groups
     rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
