@@ -16,7 +16,6 @@
 #include "planner_runtime_config.hpp"
 #include "planner_logging.hpp"
 #include "hover_controller.hpp"
-#include "ocp/ocp_tracking_circle.hpp"
 
 #include <chrono>
 #include <memory>
@@ -485,17 +484,9 @@ private:
             meta.target_snapshot_vel = result.target_snapshot_vel;
             meta.target_snapshot_acc = result.target_snapshot_acc;
 
-            if (ocp_type_ == "tracking_circle") {
-                meta.circle_center << runtime_cfg_.circle_center_x, runtime_cfg_.circle_center_y, runtime_cfg_.circle_center_z;
-                meta.circle_radius = runtime_cfg_.circle_R;
-                meta.circle_omega = runtime_cfg_.circle_omega;
-                meta.circle_phi0 = runtime_cfg_.circle_phi0;
-                if (result.extra.has_value()) {
-                    try {
-                        auto ex = std::any_cast<TrackingCircleOCP::TrackingCircleExtra>(result.extra);
-                        meta.circle_t_abs = ex.t_abs;
-                    } catch (const std::bad_any_cast&) {}
-                }
+            auto desc = OCPRegistry::getDescriptor(ocp_type_);
+            if (desc.prepare_log_meta) {
+                desc.prepare_log_meta(meta, result.extra, runtime_cfg_);
             }
 
             logger_.logSolveTrajectory(result.state_trajectory, result.control_trajectory, meta);
@@ -576,17 +567,10 @@ private:
         SolverResult result;
         if (solver_type_ == "alipddp" && alipddp_mpc_) {
             double t_abs = this->now().seconds();
+            auto desc = OCPRegistry::getDescriptor(ocp_type_);
             std::any extra;
-            
-            // Special handling for TrackingCircle params until registry gets a cleaner config system
-            if (ocp_type_ == "tracking_circle") {
-                TrackingCircleOCP::TrackingCircleExtra ex;
-                ex.tgt.center << runtime_cfg_.circle_center_x, runtime_cfg_.circle_center_y, runtime_cfg_.circle_center_z;
-                ex.tgt.R = runtime_cfg_.circle_R;
-                ex.tgt.omega = runtime_cfg_.circle_omega;
-                ex.tgt.phi0 = runtime_cfg_.circle_phi0;
-                ex.t_abs = t_abs;
-                extra = ex;
+            if (desc.prepare_extra) {
+                extra = desc.prepare_extra(runtime_cfg_, t_abs);
             }
 
             auto r = alipddp_mpc_->solve(state, target_accel, extra, t_abs);
@@ -679,17 +663,9 @@ private:
                 meta.target_snapshot_vel = result.target_snapshot_vel;
                 meta.target_snapshot_acc = result.target_snapshot_acc;
 
-                if (ocp_type_ == "tracking_circle") {
-                    meta.circle_center << runtime_cfg_.circle_center_x, runtime_cfg_.circle_center_y, runtime_cfg_.circle_center_z;
-                    meta.circle_radius = runtime_cfg_.circle_R;
-                    meta.circle_omega = runtime_cfg_.circle_omega;
-                    meta.circle_phi0 = runtime_cfg_.circle_phi0;
-                    if (result.extra.has_value()) {
-                        try {
-                            auto ex = std::any_cast<TrackingCircleOCP::TrackingCircleExtra>(result.extra);
-                            meta.circle_t_abs = ex.t_abs;
-                        } catch (const std::bad_any_cast&) {}
-                    }
+                auto desc = OCPRegistry::getDescriptor(ocp_type_);
+                if (desc.prepare_log_meta) {
+                    desc.prepare_log_meta(meta, result.extra, runtime_cfg_);
                 }
 
                 logger_.logSolveTrajectory(ol_ref_X_, ol_ref_U_, meta);

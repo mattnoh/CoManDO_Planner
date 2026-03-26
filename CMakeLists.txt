@@ -79,11 +79,9 @@ configure_target(test_stateswitch_ocp)
 
 # ── Executable 3: target_publisher
 add_executable(target_publisher src/target_publisher.cpp)
+configure_target(target_publisher)
 ament_target_dependencies(target_publisher rclcpp nav_msgs geometry_msgs)
 
-# ── Executable 4: target_circular
-add_executable(target_circular src/target_circular.cpp)
-ament_target_dependencies(target_circular rclcpp nav_msgs geometry_msgs)
 
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -91,7 +89,6 @@ install(TARGETS
     comando_planner
     test_stateswitch_ocp
     target_publisher
-    target_circular
   DESTINATION lib/${PROJECT_NAME}
 )
 

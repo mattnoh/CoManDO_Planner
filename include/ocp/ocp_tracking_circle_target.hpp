@@ -1,4 +1,4 @@
-/// @file ocp_tracking_circle.hpp
+/// @file ocp_tracking_circle_target.hpp
 /// @brief Single-shot OCP for quadrotor landing on a moving circular target.
 ///
 /// Port of quad_cf_tracking_ol_circle_rel.cpp from ALIPDDP-main.
@@ -26,6 +26,9 @@
 
 #pragma once
 
+#include "target/circular_target.hpp"
+#include "target/target_accel_buffer.hpp"
+
 #include "optimal_control_problem.h"
 #include "dynamics/discrete_dynamics_base.h"
 #include "dynamics/quad_6dof_dynamics_aug.h"
@@ -42,7 +45,7 @@
 
 #include "target/circular_target.hpp"
 
-namespace TrackingCircleOCP {
+namespace TrackingCircleTargetOCP {
 
 // ── Dimensions ────────────────────────────────────────────────────────────────
 static constexpr int NX = 13;
@@ -91,12 +94,12 @@ static constexpr double VZ_REF = -0.15;
 // ─────────────────────────────────────────────────────────────────────────────
 template<typename Scalar>
 class Quad6DOFVarTimeRelativeTV : public Quad6DOFVarTimeRelative<Scalar> {
-    target_models::CircularTarget circ_;
+    target_models::TargetAccelBuffer buf_;
     double t0_abs_;
 
 public:
-    Quad6DOFVarTimeRelativeTV(const target_models::CircularTarget& circ, double t0_abs)
-        : Quad6DOFVarTimeRelative<Scalar>(), circ_(circ), t0_abs_(t0_abs) {}
+    Quad6DOFVarTimeRelativeTV(const target_models::TargetAccelBuffer& buf, double t0_abs)
+        : Quad6DOFVarTimeRelative<Scalar>(), buf_(buf), t0_abs_(t0_abs) {}
 
     Vector<Scalar> f(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         auto xd = x.segment(0, this->NX_PHYS).template cast<double>();
@@ -104,23 +107,23 @@ public:
         double Th = static_cast<double>(u(IDX_THETA));
         double tabs = static_cast<double>(x(IDX_DT)) + t0_abs_;
 
-        Eigen::Vector3d a1 = circ_.accel(tabs);
+        Eigen::Vector3d a1 = buf_.getAccel(tabs);
         auto k1 = this->xdot_impl(xd, ud, a1);
 
-        Eigen::Vector3d a2 = circ_.accel(tabs + 0.5*Th);
+        Eigen::Vector3d a2 = buf_.getAccel(tabs + 0.5*Th);
         auto k2 = this->xdot_impl(xd + 0.5*Th*k1, ud, a2);
 
-        Eigen::Vector3d a3 = circ_.accel(tabs + 0.5*Th);
+        Eigen::Vector3d a3 = buf_.getAccel(tabs + 0.5*Th);
         auto k3 = this->xdot_impl(xd + 0.5*Th*k2, ud, a3);
 
-        Eigen::Vector3d a4 = circ_.accel(tabs + Th);
+        Eigen::Vector3d a4 = buf_.getAccel(tabs + Th);
         auto k4 = this->xdot_impl(xd + Th*k3, ud, a4);
 
         Eigen::VectorXd xn = xd + (Th/6.0)*(k1 + 2*k2 + 2*k3 + k4);
         xn.segment(6, 4).normalize();
 
         const_cast<Quad6DOFVarTimeRelativeTV*>(this)
-            ->setTargetAccel(circ_.accel(tabs + 0.5*Th));
+            ->setTargetAccel(buf_.getAccel(tabs + 0.5*Th));
 
         Vector<Scalar> res(14);
         res.segment(0, this->NX_PHYS) = xn.template cast<Scalar>();
@@ -134,13 +137,13 @@ public:
         double tabs = x14(IDX_DT) + t0_abs_;
         auto xd = x14.segment(0, this->NX_PHYS);
 
-        Eigen::Vector3d a1 = circ_.accel(tabs);
+        Eigen::Vector3d a1 = buf_.getAccel(tabs);
         auto k1 = this->xdot_impl(xd, u_phys, a1);
-        Eigen::Vector3d a2 = circ_.accel(tabs + 0.5*Th);
+        Eigen::Vector3d a2 = buf_.getAccel(tabs + 0.5*Th);
         auto k2 = this->xdot_impl(xd + 0.5*Th*k1, u_phys, a2);
-        Eigen::Vector3d a3 = circ_.accel(tabs + 0.5*Th);
+        Eigen::Vector3d a3 = buf_.getAccel(tabs + 0.5*Th);
         auto k3 = this->xdot_impl(xd + 0.5*Th*k2, u_phys, a3);
-        Eigen::Vector3d a4 = circ_.accel(tabs + Th);
+        Eigen::Vector3d a4 = buf_.getAccel(tabs + Th);
         auto k4 = this->xdot_impl(xd + Th*k3, u_phys, a4);
 
         Eigen::VectorXd xn14(14);
@@ -388,6 +391,7 @@ inline Param getSolverParams() {
 inline std::shared_ptr<OptimalControlProblem<double>> create(
     const Eigen::VectorXd& x0_abs,
     const target_models::CircularTarget& circ,
+    const target_models::TargetAccelBuffer& buf,
     double t0_abs,
     double th_init = TH_INIT,
     double th_min = THL,
@@ -395,11 +399,11 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
 {
     auto problem = std::make_shared<OptimalControlProblem<double>>(N);
 
-    auto dyn = std::make_shared<Quad6DOFVarTimeRelativeTV<double>>(circ, t0_abs);
+    auto dyn = std::make_shared<Quad6DOFVarTimeRelativeTV<double>>(buf, t0_abs);
     dyn->setMass(MASS);
     dyn->setGravity(GRAVITY);
     dyn->setJb(J_B);
-    dyn->setTargetAccel(circ.accel(t0_abs));
+    dyn->setTargetAccel(buf.getAccel(t0_abs));
 
     auto cost = std::make_shared<TimeCost<double>>(1e-4, 0.5, VZ_REF);
     auto tcost = std::make_shared<RelTermCost<double>>(1000.0, 2000.0, 200.0, 100.0, VZ_REF);
@@ -484,9 +488,10 @@ inline std::vector<Eigen::VectorXd> convertToAbsolute(
     return X_abs;
 }
 
-struct TrackingCircleExtra {
+struct TrackingCircleTargetExtra {
+    target_models::TargetAccelBuffer buf;
     target_models::CircularTarget tgt;
     double t_abs;
 };
 
-} // namespace TrackingCircleOCP
+} // namespace TrackingCircleTargetOCP

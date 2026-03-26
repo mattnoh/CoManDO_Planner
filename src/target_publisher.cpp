@@ -28,6 +28,8 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/accel_stamped.hpp>
 
+#include "target/circular_target.hpp"
+
 #include <cmath>
 #include <chrono>
 
@@ -72,26 +74,25 @@ private:
     {
         const rclcpp::Time stamp = now();
         const double t = (stamp - t_start_).seconds();
-        const double ph = omega_ * t + phi0_;
 
         // ── Kinematics ───────────────────────────────────────────────────────
-        const double cos_ph = std::cos(ph);
-        const double sin_ph = std::sin(ph);
+        target_models::CircularTarget tgt;
+        tgt.center = {center_x_, center_y_, center_z_};
+        tgt.R = radius_;
+        tgt.omega = omega_;
+        tgt.phi0 = phi0_;
 
-        // Position
-        const double px = center_x_ + radius_ * cos_ph;
-        const double py = center_y_ + radius_ * sin_ph;
-        const double pz = center_z_;
+        const auto px = tgt.pos(t).x();
+        const auto py = tgt.pos(t).y();
+        const auto pz = tgt.pos(t).z();
 
-        // Velocity (first derivative)
-        const double vx = -radius_ * omega_ * sin_ph;
-        const double vy =  radius_ * omega_ * cos_ph;
-        const double vz = 0.0;
+        const auto vx = tgt.vel(t).x();
+        const auto vy = tgt.vel(t).y();
+        const auto vz = tgt.vel(t).z();
 
-        // Centripetal acceleration (second derivative)
-        const double ax = -radius_ * omega_ * omega_ * cos_ph;
-        const double ay = -radius_ * omega_ * omega_ * sin_ph;
-        const double az = 0.0;
+        const auto ax = tgt.accel(t).x();
+        const auto ay = tgt.accel(t).y();
+        const auto az = tgt.accel(t).z();
 
         // ── Odometry message ─────────────────────────────────────────────────
         nav_msgs::msg::Odometry odom;

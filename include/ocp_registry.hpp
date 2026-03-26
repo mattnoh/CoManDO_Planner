@@ -11,6 +11,10 @@
 #include "ocp/ocp_landing.hpp"
 #include "ocp/ocp_stateswitch.hpp"
 #include "ocp/ocp_tracking_circle.hpp"
+#include "ocp/ocp_tracking_circle_target.hpp"
+
+#include "target/circular_target.hpp"
+#include "target/target_accel_buffer.hpp"
 
 #include <string>
 #include <stdexcept>
@@ -19,9 +23,12 @@
 #include <functional>
 #include <any>
 
+#include "planner_runtime_config_types.hpp"
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
 #include "rclcpp/rclcpp.hpp"
+
+#include "planner_logging.hpp"
 
 // Forward declare struct so we can use it in OCPRegistry
 struct TargetSnapshot {
@@ -49,7 +56,7 @@ struct SolverResult {
     std::any extra;
 };
 
-// Note: TrackingCircleOCP::CircularTarget must be in ocp_tracking_circle.hpp
+// Note: target_models::CircularTarget must be in target/circular_target.hpp
 
 struct OCPCreateArgs {
     Eigen::VectorXd current_state;
@@ -80,7 +87,9 @@ struct OCPDescriptor {
     std::function<void(SolverResult&,
         const TargetSnapshot&)>              post_process_result;
     
-    std::function<std::any(const std::any& node_config, double t_abs)> prepare_extra;
+    std::function<std::any(const PlannerRuntimeConfig& cfg, double t_abs)> prepare_extra;
+
+    std::function<void(planner_logging::SolveLogMeta& meta, const std::any& extra_params, const std::any& runtime_cfg)> prepare_log_meta;
 
     std::function<Param()>                   getSolverParams;
     std::function<std::shared_ptr<OptimalControlProblem<double>>(
@@ -101,6 +110,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             nullptr, // validate_target
             nullptr, // post_process_result
             nullptr, // prepare_extra
+            nullptr, // prepare_log_meta
             HoverOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return HoverOCP::create(a.current_state, a.terminal_state);
@@ -116,6 +126,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             nullptr, // validate_target
             nullptr, // post_process_result
             nullptr, // prepare_extra
+            nullptr, // prepare_log_meta
             LandingOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return LandingOCP::create(a.current_state, a.terminal_state, a.prev_U, a.prev_X);
@@ -144,6 +155,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                 r.target_snapshot_acc = t.acceleration;
             },
             nullptr, // prepare_extra
+            nullptr, // prepare_log_meta
             StateswitchOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return StateswitchOCP::create(a.current_state, a.terminal_state,
@@ -171,12 +183,25 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                     }
                 }
             },
-            [](const std::any& /*config_any*/, double t_abs) {
+            [](const PlannerRuntimeConfig& cfg, double t_abs) {
                 // Return ct so create() can use it AND post_process_result can use it.
                 TrackingCircleOCP::TrackingCircleExtra ex;
+                ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
+                ex.tgt.R = cfg.circle_R;
+                ex.tgt.omega = cfg.circle_omega;
+                ex.tgt.phi0 = cfg.circle_phi0;
                 ex.t_abs = t_abs;
-                // Params are filled in PlannerNode for now to avoid circular header dependencies
                 return std::any(ex); 
+            },
+            [](planner_logging::SolveLogMeta& meta, const std::any& extra_params, const std::any& /*runtime_cfg*/) {
+                try {
+                    auto ex = std::any_cast<TrackingCircleOCP::TrackingCircleExtra>(extra_params);
+                    meta.circle_center = ex.tgt.center;
+                    meta.circle_radius = ex.tgt.R;
+                    meta.circle_omega = ex.tgt.omega;
+                    meta.circle_phi0 = ex.tgt.phi0;
+                    meta.circle_t_abs = ex.t_abs;
+                } catch (const std::bad_any_cast&) {}
             },
             TrackingCircleOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
@@ -186,7 +211,65 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                        return TrackingCircleOCP::create(a.current_state, ex.tgt, ex.t_abs);
                    } catch (const std::bad_any_cast&) {}
                 }
-                return TrackingCircleOCP::create(a.current_state, TrackingCircleOCP::getDefaultCircularTarget(), a.t_abs);
+                return TrackingCircleOCP::create(a.current_state, target_models::getDefaultCircularTarget(), a.t_abs);
+            }
+        }},
+        {"tracking_circle_target", {
+            "tracking_circle_target",
+            TrackingCircleTargetOCP::TH_INIT,
+            TrackingCircleTargetOCP::DEFAULT_N_REPLAY,
+            TrackingCircleTargetOCP::MASS,
+            OCPDescriptor::WarmStart::Shift,
+            nullptr, // transform_state
+            nullptr, // validate_target
+            [](SolverResult& r, const TargetSnapshot& /*t*/) {
+                if (r.extra.has_value()) {
+                    try {
+                        auto ex = std::any_cast<TrackingCircleTargetOCP::TrackingCircleTargetExtra>(r.extra);
+                        // Convert relative trajectory to absolute using baked-in dynamics
+                        r.state_trajectory = TrackingCircleTargetOCP::convertToAbsolute(r.state_trajectory, ex.tgt, ex.t_abs);
+                        r.is_relative_plan = false;
+                    } catch (const std::bad_any_cast&) {
+                        std::cerr << "TrackingCircleTarget: bad_any_cast in post_process_result\n";
+                    }
+                }
+            },
+            [](const PlannerRuntimeConfig& cfg, double t_abs) {
+                TrackingCircleTargetOCP::TrackingCircleTargetExtra ex;
+                ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
+                ex.tgt.R = cfg.circle_R;
+                ex.tgt.omega = cfg.circle_omega;
+                ex.tgt.phi0 = cfg.circle_phi0;
+                ex.t_abs = t_abs;
+                
+                // Populate the buffer
+                const int N_node = 80; // from ocp_tracking_circle_target.hpp N
+                const double THH = 0.2; // worst-case dt
+                const double buf_duration = N_node * THH + 1.0;
+                ex.buf.populateFromModel(ex.tgt, t_abs, buf_duration, 0.05);
+
+                return std::any(ex); 
+            },
+            [](planner_logging::SolveLogMeta& meta, const std::any& extra_params, const std::any& /*runtime_cfg*/) {
+                try {
+                    auto ex = std::any_cast<TrackingCircleTargetOCP::TrackingCircleTargetExtra>(extra_params);
+                    meta.circle_center = ex.tgt.center;
+                    meta.circle_radius = ex.tgt.R;
+                    meta.circle_omega = ex.tgt.omega;
+                    meta.circle_phi0 = ex.tgt.phi0;
+                    meta.circle_t_abs = ex.t_abs;
+                } catch (const std::bad_any_cast&) {}
+            },
+            TrackingCircleTargetOCP::getSolverParams,
+            [](const OCPCreateArgs& a) {
+                if (a.extra.has_value()) {
+                   try {
+                       auto ex = std::any_cast<TrackingCircleTargetOCP::TrackingCircleTargetExtra>(a.extra);
+                       return TrackingCircleTargetOCP::create(a.current_state, ex.tgt, ex.buf, ex.t_abs);
+                   } catch (const std::bad_any_cast&) {}
+                }
+                // Fallback is dangerous here since buf is uninitialized, but we follow standard pattern
+                return TrackingCircleTargetOCP::create(a.current_state, target_models::getDefaultCircularTarget(), target_models::TargetAccelBuffer{}, a.t_abs);
             }
         }}
     };
