@@ -1,6 +1,6 @@
 # CoManDO Planner 
 
-**CoManDO (COnic-COnstrained Manifold Dynamic Optimizer)** is a high-performance, platform-agnostic MPC planner designed for complex maneuvering and dynamic target tracking. It utilizes the **ALIPDDP** (Augmented Lagrangian Iterative Pontryagin Differential Dynamic Programming) solver to execute real-time optimal control.
+**CoManDO (COnic-COnstrained Manifold Dynamic Optimizer)** is a high-performance, platform-agnostic MPC planner designed for complex maneuvering and dynamic target tracking. It utilizes the **ALIPDDP** (Augmented Lagrangian Interior Point Differential Dynamic Programming) solver to execute real-time optimal control.
 
 ---
 
