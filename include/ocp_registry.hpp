@@ -75,6 +75,7 @@ struct OCPDescriptor {
     int default_n_replay;
     double default_mass_kg;
     enum class WarmStart { Shift, Feedback } warm_start;
+    bool needs_target_trajectory = false;
 
     // Callbacks — nullptr = not needed
     std::function<Eigen::VectorXd(
@@ -106,6 +107,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             HoverOCP::DEFAULT_N_REPLAY,
             HoverOCP::DEFAULT_MASS_KG,
             OCPDescriptor::WarmStart::Shift,
+            false, // needs_target_trajectory
             nullptr, // transform_state
             nullptr, // validate_target
             nullptr, // post_process_result
@@ -122,6 +124,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             LandingOCP::DEFAULT_N_REPLAY,
             LandingOCP::DEFAULT_MASS_KG,
             OCPDescriptor::WarmStart::Shift,
+            false, // needs_target_trajectory
             nullptr, // transform_state
             nullptr, // validate_target
             nullptr, // post_process_result
@@ -138,6 +141,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             StateswitchOCP::DEFAULT_N_REPLAY,
             StateswitchOCP::DEFAULT_MASS_KG,
             OCPDescriptor::WarmStart::Feedback,
+            false, // needs_target_trajectory
             [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
                 Eigen::VectorXd xr = Eigen::VectorXd::Zero(13);
                 xr.segment(0, 3) = x.segment(0, 3) - t.position;
@@ -168,6 +172,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             TrackingCircleOCP::DEFAULT_N_REPLAY,
             TrackingCircleOCP::MASS,
             OCPDescriptor::WarmStart::Shift,
+            false, // needs_target_trajectory
             nullptr, // transform_state
             nullptr, // validate_target
             [](SolverResult& r, const TargetSnapshot& /*t*/) {
@@ -189,7 +194,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                 ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
                 ex.tgt.R = cfg.circle_R;
                 ex.tgt.omega = cfg.circle_omega;
-                ex.tgt.phi0 = cfg.circle_phi0;
+                ex.tgt.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
                 ex.t_abs = t_abs;
                 return std::any(ex); 
             },
@@ -220,6 +225,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             TrackingCircleTargetOCP::DEFAULT_N_REPLAY,
             TrackingCircleTargetOCP::MASS,
             OCPDescriptor::WarmStart::Shift,
+            true, // needs_target_trajectory
             nullptr, // transform_state
             nullptr, // validate_target
             [](SolverResult& r, const TargetSnapshot& /*t*/) {
@@ -239,14 +245,18 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                 ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
                 ex.tgt.R = cfg.circle_R;
                 ex.tgt.omega = cfg.circle_omega;
-                ex.tgt.phi0 = cfg.circle_phi0;
+                ex.tgt.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
                 ex.t_abs = t_abs;
                 
-                // Populate the buffer
-                const int N_node = 80; // from ocp_tracking_circle_target.hpp N
-                const double THH = 0.2; // worst-case dt
-                const double buf_duration = N_node * THH + 1.0;
-                ex.buf.populateFromModel(ex.tgt, t_abs, buf_duration, 0.05);
+                if (cfg.target_accel_buffer.has_value()) {
+                    ex.buf = cfg.target_accel_buffer.value();
+                } else {
+                    // Populate the buffer
+                    const int N_node = 80; // from ocp_tracking_circle_target.hpp N
+                    const double THH = 0.2; // worst-case dt
+                    const double buf_duration = N_node * THH + 1.0;
+                    ex.buf.populateFromModel(ex.tgt, t_abs, buf_duration, 0.05);
+                }
 
                 return std::any(ex); 
             },

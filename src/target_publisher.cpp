@@ -1,5 +1,5 @@
-/// @file circular_target_publisher.cpp
-/// @brief Standalone ROS2 node that publishes a circular target trajectory.
+/// @file target_publisher.cpp
+/// @brief Standalone ROS2 node that publishes the target 
 ///
 /// Publishes on:
 ///   /target/odom   (nav_msgs/msg/Odometry)   — position + velocity
@@ -27,6 +27,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/accel_stamped.hpp>
+#include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 
 #include "target/circular_target.hpp"
 
@@ -48,20 +49,22 @@ public:
         publish_hz_ = declare_parameter<double>("publish_hz", 100.0);
         frame_id_   = declare_parameter<std::string>("frame_id", "world");
 
+        // Record wall-clock start so visual phase matches requested phi0 at node startup
+        phi0_ = phi0_ - omega_ * now().seconds();
+
         // ── Publishers ───────────────────────────────────────────────────────
         odom_pub_  = create_publisher<nav_msgs::msg::Odometry>(
             "/target/odom",  10);
         accel_pub_ = create_publisher<geometry_msgs::msg::AccelStamped>(
             "/target/accel", 10);
+        traj_pub_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>(
+            "/target/predicted_trajectory", 10);
 
         // ── Timer ────────────────────────────────────────────────────────────
         const auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<double>(1.0 / publish_hz_));
         timer_ = create_wall_timer(period_ns,
             std::bind(&CircularTargetPublisher::timerCallback, this));
-
-        // Record wall-clock start so t=0 corresponds to phi0.
-        t_start_ = now();
 
         RCLCPP_INFO(get_logger(),
             "[CircularTarget] center=(%.2f,%.2f,%.2f)  R=%.2f  ω=%.2f rad/s  "
@@ -73,7 +76,7 @@ private:
     void timerCallback()
     {
         const rclcpp::Time stamp = now();
-        const double t = (stamp - t_start_).seconds();
+        const double t = stamp.seconds();
 
         // ── Kinematics ───────────────────────────────────────────────────────
         target_models::CircularTarget tgt;
@@ -129,6 +132,53 @@ private:
         accel.accel.angular.z = 0.0;
 
         accel_pub_->publish(accel);
+        
+        static int publish_traj_counter = 0;
+        if (publish_traj_counter++ % static_cast<int>(publish_hz_ / 10.0) == 0) {
+            trajectory_msgs::msg::MultiDOFJointTrajectory traj;
+            traj.header.stamp = stamp;
+            traj.header.frame_id = frame_id_;
+            traj.joint_names.push_back("target");
+
+            const int num_points = 400; // 20s at 0.05s resolution
+            const double dt = 0.05;
+            traj.points.reserve(num_points);
+
+            for (int i = 0; i < num_points; ++i) {
+                trajectory_msgs::msg::MultiDOFJointTrajectoryPoint pt;
+                pt.time_from_start = rclcpp::Duration::from_seconds(i * dt);
+
+                double point_t = t + i * dt;
+                auto p = tgt.pos(point_t);
+                auto v = tgt.vel(point_t);
+                auto a = tgt.accel(point_t);
+
+                geometry_msgs::msg::Transform trans;
+                trans.translation.x = p.x();
+                trans.translation.y = p.y();
+                trans.translation.z = p.z();
+                trans.rotation.w = 1.0;
+                trans.rotation.x = 0.0;
+                trans.rotation.y = 0.0;
+                trans.rotation.z = 0.0;
+                pt.transforms.push_back(trans);
+
+                geometry_msgs::msg::Twist vel;
+                vel.linear.x = v.x();
+                vel.linear.y = v.y();
+                vel.linear.z = v.z();
+                pt.velocities.push_back(vel);
+
+                geometry_msgs::msg::Twist acc;
+                acc.linear.x = a.x();
+                acc.linear.y = a.y();
+                acc.linear.z = a.z();
+                pt.accelerations.push_back(acc);
+
+                traj.points.push_back(pt);
+            }
+            traj_pub_->publish(traj);
+        }
 
         // ── Diagnostics (every 5 s) ──────────────────────────────────────────
         static double last_diag = -5.0;
@@ -149,8 +199,8 @@ private:
     // ── ROS handles ────────────────────────────────────────────────────────
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr        odom_pub_;
     rclcpp::Publisher<geometry_msgs::msg::AccelStamped>::SharedPtr accel_pub_;
+    rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr traj_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::Time t_start_;
 };
 
 int main(int argc, char* argv[])

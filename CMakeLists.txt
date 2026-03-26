@@ -14,6 +14,7 @@ find_package(rclcpp REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(crazyflie_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 
@@ -54,6 +55,7 @@ macro(configure_target TARGET_NAME)
     tf2_ros
     geometry_msgs
     nav_msgs
+    trajectory_msgs
     crazyflie_interfaces
   )
   if(px4_msgs_FOUND)
@@ -80,7 +82,7 @@ configure_target(test_stateswitch_ocp)
 # ── Executable 3: target_publisher
 add_executable(target_publisher src/target_publisher.cpp)
 configure_target(target_publisher)
-ament_target_dependencies(target_publisher rclcpp nav_msgs geometry_msgs)
+ament_target_dependencies(target_publisher rclcpp nav_msgs geometry_msgs trajectory_msgs)
 
 
 

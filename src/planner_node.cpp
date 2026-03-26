@@ -30,7 +30,8 @@ using Clock = std::chrono::steady_clock;
 class PlannerNode : public rclcpp::Node {
 public:
     PlannerNode() : Node("comando_planner") {
-        const PlannerRuntimeConfig runtime_cfg = loadPlannerRuntimeConfig(this);
+        PlannerRuntimeConfig runtime_cfg = loadPlannerRuntimeConfig(this);
+        runtime_cfg.t_start_abs = this->now().seconds();
         runtime_cfg_ = runtime_cfg;
 
         ocp_type_ = runtime_cfg.ocp_type;
@@ -570,6 +571,9 @@ private:
             auto desc = OCPRegistry::getDescriptor(ocp_type_);
             std::any extra;
             if (desc.prepare_extra) {
+                if (desc.needs_target_trajectory) {
+                    runtime_cfg_.target_accel_buffer = state_monitor_.getTargetAccelBuffer();
+                }
                 extra = desc.prepare_extra(runtime_cfg_, t_abs);
             }
 
@@ -627,13 +631,23 @@ private:
                 "[OpenLoop] Waiting for state...");
             return;
         }
+
+        auto desc = OCPRegistry::getDescriptor(ocp_type_);
+        if (desc.needs_target_trajectory) {
+            if (!state_monitor_.hasTargetTrajectory(this->now())) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "[OpenLoop] IDLE — waiting for /target/predicted_trajectory...");
+                publishPausedHoverHoldTick();
+                return;
+            }
+        }
+
         startup_timer_->cancel();
 
         Eigen::VectorXd x0 = getCurrentState();
         RCLCPP_INFO(this->get_logger(), "[OpenLoop] Solving...");
         SolverResult result = callSolver(x0);
 
-        auto desc = OCPRegistry::getDescriptor(ocp_type_);
         if (desc.post_process_result) {
             TargetSnapshot mock_t = getTargetSnapshot();
             desc.post_process_result(result, mock_t);

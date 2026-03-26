@@ -2,6 +2,9 @@
 
 #include <string>
 
+#include <optional>
+#include "target/target_accel_buffer.hpp"
+
 struct PlannerRuntimeConfig {
     std::string ocp_type = "";
     std::string drone_name = "cf_1";
@@ -37,6 +40,9 @@ struct PlannerRuntimeConfig {
 
     double ocp_dt = 0.0;
     double mass_kg = 0.0;
+
+    double t_start_abs = 0.0;
+    std::optional<target_models::TargetAccelBuffer> target_accel_buffer;
 
     bool isConfigured() const {
         return !ocp_type.empty() && !mode.empty();

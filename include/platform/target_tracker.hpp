@@ -33,8 +33,13 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/accel_stamped.hpp>
+#include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 
 #include <Eigen/Dense>
+#include <mutex>
+#include <string>
+
+#include "target/target_accel_buffer.hpp"
 #include <mutex>
 #include <string>
 
@@ -90,15 +95,31 @@ struct TargetState {
         const double aa = (now - accel_timestamp).seconds();
         return std::max(oa, aa);
     }
+
+    // Predicted trajectory cache
+    struct PredictedTrajectory {
+        rclcpp::Time origin_time{0, 0, RCL_ROS_TIME};
+        target_models::TargetAccelBuffer accel_buffer;
+        bool received = false;
+        
+        bool isFresh(const rclcpp::Time& now, double max_age_sec = 2.0) const {
+            if (!received) return false;
+            if (origin_time.nanoseconds() <= 0) return false;
+            return (now - origin_time).seconds() < max_age_sec;
+        }
+    };
+    PredictedTrajectory predicted_trajectory;
 };
 
 struct Handles {
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr       odom_sub;
     rclcpp::Subscription<geometry_msgs::msg::AccelStamped>::SharedPtr accel_sub;
+    rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr traj_sub;
 
     void reset() {
         odom_sub.reset();
         accel_sub.reset();
+        traj_sub.reset();
     }
 };
 
@@ -159,8 +180,44 @@ inline void setup(
         },
         opts);
 
+    // ── Trajectory callback ──────────────────────────────────────────────────
+    handles.traj_sub = node->create_subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>(
+        "/target/predicted_trajectory", 10,
+        [&target_state, &target_mutex, node](
+            const trajectory_msgs::msg::MultiDOFJointTrajectory::SharedPtr msg)
+        {
+            if (msg->points.size() < 2) return;
+
+            std::lock_guard<std::mutex> lk(target_mutex);
+            
+            auto& traj = target_state.predicted_trajectory;
+            traj.origin_time = rclcpp::Time(msg->header.stamp);
+            
+            double t_start = traj.origin_time.seconds();
+            double dt = (rclcpp::Duration(msg->points[1].time_from_start) - 
+                         rclcpp::Duration(msg->points[0].time_from_start)).seconds();
+            
+            std::vector<Eigen::Vector3d> accels;
+            accels.reserve(msg->points.size());
+            for (const auto& pt : msg->points) {
+                if (!pt.accelerations.empty()) {
+                    accels.emplace_back(pt.accelerations[0].linear.x,
+                                        pt.accelerations[0].linear.y,
+                                        pt.accelerations[0].linear.z);
+                } else {
+                    accels.emplace_back(0, 0, 0);
+                }
+            }
+            
+            traj.accel_buffer.t_start = t_start;
+            traj.accel_buffer.dt = dt <= 0.0 ? 0.05 : dt;
+            traj.accel_buffer.accels = std::move(accels);
+            traj.received = true;
+        },
+        opts);
+
     RCLCPP_INFO(node->get_logger(),
-        "[TargetTracker] Subscribed odom: %s  accel: %s",
+        "[TargetTracker] Subscribed odom: %s  accel: %s  traj: /target/predicted_trajectory",
         odom_topic.c_str(), accel_topic.c_str());
 }
 

@@ -71,6 +71,16 @@ public:
         return {target_state_.position, target_state_.velocity};
     }
 
+    bool hasTargetTrajectory(const rclcpp::Time& now) const {
+        std::lock_guard<std::mutex> lk(target_mutex_);
+        return target_state_.predicted_trajectory.isFresh(now, 2.0);
+    }
+
+    target_models::TargetAccelBuffer getTargetAccelBuffer() const {
+        std::lock_guard<std::mutex> lk(target_mutex_);
+        return target_state_.predicted_trajectory.accel_buffer;
+    }
+
     Eigen::VectorXd getCurrentState(const std::string& platform) const {
         std::lock_guard<std::mutex> lk(state_mutex_);
         if (platform == "crazyflie") {

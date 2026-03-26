@@ -17,11 +17,11 @@ The planner is decoupled from specific OCP physics via the `OCPRegistry`. This a
 │                                                                         │
 │  StateMonitor (thread-safe state ownership)                             │
 │  ├─ cf_state_ / px4_state_ ◄── /{drone}/pose, /{drone}/odom            │
-│  └─ target_state_ ◄── /target/odom, /target/accel                      │
+│  └─ target_state_ ◄── /target/odom, /target/accel, /target/predicted_trajectory  │
 │                                                                         │
 │  OCP Registry                                                           │
-│  └─► [hover, landing, stateswitch, tracking_circle]                     │
-│       └─► OCPDescriptor (dt, mass, transform_cb, post_process_cb)       │
+│  └─► [hover, landing, stateswitch, tracking_circle, tracking_circle_target]     │
+│       └─► OCPDescriptor (dt, mass, transform_cb, needs_trajectory_gate) │
 │                                                                         │
 │  Solver Callback Group                                                  │
 │  └─► solverLoop()                                                       │
@@ -61,7 +61,7 @@ These parameters define the behavior and can be updated dynamically via ROS para
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ocp_type` | string | `""` | OCP formulation: `"landing"`, `"hover"`, `"stateswitch"`, `"tracking_circle"` |
+| `ocp_type` | string | `""` | OCP formulation: `"landing"`, `"hover"`, `"stateswitch"`, `"tracking_circle"`, `"tracking_circle_target"` |
 | `mode` | string | `"mpc"` | `"mpc"` (closed-loop) or `"open_loop"` |
 | `n_replay` | int | `4` | Number of setpoints sent per solve cycle |
 | `hover_target_x/y/z` | double | `0.0` | Global target position (for absolute OCPs) |
@@ -107,8 +107,9 @@ For relative-frame OCPs (like `stateswitch`), the planner monitors an external t
 
 - **Target Odometry**: `{target_odom_topic}`
 - **Target Acceleration**: `{target_accel_topic}`
+- **Predicted Trajectory**: `/target/predicted_trajectory` (`trajectory_msgs/MultiDOFJointTrajectory`)
 
-Target state must be fresh (age < 0.2s) for the solver to engage.
+Target state must be fresh (age < 0.2s) for closed-loop solver. Predicted trajectories must be fresh (age < 2.0s) for the `tracking_circle_target` solver to engage.
 
 ---
 
@@ -136,8 +137,9 @@ The planner uses an `OCPRegistry` to manage different problem types.
 |----------|-------------|-------------|-----------|-------|
 | `"hover"` | Fixed Target | Absolute (13D) | No | Simple stabilization |
 | `"landing"` | Terminal Constraint | Absolute (13D) | No | Precise vertical landing |
-| `"stateswitch"`| Variable Time | Relative (14D) | **Yes** | Landing on moving targets |
-| `"tracking_circle"`| TV Dynamics | Absolute (13D) | No* | Landing on circular trajectory |
+| `"stateswitch"`| Variable Time | Relative (14D) | **Yes** | Landing on moving targets (live feedback) |
+| `"tracking_circle"`| TV Dynamics | Absolute (13D) | No* | Analytical circular target tracking |
+| `"tracking_circle_target"`| TV Dynamics | Absolute (13D) | No* | Buffer-based tracking from ROS predictions |
 
 *\*`tracking_circle` solves in a "baked-in" relative frame and post-processes the result to absolute coordinates before replaying.*
 
