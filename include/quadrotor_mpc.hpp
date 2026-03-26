@@ -8,6 +8,7 @@
 
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
+#include "ocp/ocp_tracking_circle.hpp"
 
 class QuadrotorMPC {
 public:
@@ -19,6 +20,11 @@ public:
 
         // Warm-start shift count (PlannerNode sets this from replay settings).
         int n_shift = 1;
+
+        // BUG 3 FIX: Circle target parameters for tracking_circle OCP.
+        // These are updated each RH iteration from ROS target state.
+        TrackingCircleOCP::CircularTarget circle_target;
+        double t_abs = 0.0;
 
         Config() {
             terminal_state = Eigen::VectorXd::Zero(13);
@@ -44,7 +50,11 @@ public:
     Result solve(const Eigen::VectorXd& current_state,
                  const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero());
 
-    void   setTerminalState(const Eigen::VectorXd& terminal);
+    void setTerminalState(const Eigen::VectorXd& terminal);
+
+    // BUG 3 FIX: Setter for tracking_circle parameters
+    void setCircleTarget(const TrackingCircleOCP::CircularTarget& target, double t_abs);
+
     double getOcpDt() const;
     double last_solve_ms_ = 0.0;
 

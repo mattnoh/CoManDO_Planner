@@ -6,6 +6,12 @@
 
 using namespace std;
 
+// BUG 4 FIX: Import constants for theta clamping
+using TrackingCircleOCP::THL;
+using TrackingCircleOCP::THH;
+using TrackingCircleOCP::FMIN;
+using TrackingCircleOCP::FMAX;
+
 QuadrotorMPC::QuadrotorMPC(const Config& config) : config_(config) {
     try {
         solver_params_ = OCPRegistry::getSolverParams(config_.ocp_type);
@@ -27,11 +33,24 @@ std::vector<Eigen::VectorXd> QuadrotorMPC::makeUwarm(int n_shift) const {
 
     const int NEX = std::max(1, std::min(n_shift, N - 1));
 
+    // BUG 4 FIX: Use the tail template logic from the reference implementation.
+    // This zeros moments AND clamps thrust and theta to valid bounds.
     Eigen::VectorXd u_tail = prev_U_[N - 1 - NEX];
-    if (u_tail.size() >= 4) {
+    if (u_tail.size() >= 5) {  // NU_SS = 5 for tracking_circle
+        // Zero moments (body torques)
+        u_tail(1) = 0.0;  // Mx
+        u_tail(2) = 0.0;  // My
+        u_tail(3) = 0.0;  // Mz
+        // Clamp thrust
+        u_tail(0) = std::max(FMIN, std::min(FMAX, u_tail(0)));
+        // Clamp theta (timestep)
+        u_tail(4) = std::max(THL, std::min(THH, u_tail(4)));
+    } else if (u_tail.size() >= 4) {
+        // Fallback for 4-dim controls (non-tracking_circle OCPs)
         u_tail(1) = 0.0;
         u_tail(2) = 0.0;
         u_tail(3) = 0.0;
+        u_tail(0) = std::max(FMIN, std::min(FMAX, u_tail(0)));
     }
 
     std::vector<Eigen::VectorXd> uw(N);
@@ -72,15 +91,17 @@ std::vector<Eigen::MatrixXd> QuadrotorMPC::makeKshifted(int n_shift) const {
 }
 
 void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state,
-                                const std::vector<Eigen::VectorXd>& warm_u,
-                                const std::vector<Eigen::VectorXd>& warm_x,
-                                const std::vector<Eigen::MatrixXd>& warm_k) {
+                                 const std::vector<Eigen::VectorXd>& warm_u,
+                                 const std::vector<Eigen::VectorXd>& warm_x,
+                                 const std::vector<Eigen::MatrixXd>& warm_k) {
     try {
         solver_.reset();
 
+        // BUG 3 FIX: Pass circle_target and t_abs from config_ to OCPRegistry::create
         problem_ = OCPRegistry::create(
             config_.ocp_type, current_state, config_.terminal_state,
-            warm_u, warm_x, target_accel_, warm_k);
+            warm_u, warm_x, target_accel_, warm_k,
+            config_.circle_target, config_.t_abs);
     } catch (const std::runtime_error& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         throw;
@@ -88,7 +109,7 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state,
 }
 
 QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
-                                         const Eigen::Vector3d& target_accel)
+                                           const Eigen::Vector3d& target_accel)
 {
     Result result;
     result.success = false;
@@ -102,7 +123,9 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
         std::vector<Eigen::MatrixXd> warm_k = prev_K_;
 
         if (!prev_U_.empty()) {
-            if (config_.ocp_type == "stateswitch") {
+            // BUG 4 FIX: Apply proper warm-start shifting for tracking_circle
+            // (same logic as stateswitch with theta clamping)
+            if (config_.ocp_type == "stateswitch" || config_.ocp_type == "tracking_circle") {
                 warm_u = makeUwarm(config_.n_shift);
                 warm_x = makeXshifted(config_.n_shift);
                 warm_k = makeKshifted(config_.n_shift);
@@ -159,8 +182,8 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
             prev_K_ = K_result;
 
             std::cout << "[MPC] solve " << result.solve_time_ms
-                      << "ms  iters=" << result.solve_iters
-                      << "  n_shift=" << config_.n_shift << "\n";
+                      << "ms iters=" << result.solve_iters
+                      << " n_shift=" << config_.n_shift << "\n";
         } else {
             std::cerr << "ERROR: Empty trajectory\n";
             last_solve_ms_ = 0.0;
@@ -183,4 +206,10 @@ void QuadrotorMPC::setTerminalState(const Eigen::VectorXd& terminal) {
         prev_K_.clear();
         last_solve_ms_ = 0.0;
     }
+}
+
+// BUG 3 FIX: Setter for tracking_circle parameters
+void QuadrotorMPC::setCircleTarget(const TrackingCircleOCP::CircularTarget& target, double t_abs) {
+    config_.circle_target = target;
+    config_.t_abs = t_abs;
 }

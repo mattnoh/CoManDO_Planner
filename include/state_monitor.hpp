@@ -19,7 +19,8 @@ struct TargetSnapshot {
     Eigen::Vector3d position = Eigen::Vector3d::Zero();
     Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
     Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
-    rclcpp::Time timestamp{0, 0, RCL_ROS_TIME};
+    rclcpp::Time odom_timestamp{0, 0, RCL_ROS_TIME};
+    rclcpp::Time accel_timestamp{0, 0, RCL_ROS_TIME};
 };
 
 class StateMonitor {
@@ -46,19 +47,23 @@ public:
         return false;
     }
 
+    /// @brief Check if target state is fresh for the given OCP type.
+    /// For stateswitch and tracking_circle, target state must be fresh.
     bool hasFreshTargetState(const std::string& ocp_type,
-                             const rclcpp::Time& now) const {
-        if (ocp_type != "stateswitch") {
+                              const rclcpp::Time& now) const {
+        if (ocp_type != "stateswitch" && ocp_type != "tracking_circle") {
             return true;
         }
         std::lock_guard<std::mutex> lk(target_mutex_);
         return target_state_.isFresh(now, target_state_max_age_sec_);
     }
 
+    /// @brief Get target snapshot for the given OCP type.
+    /// For stateswitch and tracking_circle, returns live target state.
     TargetSnapshot getTargetSnapshot(const std::string& ocp_type,
-                                     const rclcpp::Time& now) const {
+                                      const rclcpp::Time& now) const {
         TargetSnapshot s;
-        if (ocp_type != "stateswitch") {
+        if (ocp_type != "stateswitch" && ocp_type != "tracking_circle") {
             s.valid = true;
             return s;
         }
@@ -67,7 +72,8 @@ public:
         s.position = target_state_.position;
         s.velocity = target_state_.velocity;
         s.acceleration = target_state_.acceleration;
-        s.timestamp = target_state_.timestamp;
+        s.odom_timestamp = target_state_.odom_timestamp;
+        s.accel_timestamp = target_state_.accel_timestamp;
         s.valid = target_state_.isFresh(now, target_state_max_age_sec_);
         return s;
     }

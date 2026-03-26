@@ -24,9 +24,16 @@ struct SolveLogMeta {
     int solve_iters = 0;
     bool is_relative_plan = false;
     double ocp_dt = 0.05;
-    Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
-    Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
-    Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
+        Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
+        Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
+        Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
+
+        // Tracking circle target parameters
+        Eigen::Vector3d circle_center = Eigen::Vector3d::Zero();
+        double circle_radius = 0.0;
+        double circle_omega = 0.0;
+        double circle_phi0 = 0.0;
+        double circle_t_abs = 0.0;
 };
 
 class CsvLogger {
@@ -53,14 +60,15 @@ public:
         std::filesystem::create_directories(folder);
         log_folder_ = folder;
 
-        all_solves_log_.open(folder + "/all_solves.csv");
-        if (all_solves_log_.is_open()) {
-            all_solves_log_
-                << "solve_num,solve_time_ms,solve_iters,coord_mode,node,t,theta,"
-                << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz,"
-                << "abs_x,abs_y,abs_z,abs_vx,abs_vy,abs_vz,abs_qw,abs_qx,abs_qy,abs_qz,abs_wx,abs_wy,abs_wz,"
-                << "rel_x,rel_y,rel_z,rel_vx,rel_vy,rel_vz,rel_qw,rel_qx,rel_qy,rel_qz,rel_wx,rel_wy,rel_wz,"
-                << "fz,mx,my,mz\n";
+                        all_solves_log_.open(folder + "/all_solves.csv");
+                        if (all_solves_log_.is_open()) {
+        all_solves_log_
+            << "solve_num,solve_time_ms,solve_iters,coord_mode,node,t,theta,"
+            << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz,"
+            << "circle_center_x,circle_center_y,circle_center_z,circle_radius,circle_omega,circle_phi0,circle_t_abs,"
+            << "abs_x,abs_y,abs_z,abs_vx,abs_vy,abs_vz,abs_qw,abs_qx,abs_qy,abs_qz,abs_wx,abs_wy,abs_wz,"
+            << "fz,mx,my,mz,"
+            << "rel_x,rel_y,rel_z,rel_vx,rel_vy,rel_vz,rel_qw,rel_qx,rel_qy,rel_qz,rel_wx,rel_wy,rel_wz\n";
         }
 
         commanded_state_log_.open(folder + "/commanded_state.csv");
@@ -128,36 +136,44 @@ public:
                 t = s(13);
             }
 
-            all_solves_log_ << std::fixed << std::setprecision(6)
-                            << meta.solve_num << ","
-                            << meta.solve_time_ms << ","
-                            << meta.solve_iters << ","
-                            << (meta.is_relative_plan ? "relative" : "absolute") << ","
-                            << i << "," << t << "," << theta << ","
-                            << meta.target_snapshot_pos.x() << ","
-                            << meta.target_snapshot_pos.y() << ","
-                            << meta.target_snapshot_pos.z() << ","
-                            << meta.target_snapshot_vel.x() << ","
-                            << meta.target_snapshot_vel.y() << ","
-                            << meta.target_snapshot_vel.z();
+                                all_solves_log_ << std::fixed << std::setprecision(6)
+                                                << meta.solve_num << ","
+                                                << meta.solve_time_ms << ","
+                                                << meta.solve_iters << ","
+                                                << (meta.is_relative_plan ? "relative" : "absolute") << ","
+                                                << i << "," << t << "," << theta << ","
+                                                << meta.target_snapshot_pos.x() << ","
+                                                << meta.target_snapshot_pos.y() << ","
+                                                << meta.target_snapshot_pos.z() << ","
+                                                << meta.target_snapshot_vel.x() << ","
+                                                << meta.target_snapshot_vel.y() << ","
+                                                << meta.target_snapshot_vel.z() << ","
+                                                << meta.circle_center.x() << ","
+                                                << meta.circle_center.y() << ","
+                                                << meta.circle_center.z() << ","
+                                                << meta.circle_radius << ","
+                                                << meta.circle_omega << ","
+                                                << meta.circle_phi0 << ","
+                                                << meta.circle_t_abs;
 
-            for (int j = 0; j < 13; ++j) {
-                all_solves_log_ << "," << x_abs(j);
-            }
-            for (int j = 0; j < 13; ++j) {
-                all_solves_log_ << "," << x_rel(j);
-            }
+        for (int j = 0; j < 13; ++j) {
+            all_solves_log_ << "," << x_abs(j);
+        }
 
-            if (i < static_cast<int>(ctrls.size()) && ctrls[i].size() >= 4) {
-                all_solves_log_ << ","
-                                << ctrls[i](0) << ","
-                                << ctrls[i](1) << ","
-                                << ctrls[i](2) << ","
-                                << ctrls[i](3);
-            } else {
-                all_solves_log_ << ",0,0,0,0";
-            }
-            all_solves_log_ << "\n";
+        if (i < static_cast<int>(ctrls.size()) && ctrls[i].size() >= 4) {
+            all_solves_log_ << ","
+            << ctrls[i](0) << ","
+            << ctrls[i](1) << ","
+            << ctrls[i](2) << ","
+            << ctrls[i](3);
+        } else {
+            all_solves_log_ << ",0,0,0,0";
+        }
+
+        for (int j = 0; j < 13; ++j) {
+            all_solves_log_ << "," << x_rel(j);
+        }
+        all_solves_log_ << "\n";
         }
         all_solves_log_.flush();
     }

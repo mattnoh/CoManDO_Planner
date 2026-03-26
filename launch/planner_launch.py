@@ -32,7 +32,7 @@ def generate_launch_description():
         DeclareLaunchArgument('mode', default_value='mpc'),
         DeclareLaunchArgument('hover_target_x', default_value='0.0'),
         DeclareLaunchArgument('hover_target_y', default_value='0.0'),
-        DeclareLaunchArgument('hover_target_z', default_value='0.0'),
+        DeclareLaunchArgument('hover_target_z', default_value='1.0'),
         DeclareLaunchArgument('n_replay', default_value='4'),
         DeclareLaunchArgument('mass_kg', default_value='0.027'),
     ]
