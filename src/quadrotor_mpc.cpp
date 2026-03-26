@@ -72,16 +72,10 @@ std::vector<Eigen::MatrixXd> QuadrotorMPC::makeKshifted(int n_shift) const {
     return ks;
 }
 
-void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state,
-    const std::vector<Eigen::VectorXd>& warm_u,
-    const std::vector<Eigen::VectorXd>& warm_x,
-    const std::vector<Eigen::MatrixXd>& warm_k) {
+void QuadrotorMPC::setupProblem(const OCPCreateArgs& args) {
     try {
         solver_.reset();
-        problem_ = OCPRegistry::create(
-            config_.ocp_type, current_state, config_.terminal_state,
-            warm_u, warm_x, target_accel_, warm_k,
-            config_.circle_target, config_.t_abs);
+        problem_ = OCPRegistry::create(config_.ocp_type, args);
     } catch (const std::runtime_error& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         throw;
@@ -89,7 +83,9 @@ void QuadrotorMPC::setupProblem(const Eigen::VectorXd& current_state,
 }
 
 QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
-                                           const Eigen::Vector3d& target_accel)
+                                           const Eigen::Vector3d& target_accel,
+                                           const std::any& extra_params,
+                                           double t_abs)
 {
     Result result;
     result.success = false;
@@ -103,7 +99,8 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
         std::vector<Eigen::MatrixXd> warm_k = prev_K_;
 
         if (!prev_U_.empty()) {
-            if (config_.ocp_type == "stateswitch") {
+            auto desc = OCPRegistry::getDescriptor(config_.ocp_type);
+            if (desc.warm_start == OCPDescriptor::WarmStart::Feedback) {
                 warm_u = makeUwarm(config_.n_shift);
                 warm_x = makeXshifted(config_.n_shift);
                 warm_k = makeKshifted(config_.n_shift);
@@ -128,7 +125,17 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
             }
         }
 
-        setupProblem(current_state, warm_u, warm_x, warm_k);
+        OCPCreateArgs args;
+        args.current_state = current_state;
+        args.terminal_state = config_.terminal_state;
+        args.prev_U = warm_u;
+        args.prev_X = warm_x;
+        args.prev_K = warm_k;
+        args.target_accel = target_accel;
+        args.extra = extra_params;
+        args.t_abs = t_abs;
+
+        setupProblem(args);
 
         solver_ = make_shared<ALIPDDP<double>>(*problem_);
         solver_->init(solver_params_);
@@ -184,9 +191,4 @@ void QuadrotorMPC::setTerminalState(const Eigen::VectorXd& terminal) {
         prev_K_.clear();
         last_solve_ms_ = 0.0;
     }
-}
-
-void QuadrotorMPC::setCircleTarget(const TrackingCircleOCP::CircularTarget& target, double t_abs) {
-    config_.circle_target = target;
-    config_.t_abs = t_abs;
 }

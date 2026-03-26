@@ -8,7 +8,7 @@
 
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
-#include "ocp/ocp_tracking_circle.hpp"
+#include "ocp_registry.hpp"
 
 class QuadrotorMPC {
 public:
@@ -20,10 +20,6 @@ public:
 
         // Warm-start shift count (PlannerNode sets this from replay settings).
         int n_shift = 1;
-
-        // Circle target parameters for tracking_circle OCP (single-shot open-loop).
-        TrackingCircleOCP::CircularTarget circle_target;
-        double t_abs = 0.0;
 
         Config() {
             terminal_state = Eigen::VectorXd::Zero(13);
@@ -47,21 +43,17 @@ public:
     ~QuadrotorMPC() = default;
 
     Result solve(const Eigen::VectorXd& current_state,
-                 const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero());
+                 const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero(),
+                 const std::any& extra_params = {},
+                 double t_abs = 0.0);
 
     void setTerminalState(const Eigen::VectorXd& terminal);
-
-    // Setter for tracking_circle parameters
-    void setCircleTarget(const TrackingCircleOCP::CircularTarget& target, double t_abs);
 
     double getOcpDt() const;
     double last_solve_ms_ = 0.0;
 
 private:
-    void setupProblem(const Eigen::VectorXd& current_state,
-                      const std::vector<Eigen::VectorXd>& warm_u,
-                      const std::vector<Eigen::VectorXd>& warm_x,
-                      const std::vector<Eigen::MatrixXd>& warm_k);
+    void setupProblem(const OCPCreateArgs& args);
 
     std::vector<Eigen::VectorXd> makeUwarm(int n_shift) const;
     std::vector<Eigen::VectorXd> makeXshifted(int n_shift) const;

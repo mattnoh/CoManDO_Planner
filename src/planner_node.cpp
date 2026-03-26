@@ -15,6 +15,8 @@
 #include "trajectory_replayer.hpp"
 #include "planner_runtime_config.hpp"
 #include "planner_logging.hpp"
+#include "hover_controller.hpp"
+#include "ocp/ocp_tracking_circle.hpp"
 
 #include <chrono>
 #include <memory>
@@ -25,21 +27,6 @@
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
-
-struct SolverResult {
-    bool success = false;
-    Eigen::VectorXd next_state;
-    std::vector<Eigen::VectorXd> state_trajectory;
-    std::vector<Eigen::VectorXd> control_trajectory;
-    double solve_time_ms = 0.0;
-    int solve_iters = 0;
-    std::chrono::steady_clock::time_point solve_timestamp;
-
-    bool is_relative_plan = false;
-    Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
-    Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
-    Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
-};
 
 class PlannerNode : public rclcpp::Node {
 public:
@@ -137,11 +124,13 @@ private:
     }
 
     bool hasFreshTargetState() const {
-        return state_monitor_.hasFreshTargetState(ocp_type_, this->now());
+        bool needs_target = OCPRegistry::getDescriptor(ocp_type_).validate_target != nullptr;
+        return state_monitor_.hasFreshTargetState(needs_target, this->now());
     }
 
     TargetSnapshot getTargetSnapshot() const {
-        return state_monitor_.getTargetSnapshot(ocp_type_, this->now());
+        bool needs_target = OCPRegistry::getDescriptor(ocp_type_).validate_target != nullptr;
+        return state_monitor_.getTargetSnapshot(needs_target, this->now());
     }
 
     Eigen::VectorXd getCurrentState() const {
@@ -209,72 +198,44 @@ private:
     }
 
     void publishPausedHoverHoldTick() {
-        if (!is_configured_ || mass_kg_ <= 0.0) {
-            return;
-        }
-        if (!maintain_hover_hold_) {
-            return;
-        }
-        if (!hasState()) {
-            return;
-        }
-
-        const Eigen::VectorXd x_now = getCurrentState();
-        Eigen::VectorXd x_hold = (paused_hover_state_.size() >= 13)
-            ? paused_hover_state_
-            : x_now;
-
-        if (x_hold.size() < 13 || x_now.size() < 13) {
-            return;
-        }
-
-        // Do NOT overwrite attitude with current estimate; keep flat attitude.
-        // x_hold.segment(6, 4) = x_now.segment(6, 4);
-
-        // Re-enforce zeros just to be safe
-        x_hold.segment(3, 3).setZero();
-        x_hold.segment(10, 3).setZero();
-
-        Eigen::VectorXd u_hover = Eigen::VectorXd::Zero(4);
-        u_hover(0) = mass_kg_ * 9.81;
-        publishCommand(x_hold, u_hover);
-
-        if (logging_enabled_ && logging_initialized_) {
+        hover_controller::doHoverHoldTick(
+            is_configured_,
+            mass_kg_,
+            maintain_hover_hold_,
+            hasState(),
+            getCurrentState(),
+            paused_hover_state_,
+            [this](const auto& x, const auto& u) { publishCommand(x, u); }
+        );
+        // Logging is maintained if needed
+        if (logging_enabled_ && logging_initialized_ && maintain_hover_hold_ && hasState()) {
+            const Eigen::VectorXd x_now = getCurrentState();
+            Eigen::VectorXd x_hold = (paused_hover_state_.size() >= 13)
+                ? paused_hover_state_
+                : hover_controller::makeHoverState(x_now);
+            Eigen::VectorXd u_hover = hover_controller::makeHoverControl(mass_kg_);
             logger_.logActualState(x_now, -1);
             logger_.logCommandedState(x_hold, u_hover, -1);
         }
     }
 
     void holdHoverAndPause(const std::string& reason) {
-        if (!is_configured_ || mass_kg_ <= 0.0) {
-            RCLCPP_WARN(this->get_logger(),
-                "Cannot hold hover: planner not configured or mass_kg invalid.");
-            return;
-        }
-        Eigen::VectorXd x_hover = hasState() ? getCurrentState() : Eigen::VectorXd::Zero(13);
-        if (x_hover.size() < 13) {
-            x_hover = Eigen::VectorXd::Zero(13);
-        }
-        x_hover.segment(3, 3).setZero();       // Zero velocity
-
-        // Force a perfectly flat attitude (identity quaternion)
-        x_hover(6) = 1.0;                      // w = 1
-        x_hover.segment(7, 3).setZero();       // x, y, z = 0
-
-        x_hover.segment(10, 3).setZero();      // Zero angular velocity
-
-        Eigen::VectorXd u_hover = Eigen::VectorXd::Zero(4);
-        u_hover(0) = mass_kg_ * 9.81;
-        publishCommand(x_hover, u_hover);
-
-        paused_hover_state_ = x_hover;
-        maintain_hover_hold_ = true;
-        command_paused_.store(true);
-        resetForNewCommand();
-
-        RCLCPP_INFO(this->get_logger(),
-            "Command finished (%s). Holding hover and waiting for next command_seq.",
-            reason.c_str());
+        hover_controller::enterHoverHold(
+            reason,
+            is_configured_,
+            mass_kg_,
+            hasState(),
+            getCurrentState(),
+            command_paused_,
+            maintain_hover_hold_,
+            paused_hover_state_,
+            [this](const auto& x, const auto& u) { publishCommand(x, u); },
+            [this](const char* r) {
+                RCLCPP_INFO(this->get_logger(),
+                    "Command finished (%s). Holding hover and waiting for next command_seq.", r);
+            },
+            [this]() { resetForNewCommand(); }
+        );
     }
 
     rcl_interfaces::msg::SetParametersResult onSetParameters(
@@ -420,17 +381,15 @@ private:
         TargetSnapshot target_snapshot = getTargetSnapshot();
 
         Eigen::VectorXd x0 = x0_abs;
-        if (ocp_type_ == "stateswitch") {
-            x0 = Eigen::VectorXd::Zero(13);
-            x0.segment(0, 3) = x0_abs.segment(0, 3) - target_snapshot.position;
-            x0.segment(3, 3) = x0_abs.segment(3, 3) - target_snapshot.velocity;
-            x0.segment(6, 7) = x0_abs.segment(6, 7);
+        auto desc = OCPRegistry::getDescriptor(ocp_type_);
+        if (desc.transform_state) {
+            x0 = desc.transform_state(x0_abs, target_snapshot);
         }
 
-        const double pos_err = (ocp_type_ == "stateswitch")
+        const double pos_err = (desc.transform_state != nullptr)
             ? x0.segment(0, 3).norm()
             : (x0_abs.segment(0, 3) - terminal_position_abs_).norm();
-        const double vel_err = (ocp_type_ == "stateswitch")
+        const double vel_err = (desc.transform_state != nullptr)
             ? x0.segment(3, 3).norm()
             : x0_abs.segment(3, 3).norm();
 
@@ -469,15 +428,11 @@ private:
             x0(0), x0(1), x0(2), x0(3), x0(4), x0(5));
     }
 
-        const Eigen::Vector3d target_accel =
-            (ocp_type_ == "stateswitch") ? target_snapshot.acceleration : Eigen::Vector3d::Zero();
+        const Eigen::Vector3d target_accel = target_snapshot.acceleration;
 
         SolverResult result = callSolver(x0, target_accel);
-        if (ocp_type_ == "stateswitch") {
-            result.is_relative_plan = true;
-            result.target_snapshot_pos = target_snapshot.position;
-            result.target_snapshot_vel = target_snapshot.velocity;
-            result.target_snapshot_acc = target_snapshot.acceleration;
+        if (desc.post_process_result) {
+            desc.post_process_result(result, target_snapshot);
         }
 
         if (!result.success || result.state_trajectory.size() < 2) {
@@ -598,7 +553,18 @@ private:
                             const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero()) {
         SolverResult result;
         if (solver_type_ == "alipddp" && alipddp_mpc_) {
-            auto r = alipddp_mpc_->solve(state, target_accel);
+            TrackingCircleOCP::CircularTarget ct;
+            ct.center << runtime_cfg_.circle_center_x, runtime_cfg_.circle_center_y, runtime_cfg_.circle_center_z;
+            ct.R = runtime_cfg_.circle_R;
+            ct.omega = runtime_cfg_.circle_omega;
+            ct.phi0 = runtime_cfg_.circle_phi0;
+
+            double t_abs = 0.0;
+            if (hasState()) {
+                t_abs = this->now().seconds();
+            }
+
+            auto r = alipddp_mpc_->solve(state, target_accel, ct, t_abs);
             result.success = r.success;
             result.next_state = r.next_state;
             result.state_trajectory = r.state_trajectory;
@@ -606,7 +572,6 @@ private:
             result.solve_time_ms = r.solve_time_ms;
             result.solve_iters = r.solve_iters;
             result.solve_timestamp = r.solve_timestamp;
-            result.is_relative_plan = (ocp_type_ == "stateswitch");
         }
         return result;
     }
@@ -642,6 +607,10 @@ private:
     }
 
     void openLoopStartupCheck() {
+        if (command_paused_.load()) {
+            publishPausedHoverHoldTick();
+            return;
+        }
         if (!hasState()) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                 "[OpenLoop] Waiting for state...");
@@ -690,8 +659,19 @@ private:
     }
 
     void openLoopReplayTick() {
+        if (command_paused_.load()) {
+            publishPausedHoverHoldTick();
+            return;
+        }
+
         const int N = static_cast<int>(ol_ref_X_.size()) - 1;
-        const int step = std::min(ol_replay_step_, N);
+
+        if (ol_replay_step_ >= N) {
+            holdHoverAndPause("[OpenLoop] Trajectory complete");
+            return;
+        }
+
+        const int step = ol_replay_step_;
         const Eigen::VectorXd& x_cmd = ol_ref_X_[step];
         const Eigen::VectorXd u_cmd = (step < static_cast<int>(ol_ref_U_.size()))
             ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4);
@@ -704,12 +684,7 @@ private:
             logger_.logCommandedState(x_cmd, u_cmd, 0);
         }
 
-        if (ol_replay_step_ < N) {
-            ++ol_replay_step_;
-        } else if (!ol_done_logged_) {
-            RCLCPP_INFO(this->get_logger(), "[OpenLoop] Done. Holding.");
-            ol_done_logged_ = true;
-        }
+        ++ol_replay_step_;
     }
 
     std::string ocp_type_, platform_, solver_type_, mode_, drone_name_;
@@ -724,6 +699,7 @@ private:
 
     bool logging_enabled_;
     double ocp_dt_ = 0.05;
+    PlannerRuntimeConfig runtime_cfg_;
     double mass_kg_ = 0.027;
     int n_replay_ = 4;
 

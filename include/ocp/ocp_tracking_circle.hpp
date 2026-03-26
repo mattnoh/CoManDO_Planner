@@ -84,8 +84,10 @@ static constexpr double VZ_REF = -0.15;
 
 // ── Circular target ───────────────────────────────────────────────────────────
 struct CircularTarget {
-    Eigen::Vector3d center;
-    double R, omega, phi0;
+    Eigen::Vector3d center{0.0, 0.0, 1.5};
+    double R = 2.0;
+    double omega = 0.4;
+    double phi0 = 0.0;
 
     Eigen::Vector3d pos(double t) const {
         double ph = omega*t + phi0;
@@ -104,6 +106,10 @@ struct CircularTarget {
         Eigen::VectorXd s(6); s.head(3)=pos(t); s.tail(3)=vel(t); return s;
     }
 };
+
+inline CircularTarget getDefaultCircularTarget() {
+    return CircularTarget{};
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Quad6DOFVarTimeRelativeTV — time-varying target acceleration
@@ -236,8 +242,8 @@ public:
         g.segment(10,3) = Scalar(2*wom_) * x.segment(10,3);
         return g;
     }
-    Matrix<Scalar> pxx(const Vector<Scalar>&) const override {
-        Matrix<Scalar> H = Matrix<Scalar>::Zero(NX_SS, NX_SS);
+    Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
+        Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
         H(2,2) = Scalar(2*wz_);
         H(5,5) = Scalar(2*wvz_);
         H(7,7) = Scalar(2*watt_);

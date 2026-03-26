@@ -13,15 +13,7 @@
 #include "platform/crazyflie.hpp"
 #include "platform/px4.hpp"
 #include "platform/target_tracker.hpp"
-
-struct TargetSnapshot {
-    bool valid = false;
-    Eigen::Vector3d position = Eigen::Vector3d::Zero();
-    Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
-    Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
-    rclcpp::Time odom_timestamp{0, 0, RCL_ROS_TIME};
-    rclcpp::Time accel_timestamp{0, 0, RCL_ROS_TIME};
-};
+#include "ocp_registry.hpp"
 
 class StateMonitor {
 public:
@@ -47,23 +39,19 @@ public:
         return false;
     }
 
-    /// @brief Check if target state is fresh for the given OCP type.
-    /// For stateswitch and tracking_circle, target state must be fresh.
-    bool hasFreshTargetState(const std::string& ocp_type,
-                              const rclcpp::Time& now) const {
-        if (ocp_type != "stateswitch" && ocp_type != "tracking_circle") {
+    /// @brief Check if target state is fresh if the OCP requires it.
+    bool hasFreshTargetState(bool needs_target, const rclcpp::Time& now) const {
+        if (!needs_target) {
             return true;
         }
         std::lock_guard<std::mutex> lk(target_mutex_);
         return target_state_.isFresh(now, target_state_max_age_sec_);
     }
 
-    /// @brief Get target snapshot for the given OCP type.
-    /// For stateswitch and tracking_circle, returns live target state.
-    TargetSnapshot getTargetSnapshot(const std::string& ocp_type,
-                                      const rclcpp::Time& now) const {
+    /// @brief Get live target snapshot if the OCP requires it.
+    TargetSnapshot getTargetSnapshot(bool needs_target, const rclcpp::Time& now) const {
         TargetSnapshot s;
-        if (ocp_type != "stateswitch" && ocp_type != "tracking_circle") {
+        if (!needs_target) {
             s.valid = true;
             return s;
         }

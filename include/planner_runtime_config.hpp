@@ -19,6 +19,13 @@ struct PlannerRuntimeConfig {
     double hover_target_y = 0.0;
     double hover_target_z = 0.0;
 
+    double circle_center_x = 0.0;
+    double circle_center_y = 0.0;
+    double circle_center_z = 1.5;
+    double circle_R = 2.0;
+    double circle_omega = 0.4;
+    double circle_phi0 = 0.0;
+
     int n_replay = 0;
 
     std::string target_odom_topic = "/target/odom";
@@ -58,13 +65,24 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     node->declare_parameter("platform", cfg.platform);
     node->declare_parameter("solver", cfg.solver);
     node->declare_parameter("mode", cfg.mode);
-
+    
+    // Used for Hover OCP
     node->declare_parameter("hover_target_x", cfg.hover_target_x);
     node->declare_parameter("hover_target_y", cfg.hover_target_y);
     node->declare_parameter("hover_target_z", cfg.hover_target_z);
 
+    // Used as a target movement for Tracking Circle OCP
+    node->declare_parameter("circle_center_x", cfg.circle_center_x);
+    node->declare_parameter("circle_center_y", cfg.circle_center_y);
+    node->declare_parameter("circle_center_z", cfg.circle_center_z);
+    node->declare_parameter("circle_R", cfg.circle_R);
+    node->declare_parameter("circle_omega", cfg.circle_omega);
+    node->declare_parameter("circle_phi0", cfg.circle_phi0);
+
+    // Decides how many NEX setpoints we send each RH. Does not get called for Open Loop
     node->declare_parameter("n_replay", cfg.n_replay);
 
+    // Topics for externernal target tracking <- need to work on this later
     node->declare_parameter("target_odom_topic", cfg.target_odom_topic);
     node->declare_parameter("target_accel_topic", cfg.target_accel_topic);
 
@@ -86,6 +104,13 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     cfg.hover_target_x = node->get_parameter("hover_target_x").as_double();
     cfg.hover_target_y = node->get_parameter("hover_target_y").as_double();
     cfg.hover_target_z = node->get_parameter("hover_target_z").as_double();
+
+    cfg.circle_center_x = node->get_parameter("circle_center_x").as_double();
+    cfg.circle_center_y = node->get_parameter("circle_center_y").as_double();
+    cfg.circle_center_z = node->get_parameter("circle_center_z").as_double();
+    cfg.circle_R = node->get_parameter("circle_R").as_double();
+    cfg.circle_omega = node->get_parameter("circle_omega").as_double();
+    cfg.circle_phi0 = node->get_parameter("circle_phi0").as_double();
 
     cfg.n_replay = node->get_parameter("n_replay").as_int();
 
