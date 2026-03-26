@@ -32,6 +32,7 @@ class PlannerNode : public rclcpp::Node {
 public:
     PlannerNode() : Node("comando_planner") {
         const PlannerRuntimeConfig runtime_cfg = loadPlannerRuntimeConfig(this);
+        runtime_cfg_ = runtime_cfg;
 
         ocp_type_ = runtime_cfg.ocp_type;
         drone_name_ = runtime_cfg.drone_name;
@@ -124,11 +125,13 @@ private:
     }
 
     bool hasFreshTargetState() const {
+        if (ocp_type_.empty()) return true;
         bool needs_target = OCPRegistry::getDescriptor(ocp_type_).validate_target != nullptr;
         return state_monitor_.hasFreshTargetState(needs_target, this->now());
     }
 
     TargetSnapshot getTargetSnapshot() const {
+        if (ocp_type_.empty()) return TargetSnapshot{true};
         bool needs_target = OCPRegistry::getDescriptor(ocp_type_).validate_target != nullptr;
         return state_monitor_.getTargetSnapshot(needs_target, this->now());
     }
@@ -208,15 +211,16 @@ private:
             [this](const auto& x, const auto& u) { publishCommand(x, u); }
         );
         // Logging is maintained if needed
-        if (logging_enabled_ && logging_initialized_ && maintain_hover_hold_ && hasState()) {
-            const Eigen::VectorXd x_now = getCurrentState();
-            Eigen::VectorXd x_hold = (paused_hover_state_.size() >= 13)
-                ? paused_hover_state_
-                : hover_controller::makeHoverState(x_now);
-            Eigen::VectorXd u_hover = hover_controller::makeHoverControl(mass_kg_);
-            logger_.logActualState(x_now, -1);
-            logger_.logCommandedState(x_hold, u_hover, -1);
-        }
+            // Only log if OCP is active
+            if (ocp_active_.load()) {
+                const Eigen::VectorXd x_now = getCurrentState();
+                Eigen::VectorXd x_hold = (paused_hover_state_.size() >= 13)
+                    ? paused_hover_state_
+                    : hover_controller::makeHoverState(x_now);
+                Eigen::VectorXd u_hover = hover_controller::makeHoverControl(mass_kg_);
+                logger_.logActualState(x_now, -1);
+                logger_.logCommandedState(x_hold, u_hover, -1);
+            }
     }
 
     void holdHoverAndPause(const std::string& reason) {
@@ -234,7 +238,10 @@ private:
                 RCLCPP_INFO(this->get_logger(),
                     "Command finished (%s). Holding hover and waiting for next command_seq.", r);
             },
-            [this]() { resetForNewCommand(); }
+            [this]() { 
+                resetForNewCommand();
+                ocp_active_.store(false);
+            }
         );
     }
 
@@ -324,13 +331,14 @@ private:
 
             resetForNewCommand();
             command_paused_.store(true);
+            last_command_seq_ = 0;  // Reset so command_seq:=1 always works
 
             RCLCPP_INFO(this->get_logger(),
                 "Updated command profile: ocp=%s mode=%s n_replay=%d target=[%.3f,%.3f,%.3f] mass=%.4f",
                 ocp_type_.c_str(), mode_.c_str(), n_replay_,
                 hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_);
             RCLCPP_INFO(this->get_logger(),
-                "Profile applied. Increment command_seq to start this command.");
+                "Profile applied. Set command_seq to start this command.");
         }
 
         if (new_command_seq > last_command_seq_) {
@@ -344,6 +352,7 @@ private:
             last_command_seq_ = new_command_seq;
             maintain_hover_hold_ = false;
             command_paused_.store(false);
+            ocp_active_.store(true);
             resetForNewCommand();
             RCLCPP_INFO(this->get_logger(),
                 "Accepted new command_seq=%d. Starting OCP=%s mode=%s n_replay=%d.",
@@ -476,6 +485,19 @@ private:
             meta.target_snapshot_vel = result.target_snapshot_vel;
             meta.target_snapshot_acc = result.target_snapshot_acc;
 
+            if (ocp_type_ == "tracking_circle") {
+                meta.circle_center << runtime_cfg_.circle_center_x, runtime_cfg_.circle_center_y, runtime_cfg_.circle_center_z;
+                meta.circle_radius = runtime_cfg_.circle_R;
+                meta.circle_omega = runtime_cfg_.circle_omega;
+                meta.circle_phi0 = runtime_cfg_.circle_phi0;
+                if (result.extra.has_value()) {
+                    try {
+                        auto ex = std::any_cast<TrackingCircleOCP::TrackingCircleExtra>(result.extra);
+                        meta.circle_t_abs = ex.t_abs;
+                    } catch (const std::bad_any_cast&) {}
+                }
+            }
+
             logger_.logSolveTrajectory(result.state_trajectory, result.control_trajectory, meta);
         }
 
@@ -553,18 +575,22 @@ private:
                             const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero()) {
         SolverResult result;
         if (solver_type_ == "alipddp" && alipddp_mpc_) {
-            TrackingCircleOCP::CircularTarget ct;
-            ct.center << runtime_cfg_.circle_center_x, runtime_cfg_.circle_center_y, runtime_cfg_.circle_center_z;
-            ct.R = runtime_cfg_.circle_R;
-            ct.omega = runtime_cfg_.circle_omega;
-            ct.phi0 = runtime_cfg_.circle_phi0;
-
-            double t_abs = 0.0;
-            if (hasState()) {
-                t_abs = this->now().seconds();
+            double t_abs = this->now().seconds();
+            std::any extra;
+            
+            // Special handling for TrackingCircle params until registry gets a cleaner config system
+            if (ocp_type_ == "tracking_circle") {
+                TrackingCircleOCP::TrackingCircleExtra ex;
+                ex.tgt.center << runtime_cfg_.circle_center_x, runtime_cfg_.circle_center_y, runtime_cfg_.circle_center_z;
+                ex.tgt.R = runtime_cfg_.circle_R;
+                ex.tgt.omega = runtime_cfg_.circle_omega;
+                ex.tgt.phi0 = runtime_cfg_.circle_phi0;
+                ex.t_abs = t_abs;
+                extra = ex;
             }
 
-            auto r = alipddp_mpc_->solve(state, target_accel, ct, t_abs);
+            auto r = alipddp_mpc_->solve(state, target_accel, extra, t_abs);
+            
             result.success = r.success;
             result.next_state = r.next_state;
             result.state_trajectory = r.state_trajectory;
@@ -572,6 +598,7 @@ private:
             result.solve_time_ms = r.solve_time_ms;
             result.solve_iters = r.solve_iters;
             result.solve_timestamp = r.solve_timestamp;
+            result.extra = r.extra_params;
         }
         return result;
     }
@@ -622,6 +649,12 @@ private:
         RCLCPP_INFO(this->get_logger(), "[OpenLoop] Solving...");
         SolverResult result = callSolver(x0);
 
+        auto desc = OCPRegistry::getDescriptor(ocp_type_);
+        if (desc.post_process_result) {
+            TargetSnapshot mock_t = getTargetSnapshot();
+            desc.post_process_result(result, mock_t);
+        }
+
         if (!result.success || result.state_trajectory.size() < 2) {
             RCLCPP_ERROR(this->get_logger(), "[OpenLoop] FAILED");
             return;
@@ -640,8 +673,25 @@ private:
                 meta.solve_num = 0;
                 meta.solve_time_ms = result.solve_time_ms;
                 meta.solve_iters = result.solve_iters;
-                meta.is_relative_plan = false;
+                meta.is_relative_plan = result.is_relative_plan;
                 meta.ocp_dt = ocp_dt_;
+                meta.target_snapshot_pos = result.target_snapshot_pos;
+                meta.target_snapshot_vel = result.target_snapshot_vel;
+                meta.target_snapshot_acc = result.target_snapshot_acc;
+
+                if (ocp_type_ == "tracking_circle") {
+                    meta.circle_center << runtime_cfg_.circle_center_x, runtime_cfg_.circle_center_y, runtime_cfg_.circle_center_z;
+                    meta.circle_radius = runtime_cfg_.circle_R;
+                    meta.circle_omega = runtime_cfg_.circle_omega;
+                    meta.circle_phi0 = runtime_cfg_.circle_phi0;
+                    if (result.extra.has_value()) {
+                        try {
+                            auto ex = std::any_cast<TrackingCircleOCP::TrackingCircleExtra>(result.extra);
+                            meta.circle_t_abs = ex.t_abs;
+                        } catch (const std::bad_any_cast&) {}
+                    }
+                }
+
                 logger_.logSolveTrajectory(ol_ref_X_, ol_ref_U_, meta);
             }
         }
@@ -750,6 +800,7 @@ private:
     std::mutex command_mutex_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 
+    std::atomic<bool> ocp_active_{false};
     bool is_configured_ = true;
 };
 

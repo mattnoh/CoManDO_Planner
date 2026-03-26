@@ -46,6 +46,7 @@ struct SolverResult {
     Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
+    std::any extra;
 };
 
 // Note: TrackingCircleOCP::CircularTarget must be in ocp_tracking_circle.hpp
@@ -78,6 +79,8 @@ struct OCPDescriptor {
 
     std::function<void(SolverResult&,
         const TargetSnapshot&)>              post_process_result;
+    
+    std::function<std::any(const std::any& node_config, double t_abs)> prepare_extra;
 
     std::function<Param()>                   getSolverParams;
     std::function<std::shared_ptr<OptimalControlProblem<double>>(
@@ -97,6 +100,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             nullptr, // transform_state
             nullptr, // validate_target
             nullptr, // post_process_result
+            nullptr, // prepare_extra
             HoverOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return HoverOCP::create(a.current_state, a.terminal_state);
@@ -111,6 +115,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             nullptr, // transform_state
             nullptr, // validate_target
             nullptr, // post_process_result
+            nullptr, // prepare_extra
             LandingOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return LandingOCP::create(a.current_state, a.terminal_state, a.prev_U, a.prev_X);
@@ -129,7 +134,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                 xr.segment(6, 7) = x.segment(6, 7);
                 return xr;
             },
-            [](const TargetSnapshot& t, const rclcpp::Time& now, double age) {
+            [](const TargetSnapshot& t, const rclcpp::Time& /*now*/, double /*age*/) {
                 return t.valid; // state_monitor already handles freshness checks
             },
             [](SolverResult& r, const TargetSnapshot& t) {
@@ -138,6 +143,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                 r.target_snapshot_vel = t.velocity;
                 r.target_snapshot_acc = t.acceleration;
             },
+            nullptr, // prepare_extra
             StateswitchOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return StateswitchOCP::create(a.current_state, a.terminal_state,
@@ -150,30 +156,37 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             TrackingCircleOCP::DEFAULT_N_REPLAY,
             TrackingCircleOCP::MASS,
             OCPDescriptor::WarmStart::Shift,
-            [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
-                Eigen::VectorXd xr = Eigen::VectorXd::Zero(13);
-                xr.segment(0, 3) = x.segment(0, 3) - t.position;
-                xr.segment(3, 3) = x.segment(3, 3) - t.velocity;
-                xr.segment(6, 7) = x.segment(6, 7);
-                return xr;
+            nullptr, // transform_state
+            nullptr, // validate_target
+            [](SolverResult& r, const TargetSnapshot& /*t*/) {
+                if (r.extra.has_value()) {
+                    try {
+                        auto ex = std::any_cast<TrackingCircleOCP::TrackingCircleExtra>(r.extra);
+                        // Convert relative trajectory to absolute using baked-in dynamics
+                        r.state_trajectory = TrackingCircleOCP::convertToAbsolute(r.state_trajectory, ex.tgt, ex.t_abs);
+                        // We set is_relative_plan=false so mpcReplayTick doesn't try to add live target state
+                        r.is_relative_plan = false;
+                    } catch (const std::bad_any_cast&) {
+                        std::cerr << "TrackingCircle: bad_any_cast in post_process_result\n";
+                    }
+                }
             },
-            [](const TargetSnapshot& t, const rclcpp::Time& now, double age) {
-                return t.valid;
-            },
-            [](SolverResult& r, const TargetSnapshot& t) {
-                r.is_relative_plan = true;
-                r.target_snapshot_pos = t.position;
-                r.target_snapshot_vel = t.velocity;
-                // Tracking circle might not need acceleration in post processing since it uses TV
+            [](const std::any& /*config_any*/, double t_abs) {
+                // Return ct so create() can use it AND post_process_result can use it.
+                TrackingCircleOCP::TrackingCircleExtra ex;
+                ex.t_abs = t_abs;
+                // Params are filled in PlannerNode for now to avoid circular header dependencies
+                return std::any(ex); 
             },
             TrackingCircleOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
-                TrackingCircleOCP::CircularTarget default_ct;
-                const TrackingCircleOCP::CircularTarget* ct_ptr = &default_ct;
                 if (a.extra.has_value()) {
-                    ct_ptr = std::any_cast<const TrackingCircleOCP::CircularTarget>(&a.extra);
+                   try {
+                       auto ex = std::any_cast<TrackingCircleOCP::TrackingCircleExtra>(a.extra);
+                       return TrackingCircleOCP::create(a.current_state, ex.tgt, ex.t_abs);
+                   } catch (const std::bad_any_cast&) {}
                 }
-                return TrackingCircleOCP::create(a.current_state, ct_ptr ? *ct_ptr : default_ct, a.t_abs);
+                return TrackingCircleOCP::create(a.current_state, TrackingCircleOCP::getDefaultCircularTarget(), a.t_abs);
             }
         }}
     };

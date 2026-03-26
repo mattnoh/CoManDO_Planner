@@ -5,6 +5,7 @@
 #include <memory>
 #include <chrono>
 #include <string>
+#include <any>
 
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
@@ -37,6 +38,7 @@ public:
         double                        solve_time_ms = 0.0;
         int                           solve_iters   = 0;
         std::chrono::steady_clock::time_point solve_timestamp;
+        std::any                      extra_params;
     };
 
     explicit QuadrotorMPC(const Config& config = Config());

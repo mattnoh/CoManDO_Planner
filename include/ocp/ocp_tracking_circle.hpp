@@ -52,7 +52,7 @@ static constexpr int IDX_THETA = 4;
 
 // ── Horizon / timing ─────────────────────────────────────────────────────────
 static constexpr int N = 80;
-static constexpr int TH_INIT = 0.1;
+static constexpr double TH_INIT = 0.1;
 static constexpr double THL = 0.05;
 static constexpr double THH = 0.2;
 static constexpr int DEFAULT_N_REPLAY = N;
@@ -508,5 +508,10 @@ inline std::vector<Eigen::VectorXd> convertToAbsolute(
     }
     return X_abs;
 }
+
+struct TrackingCircleExtra {
+    CircularTarget tgt;
+    double t_abs;
+};
 
 } // namespace TrackingCircleOCP

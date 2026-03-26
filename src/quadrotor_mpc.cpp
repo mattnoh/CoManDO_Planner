@@ -149,6 +149,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
             chrono::high_resolution_clock::now() - t0).count();
         result.solve_timestamp = chrono::steady_clock::now();
         result.solve_iters = static_cast<int>(solver_->getAllCost().size());
+        result.extra_params = extra_params;
         last_solve_ms_ = result.solve_time_ms;
 
         if (X_result.size() > 1) {
