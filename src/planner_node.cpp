@@ -206,13 +206,6 @@ private:
         is_primed_.store(false);
         terminal_freeze_.store(false);
         stale_warning_count_ = 0;
-
-        // BUG 2 FIX: Reset t_abs for tracking_circle OCP
-        if (ocp_type_ == "tracking_circle") {
-            t_abs_ = 0.0;
-            tracking_start_time_ = this->now();
-            RCLCPP_INFO(this->get_logger(), "[TrackingCircle] Reset t_abs=0.0");
-        }
     }
 
     void publishPausedHoverHoldTick() {
@@ -471,45 +464,13 @@ private:
                 logging_initialized_ = logger_.initialize(
                     drone_name_, ocp_type_, mode_, solver_type_, this->get_logger(), mass_kg_);
             }
-            RCLCPP_INFO(this->get_logger(),
-                "x0=[%.3f,%.3f,%.3f | %.3f,%.3f,%.3f]",
-                x0(0), x0(1), x0(2), x0(3), x0(4), x0(5));
-
-            // BUG 2 FIX: Initialize tracking circle start time
-            if (ocp_type_ == "tracking_circle") {
-                t_abs_ = 0.0;
-                tracking_start_time_ = this->now();
-                RCLCPP_INFO(this->get_logger(), "[TrackingCircle] Initialized t_abs=0.0");
-            }
-        }
+        RCLCPP_INFO(this->get_logger(),
+            "x0=[%.3f,%.3f,%.3f | %.3f,%.3f,%.3f]",
+            x0(0), x0(1), x0(2), x0(3), x0(4), x0(5));
+    }
 
         const Eigen::Vector3d target_accel =
             (ocp_type_ == "stateswitch") ? target_snapshot.acceleration : Eigen::Vector3d::Zero();
-
-        // BUG 2/3 FIX: Update circle_target and t_abs for tracking_circle OCP
-        if (ocp_type_ == "tracking_circle") {
-            // Update t_abs based on elapsed wall-clock time since tracking started
-            rclcpp::Time now = this->now();
-            t_abs_ = (now - tracking_start_time_).seconds();
-
-            // Update circle_target from target snapshot (could be from ROS params or target_circular)
-            // Note: For now, use default values. In production, these should come from ROS params
-            // or be estimated from the target's motion pattern.
-            // circle_target_.center, .R, .omega, .phi0 should be set via ROS params.
-            circle_target_.center = Eigen::Vector3d(0.0, 0.0, 1.0);  // Default, override via params
-            circle_target_.R = 3.0;
-            circle_target_.omega = 0.5;
-            circle_target_.phi0 = 0.0;
-
-            // Pass to MPC solver config
-            if (alipddp_mpc_) {
-                alipddp_mpc_->setCircleTarget(circle_target_, t_abs_);
-            }
-
-            RCLCPP_INFO(this->get_logger(), "[TrackingCircle] t_abs=%.3f target=[%.2f,%.2f,%.2f]",
-                t_abs_,
-                circle_target_.center.x(), circle_target_.center.y(), circle_target_.center.z());
-        }
 
         SolverResult result = callSolver(x0, target_accel);
         if (ocp_type_ == "stateswitch") {
@@ -559,15 +520,6 @@ private:
             meta.target_snapshot_pos = result.target_snapshot_pos;
             meta.target_snapshot_vel = result.target_snapshot_vel;
             meta.target_snapshot_acc = result.target_snapshot_acc;
-
-        // If tracking_circle, fill in the circle parameters from the OCP config or state
-        if (ocp_type_ == "tracking_circle") {
-            meta.circle_center = circle_target_.center;
-            meta.circle_radius = circle_target_.R;
-            meta.circle_omega = circle_target_.omega;
-            meta.circle_phi0 = circle_target_.phi0;
-            meta.circle_t_abs = t_abs_;
-        }
 
             logger_.logSolveTrajectory(result.state_trajectory, result.control_trajectory, meta);
         }
@@ -625,18 +577,11 @@ private:
 
         if (plan_is_relative) {
             const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
-            if (x_rel_k.size() >= 13) {
+        if (x_rel_k.size() >= 13) {
                 x_cmd.segment(0, 3) = x_rel_k.segment(0, 3) + tgt_pos_now;
                 x_cmd.segment(3, 3) = x_rel_k.segment(3, 3) + tgt_vel_now;
                 x_cmd.segment(6, 7) = x_rel_k.segment(6, 7);
             }
-        }
-
-        // BUG 2 FIX: Increment t_abs after each executed step for tracking_circle
-        if (ocp_type_ == "tracking_circle" && u_cmd.size() >= 5) {
-            double Th_executed = u_cmd(4);  // IDX_THETA = 4
-            t_abs_ += Th_executed;
-            RCLCPP_DEBUG(this->get_logger(), "[TrackingCircle] Executed step, t_abs now=%.3f", t_abs_);
         }
 
         replay_ticks_since_solve_.fetch_add(1);
@@ -830,11 +775,6 @@ private:
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 
     bool is_configured_ = true;
-
-    // BUG 2 FIX: Tracking circle state - t_abs and circle_target parameters
-    double t_abs_ = 0.0;
-    rclcpp::Time tracking_start_time_{0, 0, RCL_ROS_TIME};
-    TrackingCircleOCP::CircularTarget circle_target_;
 };
 
 int main(int argc, char** argv) {

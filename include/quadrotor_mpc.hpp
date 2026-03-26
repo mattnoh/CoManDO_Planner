@@ -21,8 +21,7 @@ public:
         // Warm-start shift count (PlannerNode sets this from replay settings).
         int n_shift = 1;
 
-        // BUG 3 FIX: Circle target parameters for tracking_circle OCP.
-        // These are updated each RH iteration from ROS target state.
+        // Circle target parameters for tracking_circle OCP (single-shot open-loop).
         TrackingCircleOCP::CircularTarget circle_target;
         double t_abs = 0.0;
 
@@ -52,7 +51,7 @@ public:
 
     void setTerminalState(const Eigen::VectorXd& terminal);
 
-    // BUG 3 FIX: Setter for tracking_circle parameters
+    // Setter for tracking_circle parameters
     void setCircleTarget(const TrackingCircleOCP::CircularTarget& target, double t_abs);
 
     double getOcpDt() const;

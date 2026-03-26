@@ -1,8 +1,8 @@
 /// @file ocp_registry.hpp
 /// @brief Centralized OCP lookup and factory — reduces duplication and eases adding new OCPs
 ///
-/// BUG 3 FIX: Updated create() to accept live circle_target and t_abs parameters
-/// for tracking_circle OCP, passing them from QuadrotorMPC::Config.
+/// tracking_circle: Single-shot open-loop OCP for landing on circular target.
+/// Uses time-varying dynamics (Quad6DOFVarTimeRelativeTV) and outputs absolute coordinates.
 
 #pragma once
 
@@ -89,13 +89,7 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
                                        target_accel, prev_K);
     }
     if (ocp_type == "tracking_circle") {
-        // BUG 3 FIX: Use live circle_target and t_abs from QuadrotorMPC::Config
-        // instead of hardcoded placeholder values.
-        return TrackingCircleOCP::create(current_state, circle_target, t_abs,
-                                          TrackingCircleOCP::TH_INIT,
-                                          TrackingCircleOCP::THL,
-                                          TrackingCircleOCP::THH,
-                                          nullptr, prev_U);
+        return TrackingCircleOCP::create(current_state, circle_target, t_abs);
     }
     throw std::runtime_error("Unknown OCP type: " + ocp_type);
 }
