@@ -114,16 +114,42 @@ public:
                 continue;
             }
 
+            double t_node = i * meta.ocp_dt;
+            if (s.size() > 13) {
+                t_node = s(13);
+            }
+
+            Eigen::Vector3d tgt_p = meta.target_snapshot_pos;
+            Eigen::Vector3d tgt_v = meta.target_snapshot_vel;
+
+            if (meta.circle_radius > 1e-6) {
+                double tabs = meta.circle_t_abs + t_node;
+                double phi = meta.circle_omega * tabs + meta.circle_phi0;
+                tgt_p = meta.circle_center + Eigen::Vector3d(
+                    meta.circle_radius * std::cos(phi),
+                    meta.circle_radius * std::sin(phi),
+                    0.0
+                );
+                tgt_v = Eigen::Vector3d(
+                    -meta.circle_radius * meta.circle_omega * std::sin(phi),
+                    meta.circle_radius * meta.circle_omega * std::cos(phi),
+                    0.0
+                );
+            }
+
             Eigen::VectorXd x_abs = Eigen::VectorXd::Zero(13);
             Eigen::VectorXd x_rel = Eigen::VectorXd::Constant(13, nan);
 
             if (meta.is_relative_plan) {
                 x_rel = s.head(13);
-                x_abs.segment(0, 3) = meta.target_snapshot_pos + x_rel.segment(0, 3);
-                x_abs.segment(3, 3) = meta.target_snapshot_vel + x_rel.segment(3, 3);
+                x_abs.segment(0, 3) = tgt_p + x_rel.segment(0, 3);
+                x_abs.segment(3, 3) = tgt_v + x_rel.segment(3, 3);
                 x_abs.segment(6, 7) = x_rel.segment(6, 7);
             } else {
                 x_abs = s.head(13);
+                x_rel.segment(0, 3) = x_abs.segment(0, 3) - tgt_p;
+                x_rel.segment(3, 3) = x_abs.segment(3, 3) - tgt_v;
+                x_rel.segment(6, 7) = x_abs.segment(6, 7);
             }
 
             double theta = meta.ocp_dt;
@@ -131,30 +157,25 @@ public:
                 theta = ctrls[i](4);
             }
 
-            double t = i * meta.ocp_dt;
-            if (s.size() > 13) {
-                t = s(13);
-            }
-
-                                all_solves_log_ << std::fixed << std::setprecision(6)
-                                                << meta.solve_num << ","
-                                                << meta.solve_time_ms << ","
-                                                << meta.solve_iters << ","
-                                                << (meta.is_relative_plan ? "relative" : "absolute") << ","
-                                                << i << "," << t << "," << theta << ","
-                                                << meta.target_snapshot_pos.x() << ","
-                                                << meta.target_snapshot_pos.y() << ","
-                                                << meta.target_snapshot_pos.z() << ","
-                                                << meta.target_snapshot_vel.x() << ","
-                                                << meta.target_snapshot_vel.y() << ","
-                                                << meta.target_snapshot_vel.z() << ","
-                                                << meta.circle_center.x() << ","
-                                                << meta.circle_center.y() << ","
-                                                << meta.circle_center.z() << ","
-                                                << meta.circle_radius << ","
-                                                << meta.circle_omega << ","
-                                                << meta.circle_phi0 << ","
-                                                << meta.circle_t_abs;
+            all_solves_log_ << std::fixed << std::setprecision(6)
+                            << meta.solve_num << ","
+                            << meta.solve_time_ms << ","
+                            << meta.solve_iters << ","
+                            << (meta.is_relative_plan ? "relative" : "absolute") << ","
+                            << i << "," << t_node << "," << theta << ","
+                            << tgt_p.x() << ","
+                            << tgt_p.y() << ","
+                            << tgt_p.z() << ","
+                            << tgt_v.x() << ","
+                            << tgt_v.y() << ","
+                            << tgt_v.z() << ","
+                            << meta.circle_center.x() << ","
+                            << meta.circle_center.y() << ","
+                            << meta.circle_center.z() << ","
+                            << meta.circle_radius << ","
+                            << meta.circle_omega << ","
+                            << meta.circle_phi0 << ","
+                            << meta.circle_t_abs;
 
         for (int j = 0; j < 13; ++j) {
             all_solves_log_ << "," << x_abs(j);

@@ -9,14 +9,17 @@ CSV inputs (inside --dir folder):
                      wx, wy, wz, fz, mx, my, mz
 
 Output PDF pages (one per figure):
-  Page 1  — 3-D trajectory  (4 azimuth views, 2×2)
-  Page 2  — Position states  (x, y, z vs time)
-  Page 3  — Velocity states  (vx, vy, vz vs time)
+  Page 1  — 3-D trajectory  (2 × 2: top = Absolute coords, bottom = Relative coords)
+  Page 2  — Position states  (absolute: x, y, z vs time)
+  Page 3  — Velocity states  (absolute: vx, vy, vz vs time)
   Page 4  — Quaternion       (qw, qx, qy, qz vs time)
   Page 5  — Angular velocity (wx, wy, wz vs time)
-  Page 6  — Position error   (time series + box plot)
-  Page 7  — Velocity error   (time series + box plot)
-  Page 8  — Solver performance (solve time + iterations)
+  Page 6  — Relative position & velocity states  (rx, ry, rz  and  rvx, rvy, rvz)
+  Page 7  — Target Tracking  (actual vs target position components)
+  Page 8  — Position error   (time series + box plot)
+  Page 9  — Velocity error   (time series + box plot)
+  Page 10 — Solver performance (solve time + iterations)
+  Page 11 — Control Inputs & Timing (fz, moments, node intervals)
 
 Usage:
   python plot_landing.py --dir cf_1_landing_mpc_alipddp_20260322_225842
@@ -65,10 +68,23 @@ COMP_COLS = ["#e84040", "#38c870", "#3898e8", "#f0c060"]   # x/y/z/(w)
 
 GS_DEG  = 60.0
 GS_TAN  = np.tan(np.radians(GS_DEG))
-CONE_H  = 0.0
-BODY_AZSCALE = 0.4    # length of body-frame arrows in 3-D plot [m]
+CONE_H  = 1.5           # matches target height
+BODY_AZSCALE = 0.4      # length of body-frame arrows in 3-D plot [m]
 
-AZIM_VIEWS = [30, 120, -60, -120]   # four azimuth angles for 3-D views
+# --- OCP Parameters from ocp_tracking_circle.hpp ---
+MASS        = 0.027     # [kg]
+VZ_REF      = -0.15     # [m/s] reference descent
+VZ_LAND_MAX = 2.5       # [m/s]
+FMIN        = 0.08      # [N]
+FMAX        = 0.60      # [N]
+TH_INIT     = 0.1       # [s] default DT
+THL         = 0.05      # [s] min DT
+THH         = 0.2       # [s] max DT
+
+# Relative-component colours (softer variants)
+REL_COLS  = ["#f5a0a0", "#90e8b0", "#a898f8", "#f8e090"]   # rx/ry/rz
+
+AZ_PAIR    = [30, 120]              # two azimuths shown per frame
 ELEV_VIEW  = 22                     # fixed elevation
 
 
@@ -144,36 +160,48 @@ def compute_commanded_states(actual_df, solves_df):
     each solve, so solve transitions always restart at node 0.
     """
     state_cols = ["x", "y", "z", "vx", "vy", "vz",
-                  "qw", "qx", "qy", "qz", "wx", "wy", "wz"]
+                  "qw", "qx", "qy", "qz", "wx", "wy", "wz",
+                  "fz", "mx", "my", "mz", "theta"]
 
-    # all_solves.csv now uses abs_ prefix for absolute-frame state columns
+    # all_solves.csv uses abs_ and rel_ prefixes for state, but not for controls
     _abs = {"x": "abs_x", "y": "abs_y", "z": "abs_z",
             "vx": "abs_vx", "vy": "abs_vy", "vz": "abs_vz",
             "qw": "abs_qw", "qx": "abs_qx", "qy": "abs_qy", "qz": "abs_qz",
-            "wx": "abs_wx", "wy": "abs_wy", "wz": "abs_wz"}
+            "wx": "abs_wx", "wy": "abs_wy", "wz": "abs_wz",
+            "fz": "fz", "mx": "mx", "my": "my", "mz": "mz", "theta": "theta"}
+    
+    _rel = {"x": "rel_x", "y": "rel_y", "z": "rel_z",
+            "vx": "rel_vx", "vy": "rel_vy", "vz": "rel_vz",
+            "qw": "rel_qw", "qx": "rel_qx", "qy": "rel_qy", "qz": "rel_qz",
+            "wx": "rel_wx", "wy": "rel_wy", "wz": "rel_wz",
+            "fz": "fz", "mx": "mx", "my": "my", "mz": "mz", "theta": "theta"}
 
     # Build dict: solve_num → sorted DataFrame of nodes
     solve_groups = {int(sn): grp.sort_values("node").reset_index(drop=True)
                     for sn, grp in solves_df.groupby("solve_num")}
 
-    nan_row = {c: np.nan for c in state_cols}
+    nan_row_abs = {c: np.nan for c in state_cols}
+    nan_row_rel = {c: np.nan for c in state_cols}
     node_idx = {}
-    cmd_rows  = []
+    cmd_rows_abs = []
+    cmd_rows_rel = []
 
     for _, row in actual_df.iterrows():
         sn = int(row["solve_num"])
         if sn not in solve_groups:
-            cmd_rows.append(nan_row.copy())
+            cmd_rows_abs.append(nan_row_abs.copy())
+            cmd_rows_rel.append(nan_row_rel.copy())
             continue
         if sn not in node_idx:
             node_idx[sn] = 0
         grp  = solve_groups[sn]
         nidx = min(node_idx[sn], len(grp) - 1)
         r    = grp.iloc[nidx]
-        cmd_rows.append({c: r[_abs[c]] if _abs[c] in r.index else np.nan for c in state_cols})
+        cmd_rows_abs.append({c: r[_abs[c]] if _abs[c] in r.index else np.nan for c in state_cols})
+        cmd_rows_rel.append({c: r[_rel[c]] if _rel[c] in r.index else np.nan for c in state_cols})
         node_idx[sn] += 1
 
-    return pd.DataFrame(cmd_rows)
+    return pd.DataFrame(cmd_rows_abs), pd.DataFrame(cmd_rows_rel)
 
 
 def get_first_solve_traj(solves_df):
@@ -194,14 +222,37 @@ def find_solve_update_indices(actual_df):
 #  Page 1 – 3-D trajectory (4 views)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def page_3d_views(actual_df, solves_df, cmd_df, first_traj, title_str):
+def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str):
     dpos  = actual_df[["x","y","z"]].values
     quats = actual_df[["qw","qx","qy","qz"]].values
-    time  = actual_df["timestamp"].values
-    time  = time - time[0]
+    time_actual = actual_df["timestamp"].values
+    t_rel = time_actual - time_actual[0]
 
-    cmd_pos   = cmd_df[["x","y","z"]].values
-    first_pos = first_traj[["abs_x","abs_y","abs_z"]].values
+    # --- Target circle parameters (for tracking_circle OCP) -------------------
+    meta = solves_df.iloc[0]
+    c_x = meta.get("circle_center_x", 0.0)
+    c_y = meta.get("circle_center_y", 0.0)
+    c_z = meta.get("circle_center_z", 1.0)
+    R = meta.get("circle_radius", 0.0)
+    omega = meta.get("circle_omega", 0.0)
+    phi0 = meta.get("circle_phi0", 0.0)
+    t_abs0 = meta.get("circle_t_abs", 0.0)
+
+    # Reconstruct target trajectory for actual simulation time
+    t_span = t_abs0 + t_rel
+    tgt_x = c_x + R * np.cos(omega * t_span + phi0)
+    tgt_y = c_y + R * np.sin(omega * t_span + phi0)
+    tgt_z = np.full_like(t_span, c_z)
+    tgt_pos = np.stack([tgt_x, tgt_y, tgt_z], axis=1)
+
+    # Relative actual position
+    rel_pos = dpos - tgt_pos
+
+    cmd_pos_abs = cmd_df_abs[["x","y","z"]].values
+    cmd_pos_rel = cmd_df_rel[["x","y","z"]].values
+    
+    first_pos_abs = first_traj[["abs_x","abs_y","abs_z"]].values
+    first_pos_rel = first_traj[["rel_x","rel_y","rel_z"]].values
 
     # Speed magnitude for colormap
     vel  = actual_df[["vx","vy","vz"]].values
@@ -209,135 +260,103 @@ def page_3d_views(actual_df, solves_df, cmd_df, first_traj, title_str):
 
     replan_idx = find_solve_update_indices(actual_df)
 
-    XY_LIM = max(float(np.abs(dpos[:, :2]).max()) * 1.2, 1.5)
-    Z_LIM  = max(float(dpos[:, 2].max())           * 1.2, 1.5)
+    # ── Scene limits ──────────────────────────────────────────────────────────
+    XY_LIM_ABS = max(float(np.abs(dpos[:, :2]).max()) * 1.2, float(np.abs(tgt_pos[:, :2]).max()) * 1.2, 1.5)
+    Z_LIM_ABS  = max(float(dpos[:, 2].max()) * 1.2, 1.5)
+    
+    XY_LIM_REL = max(float(np.abs(rel_pos[:, :2]).max()) * 1.2, R * 1.2 if R > 0 else 1.5)
+    Z_LIM_REL  = max(float(rel_pos[:, 2].max()) * 1.2, 1.5)
 
-
-    # --- Target circle parameters (for tracking_circle OCP) -------------------
-    # Try to infer from all_solves.csv if present, else use defaults
-    # (center_x, center_y, center_z, R, omega, phi0)
-    center = np.array([0.0, 0.0, 1.0])
-    R = 3.0
-    omega = 0.5
-    phi0 = 0.0
-    # Try to infer from solves_df if columns exist
-    for col in solves_df.columns:
-        if col.startswith("tgt_"):
-            # If target columns exist, use first row as reference
-            center = np.array([
-                solves_df.get("tgt_x", pd.Series([0])).iloc[0],
-                solves_df.get("tgt_y", pd.Series([0])).iloc[0],
-                1.0,
-                ])
-            R = solves_df.get("tgt_R", pd.Series([R])).iloc[0] if "tgt_R" in solves_df.columns else R
-            omega = solves_df.get("tgt_omega", pd.Series([omega])).iloc[0] if "tgt_omega" in solves_df.columns else omega
-            phi0 = solves_df.get("tgt_phi0", pd.Series([phi0])).iloc[0] if "tgt_phi0" in solves_df.columns else phi0
-            break
-
-    # Compute target circle trajectory over the time span
-    t_span = np.linspace(0, actual_df["timestamp"].values[-1] - actual_df["timestamp"].values[0], 500)
-    circ_x = center[0] + R * np.cos(omega * t_span + phi0)
-    circ_y = center[1] + R * np.sin(omega * t_span + phi0)
-    circ_z = np.full_like(t_span, center[2])
-
-    # --- Glideslope cone geometry (static, apex at origin) --------------------
+    # ── Cone geometry ─────────────────────────────────────────────────────────
     rim_r  = GS_TAN * CONE_H
     _rt    = np.linspace(0, 2*np.pi, 64)
     rim_x  = rim_r * np.cos(_rt);  rim_y = rim_r * np.sin(_rt)
     _ct    = np.linspace(0, 2*np.pi, 12, endpoint=False)
 
-    fig = _fig(f"{title_str}  —  3-D Trajectory (4 views)", figsize=(20, 14))
-    axs = []
-    for k, azim in enumerate(AZIM_VIEWS):
-        ax = fig.add_subplot(2, 2, k+1, projection="3d")
-        _style_3d(ax, f"Azimuth = {azim}°")
-        ax.view_init(elev=ELEV_VIEW, azim=azim)
-        ax.set_xlim(-XY_LIM, XY_LIM)
-        ax.set_ylim(-XY_LIM, XY_LIM)
-        ax.set_zlim(0, Z_LIM)
-        ax.set_box_aspect([2, 2, 1.5])
-        ax.set_xlabel("X [m]", labelpad=6)
-        ax.set_ylabel("Y [m]", labelpad=6)
-        ax.set_zlabel("Z [m]", labelpad=6)
+    fig = _fig(f"{title_str}  —  3-D Trajectory (Absolute vs Relative)", figsize=(20, 16))
+    
+    for row_idx, is_rel in enumerate([False, True]):
+        frame_label = "Relative" if is_rel else "Absolute"
+        lim_xy = XY_LIM_REL if is_rel else XY_LIM_ABS
+        lim_z  = Z_LIM_REL if is_rel else Z_LIM_ABS
+        traj   = rel_pos if is_rel else dpos
+        ctraj  = cmd_pos_rel if is_rel else cmd_pos_abs
+        ftraj  = first_pos_rel if is_rel else first_pos_abs
+        
+        xlbl, ylbl, zlbl = ("rx [m]", "ry [m]", "rz [m]") if is_rel else ("X [m]", "Y [m]", "Z [m]")
 
-        # Ground plane
-        _gx = np.array([[-XY_LIM, XY_LIM], [-XY_LIM, XY_LIM]])
-        _gy = np.array([[-XY_LIM, -XY_LIM], [XY_LIM, XY_LIM]])
-        ax.plot_surface(_gx, _gy, np.zeros_like(_gx),
-                        color=GROUND_COL, alpha=0.4, linewidth=0, antialiased=False)
+        for col_idx, azim in enumerate(AZ_PAIR):
+            subplot_idx = row_idx * 2 + col_idx + 1
+            ax = fig.add_subplot(2, 2, subplot_idx, projection="3d")
+            _style_3d(ax, f"{frame_label} Frame  |  Azimuth = {azim}°")
+            ax.view_init(elev=ELEV_VIEW, azim=azim)
+            ax.set_xlim(-lim_xy, lim_xy)
+            ax.set_ylim(-lim_xy, lim_xy)
+            ax.set_zlim(0 if not is_rel else -lim_z, lim_z)
+            ax.set_box_aspect([2, 2, 1.5])
+            ax.set_xlabel(xlbl, labelpad=6)
+            ax.set_ylabel(ylbl, labelpad=6)
+            ax.set_zlabel(zlbl, labelpad=6)
 
-        # Landing pad
-        _pt = np.linspace(0, 2*np.pi, 48)
-        ax.plot(0.35*np.cos(_pt), 0.35*np.sin(_pt), np.zeros(48),
-                color=CAPTURE_COL, lw=2.0, alpha=0.85)
-        ax.plot([0], [0], [0], "o", color=CAPTURE_COL, markersize=7)
+            # Ground / Target Plane
+            _gx = np.array([[-lim_xy, lim_xy], [-lim_xy, lim_xy]])
+            _gy = np.array([[-lim_xy, -lim_xy], [lim_xy, lim_xy]])
+            ax.plot_surface(_gx, _gy, np.zeros_like(_gx),
+                            color=GROUND_COL if not is_rel else "#dcdcdc", 
+                            alpha=0.3, linewidth=0, antialiased=False)
 
-        # Glideslope cone
-        ax.plot(rim_x, rim_y, np.full(64, CONE_H),
-                color=CONE_COL, lw=1.4, alpha=0.55)
-        for _th in _ct:
-            ax.plot([0, rim_r*np.cos(_th)], [0, rim_r*np.sin(_th)], [0, CONE_H],
-                    color=CONE_COL, lw=0.7, alpha=0.30)
+            if not is_rel:
+                # Target circle trajectory (thick magenta) in absolute frame
+                ax.plot(tgt_pos[:, 0], tgt_pos[:, 1], tgt_pos[:, 2], color="#d12be6", lw=2.5, ls="-", alpha=0.85, zorder=2, label="Target circle")
+                # Target current position
+                ax.plot([tgt_pos[-1, 0]], [tgt_pos[-1, 1]], [tgt_pos[-1, 2]], "o", color="#d12be6", markersize=8)
+            else:
+                # Target at origin in relative frame
+                ax.plot([0], [0], [0], "o", color="#d12be6", markersize=10, label="Target (origin)")
+                # Show circle rim in relative frame (where drone wants to be)
+                ax.plot(R*np.cos(_rt), R*np.sin(_rt), np.zeros_like(_rt), color="#d12be6", lw=1.0, ls="--", alpha=0.3)
 
+            # First-solve reference (dotted, faint)
+            ax.plot(ftraj[:, 0], ftraj[:, 1], ftraj[:, 2],
+                color=C_FIRST, lw=1.4, ls=":", alpha=0.55, zorder=3)
 
-        # Target circle trajectory (thick magenta)
-        ax.plot(circ_x, circ_y, circ_z, color="#d12be6", lw=2.5, ls="-", alpha=0.85, zorder=2, label="Target circle")
+            # Commanded / stitched path (dashed)
+            ax.plot(ctraj[:, 0], ctraj[:, 1], ctraj[:, 2],
+                color=C_CMD, lw=1.5, ls="--", alpha=0.70, zorder=4)
 
-        # First-solve reference (dotted, faint)
-        ax.plot(first_pos[:, 0], first_pos[:, 1], first_pos[:, 2],
-            color=C_FIRST, lw=1.4, ls=":", alpha=0.55, zorder=3)
+            # Actual trajectory (solid, coloured by speed)
+            from matplotlib.colors import Normalize
+            import matplotlib.cm as cm
+            v_max   = max(float(vmag.max()), 0.1)
+            vnorm   = Normalize(vmin=0, vmax=v_max)
+            cmap    = cm.plasma
+            for j in range(len(traj) - 1):
+                c = cmap(vnorm(vmag[j]))
+                ax.plot(traj[j:j+2, 0], traj[j:j+2, 1], traj[j:j+2, 2],
+                        color=c, lw=2.2, alpha=0.90, zorder=5)
 
-        # Commanded / stitched path (dashed)
-        ax.plot(cmd_pos[:, 0], cmd_pos[:, 1], cmd_pos[:, 2],
-            color=C_CMD, lw=1.5, ls="--", alpha=0.70, zorder=4)
+            # Body-frame axes at replanning instants
+            for ridx in replan_idx:
+                if ridx >= len(traj): continue
+                pos = traj[ridx]
+                R_mat = quat_to_rotmat(*quats[ridx])
+                s_val = BODY_AZSCALE
+                ax.quiver(*pos, *(R_mat[:, 0]*s_val), color=BODY_X, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
+                ax.quiver(*pos, *(R_mat[:, 1]*s_val), color=BODY_Y, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
+                ax.quiver(*pos, *(R_mat[:, 2]*s_val), color=BODY_Z, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
 
-        # Actual trajectory (solid, coloured by speed)
-        from matplotlib.colors import Normalize
-        import matplotlib.cm as cm
-        v_max   = max(float(vmag.max()), 0.1)
-        vnorm   = Normalize(vmin=0, vmax=v_max)
-        cmap    = cm.plasma
-        for j in range(len(dpos) - 1):
-            c = cmap(vnorm(vmag[j]))
-            ax.plot(dpos[j:j+2, 0], dpos[j:j+2, 1], dpos[j:j+2, 2],
-                    color=c, lw=2.2, alpha=0.90, zorder=5)
+            # Start / end markers
+            ax.plot(*traj[0], "o", color=C_ACTUAL, markersize=8, zorder=10)
+            ax.plot(*traj[-1], "*", color=C_ACTUAL, markersize=10, zorder=10)
 
-        # Body-frame axes at replanning instants
-        for ridx in replan_idx:
-            if ridx >= len(dpos):
-                continue
-            pos = dpos[ridx]
-            R   = quat_to_rotmat(*quats[ridx])
-            s   = BODY_AZSCALE
-            ax.quiver(*pos, *(R[:, 0]*s), color=BODY_X, lw=1.5,
-                       arrow_length_ratio=0.35, alpha=0.85)
-            ax.quiver(*pos, *(R[:, 1]*s), color=BODY_Y, lw=1.5,
-                       arrow_length_ratio=0.35, alpha=0.85)
-            ax.quiver(*pos, *(R[:, 2]*s), color=BODY_Z, lw=1.5,
-                       arrow_length_ratio=0.35, alpha=0.85)
-
-        # Start / end markers
-        ax.plot(*dpos[0], "o", color=C_ACTUAL, markersize=9, zorder=10)
-        ax.plot(*dpos[-1], "*", color=C_ACTUAL, markersize=12, zorder=10)
-
-
-        # Legend (only on first subplot)
-        if k == 0:
-            handles = [
-                Line2D([0],[0], color=C_ACTUAL, lw=2.2,           label="Actual trajectory"),
-                Line2D([0],[0], color="#d12be6", lw=2.5,         label="Target circle"),
-                Line2D([0],[0], color=C_CMD,    lw=1.5, ls="--",  label="Commanded (stitched)"),
-                Line2D([0],[0], color=C_FIRST,  lw=1.4, ls=":",   label="First solve plan"),
-                Line2D([0],[0], color=CONE_COL, lw=1.4,           label="Glideslope cone"),
-                Line2D([0],[0], color=BODY_X,   lw=2.0,           label="Body X (at replan)"),
-                Line2D([0],[0], color=BODY_Y,   lw=2.0,           label="Body Y (at replan)"),
-                Line2D([0],[0], color=BODY_Z,   lw=2.0,           label="Body Z (at replan)"),
-                Line2D([0],[0], color=CAPTURE_COL, lw=0, marker="o",
-                       markersize=8,                               label="Landing pad"),
-            ]
-            _legend(ax, handles, loc="upper right", fontsize=10)
-
-        axs.append(ax)
+            if row_idx == 0 and col_idx == 0:
+                handles = [
+                    Line2D([0],[0], color=C_ACTUAL, lw=2.2,           label="Actual path"),
+                    Line2D([0],[0], color="#d12be6", lw=2.5,         label="Target"),
+                    Line2D([0],[0], color=C_CMD,    lw=1.5, ls="--",  label="Commanded"),
+                    Line2D([0],[0], color=C_FIRST,  lw=1.4, ls=":",   label="First plan"),
+                ]
+                _legend(ax, handles, loc="upper right", fontsize=9)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
@@ -543,15 +562,50 @@ def page_solver_stats(solves_df, title_str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Master builder
+#  Page 11 – Control Inputs & Timing
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def page_controls(time, actual_ctrl, cmd_ctrl, title_str):
+    """
+    Subplots for thrust, moments, and node-time (theta).
+    """
+    fig = _fig(f"{title_str}  —  Control Inputs & Timing", figsize=(16, 12))
+    gs  = gridspec.GridSpec(3, 1, hspace=0.4)
+    
+    ax_fz = fig.add_subplot(gs[0])
+    _style_ax(ax_fz, "Time [s]", "Thrust [N]", "Vertical Thrust (fz)")
+    ax_fz.plot(time, cmd_ctrl[:, 0], color=COMP_COLS[2], lw=1.8, ls="--", label="cmd fz")
+    ax_fz.axhline(FMIN, color="r", lw=1.2, ls=":", label="FMIN")
+    ax_fz.axhline(FMAX, color="r", lw=1.2, ls=":", label="FMAX")
+    ax_fz.legend(loc="upper right", fontsize=10)
+
+    ax_m = fig.add_subplot(gs[1])
+    _style_ax(ax_m, "Time [s]", "Moment [Nm?]", "Control Moments (mx, my, mz)")
+    ax_m.plot(time, cmd_ctrl[:, 1], color=COMP_COLS[0], lw=1.8, ls="--", label="mx")
+    ax_m.plot(time, cmd_ctrl[:, 2], color=COMP_COLS[1], lw=1.8, ls="--", label="my")
+    ax_m.plot(time, cmd_ctrl[:, 3], color=COMP_COLS[2], lw=1.8, ls="--", label="mz")
+    ax_m.legend(loc="upper right", fontsize=10)
+
+    ax_th = fig.add_subplot(gs[2])
+    _style_ax(ax_th, "Time [s]", "DT [s]", "Node Interval (theta)")
+    # Extract theta if available (often stored in a specific column or meta)
+    # Since we are reading from all_solves stitched to actual, we need to check columns
+    if "theta" in actual_ctrl.columns:
+        ax_th.plot(time, actual_ctrl["theta"].values, color="#606060", lw=2.0, label="actual theta")
+    ax_th.axhline(THL, color="r", lw=1.2, ls=":", label="THL")
+    ax_th.axhline(THH, color="r", lw=1.2, ls=":", label="THH")
+    ax_th.axhline(TH_INIT, color="g", lw=1.0, ls="--", label="Initial")
+    ax_th.legend(loc="upper right", fontsize=10)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    return fig
 
 def build_plots(data_dir, out_path=None, elev=22):
     global ELEV_VIEW
     ELEV_VIEW = elev
 
     actual_df, solves_df = load_data(data_dir)
-    cmd_df               = compute_commanded_states(actual_df, solves_df)
+    cmd_df_abs, cmd_df_rel = compute_commanded_states(actual_df, solves_df)
     first_traj           = get_first_solve_traj(solves_df)
 
     title_str = os.path.basename(os.path.normpath(data_dir))
@@ -573,82 +627,143 @@ def build_plots(data_dir, out_path=None, elev=22):
     actual_quat = actual_df[["qw","qx","qy","qz"]].values
     actual_angv = actual_df[["wx","wy","wz"]].values
 
-    cmd_pos     = cmd_df[["x","y","z"]].values
-    cmd_vel     = cmd_df[["vx","vy","vz"]].values
-    cmd_quat    = cmd_df[["qw","qx","qy","qz"]].values
-    cmd_angv    = cmd_df[["wx","wy","wz"]].values
+    cmd_pos_abs = cmd_df_abs[["x","y","z"]].values
+    cmd_vel_abs = cmd_df_abs[["vx","vy","vz"]].values
+    cmd_quat_abs= cmd_df_abs[["qw","qx","qy","qz"]].values
+    cmd_angv_abs= cmd_df_abs[["wx","wy","wz"]].values
 
-    first_pos   = first_traj[["abs_x","abs_y","abs_z"]].values
-    first_vel   = first_traj[["abs_vx","abs_vy","abs_vz"]].values
-    first_quat  = first_traj[["abs_qw","abs_qx","abs_qy","abs_qz"]].values
-    first_angv  = first_traj[["abs_wx","abs_wy","abs_wz"]].values
+    first_pos_abs = first_traj[["abs_x","abs_y","abs_z"]].values
+    first_vel_abs = first_traj[["abs_vx","abs_vy","abs_vz"]].values
+    first_quat_abs= first_traj[["abs_qw","abs_qx","abs_qy","abs_qz"]].values
+    first_angv_abs= first_traj[["abs_wx","abs_wy","abs_wz"]].values
 
     print(f"  Building PDF → {out_path}")
     with PdfPages(out_path) as pdf:
 
         # ── Page 1 : 3-D views ─────────────────────────────────────────────────
-        print("  [1/8] 3-D views …")
-        fig1 = page_3d_views(actual_df, solves_df, cmd_df, first_traj, title_str)
-        pdf.savefig(fig1, facecolor=FIG_BG)
-        plt.close(fig1)
+        print("  [1/10] 3-D views (Abs/Rel) …")
+        fig1 = page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str)
+        pdf.savefig(fig1, facecolor=FIG_BG); plt.close(fig1)
 
-        # ── Page 2 : Position ─────────────────────────────────────────────────
-        print("  [2/8] Position states …")
+        # ── Page 2 : Position (Absolute) ──────────────────────────────────────
+        print("  [2/10] Position states (Absolute) …")
         fig2 = _state_page(
-            time, actual_pos, cmd_pos,
-            first_t, first_pos,
+            time, actual_pos, cmd_pos_abs,
+            first_t, first_pos_abs,
             labels=["x", "y", "z"], units="m",
-            page_title=f"{title_str}  —  Position",
-            fig_title="Position  [x, y, z]")
+            page_title=f"{title_str}  —  Position (Absolute)",
+            fig_title="Absolute Position  [x, y, z]")
         pdf.savefig(fig2, facecolor=FIG_BG); plt.close(fig2)
 
-        # ── Page 3 : Velocity ─────────────────────────────────────────────────
-        print("  [3/7] Velocity states …")
+        # ── Page 3 : Velocity (Absolute) ──────────────────────────────────────
+        print("  [3/11] Velocity states (Absolute) …")
         fig3 = _state_page(
-            time, actual_vel, cmd_vel,
-            first_t, first_vel,
+            time, actual_vel, cmd_vel_abs,
+            first_t, first_vel_abs,
             labels=["vx", "vy", "vz"], units="m/s",
-            page_title=f"{title_str}  —  Velocity",
-            fig_title="Velocity  [vx, vy, vz]")
+            page_title=f"{title_str}  —  Velocity (Absolute)",
+            fig_title="Absolute Velocity  [vx, vy, vz]")
+        # Reference vz_ref
+        for ax in fig3.get_axes():
+            if ax.get_title().startswith("Absolute Velocity"):
+                ax.axhline(VZ_REF, color="r", lw=1.2, ls="--", alpha=0.6, label="VZ_REF")
+                _legend(ax, ax.get_lines(), loc="best")
         pdf.savefig(fig3, facecolor=FIG_BG); plt.close(fig3)
 
         # ── Page 4 : Quaternion ───────────────────────────────────────────────
-        print("  [4/7] Quaternion states …")
+        print("  [4/10] Quaternion states …")
         fig4 = _state_page(
-            time, actual_quat, cmd_quat,
-            first_t, first_quat,
+            time, actual_quat, cmd_quat_abs,
+            first_t, first_quat_abs,
             labels=["qw", "qx", "qy", "qz"], units="–",
             page_title=f"{title_str}  —  Quaternion",
             fig_title="Attitude quaternion  [qw, qx, qy, qz]")
         pdf.savefig(fig4, facecolor=FIG_BG); plt.close(fig4)
 
         # ── Page 5 : Angular velocity ─────────────────────────────────────────
-        print("  [5/7] Angular velocity states …")
+        print("  [5/10] Angular velocity states …")
         fig5 = _state_page(
-            time, actual_angv, cmd_angv,
-            first_t, first_angv,
+            time, actual_angv, cmd_angv_abs,
+            first_t, first_angv_abs,
             labels=["wx", "wy", "wz"], units="rad/s",
             page_title=f"{title_str}  —  Angular Velocity",
             fig_title="Angular velocity  [wx, wy, wz]")
         pdf.savefig(fig5, facecolor=FIG_BG); plt.close(fig5)
 
-        # ── Page 6 : Position error ───────────────────────────────────────────
-        print("  [6/7] Position error …")
-        fig6 = _error_page(
-            time, actual_pos, cmd_pos,
+        # ── Page 6 : Relative Position & Velocity ─────────────────────────────
+        print("  [6/10] Relative states …")
+        # Target trajectory over actual time
+        meta = solves_df.iloc[0]
+        c_x, c_y, c_z = meta.get("circle_center_x", 0.0), meta.get("circle_center_y", 0), meta.get("circle_center_z", 1.0)
+        R, omega, phi0, t0_abs = meta.get("circle_radius", 0.0), meta.get("circle_omega", 0), meta.get("circle_phi0", 0), meta.get("circle_t_abs", 0)
+        t_span = t0_abs + (time)
+        tgt_x = c_x + R * np.cos(omega * t_span + phi0)
+        tgt_y = c_y + R * np.sin(omega * t_span + phi0)
+        tgt_z = np.full_like(t_span, c_z)
+        tgt_vx = -R * omega * np.sin(omega * t_span + phi0)
+        tgt_vy = R * omega * np.cos(omega * t_span + phi0)
+        tgt_vz = np.zeros_like(t_span)
+        
+        actual_rel_pos = actual_pos - np.stack([tgt_x, tgt_y, tgt_z], axis=1)
+        actual_rel_vel = actual_vel - np.stack([tgt_vx, tgt_vy, tgt_vz], axis=1)
+        
+        fig6 = _fig(f"{title_str}  —  Relative States", figsize=(16, 10))
+        gs6 = gridspec.GridSpec(2, 1, hspace=0.3)
+        ax6a = fig6.add_subplot(gs6[0]); _style_ax(ax6a, "Time [s]", "Pos [m]", "Relative Position (Drone - Target)")
+        ax6b = fig6.add_subplot(gs6[1]); _style_ax(ax6b, "Time [s]", "Vel [m/s]", "Relative Velocity (Drone - Target)")
+        
+        for k in range(3):
+            ax6a.plot(time, actual_rel_pos[:, k], color=COMP_COLS[k], lw=2.0, label=["rx","ry","rz"][k])
+            ax6b.plot(time, actual_rel_vel[:, k], color=COMP_COLS[k], lw=2.0, label=["rvx","rvy","rvz"][k])
+        ax6b.axhline(VZ_REF, color="r", lw=1.2, ls="--", alpha=0.6, label="VZ_REF")
+        ax6a.legend(); ax6b.legend()
+        pdf.savefig(fig6, facecolor=FIG_BG); plt.close(fig6)
+
+        # ── Page 7 : Target Tracking ──────────────────────────────────────────
+        print("  [7/10] Target tracking …")
+        fig7 = _fig(f"{title_str}  —  Target Tracking", figsize=(16, 10))
+        # Plot x, y components vs target
+        ax7a = fig7.add_subplot(2, 1, 1); _style_ax(ax7a, "Time [s]", "X [m]", "X Tracking")
+        ax7a.plot(time, tgt_x, color="#d12be6", lw=1.5, ls="--", label="Target X")
+        ax7a.plot(time, actual_pos[:, 0], color=COMP_COLS[0], lw=2.0, label="Drone X")
+        ax7a.legend()
+        
+        ax7b = fig7.add_subplot(2, 1, 2); _style_ax(ax7b, "Time [s]", "Y [m]", "Y Tracking")
+        ax7b.plot(time, tgt_y, color="#d12be6", lw=1.5, ls="--", label="Target Y")
+        ax7b.plot(time, actual_pos[:, 1], color=COMP_COLS[1], lw=2.0, label="Drone Y")
+        ax7b.legend()
+        pdf.savefig(fig7, facecolor=FIG_BG); plt.close(fig7)
+
+        # ── Page 8 : Position error ───────────────────────────────────────────
+        print("  [8/10] Position error …")
+        fig8 = _error_page(
+            time, actual_pos, cmd_pos_abs,
             labels=["x", "y", "z"], units="m",
             page_title=f"{title_str}  —  Position Tracking Error",
             fig_title="Position error  (actual − commanded)")
-        pdf.savefig(fig6, facecolor=FIG_BG); plt.close(fig6)
+        pdf.savefig(fig8, facecolor=FIG_BG); plt.close(fig8)
 
-        # ── Page 7 : Velocity error ───────────────────────────────────────────
-        print("  [7/7] Velocity error …")
-        fig7 = _error_page(
-            time, actual_vel, cmd_vel,
+        # ── Page 9 : Velocity error ───────────────────────────────────────────
+        print("  [9/10] Velocity error …")
+        fig9 = _error_page(
+            time, actual_vel, cmd_vel_abs,
             labels=["vx", "vy", "vz"], units="m/s",
             page_title=f"{title_str}  —  Velocity Tracking Error",
             fig_title="Velocity error  (actual − commanded)")
-        pdf.savefig(fig7, facecolor=FIG_BG); plt.close(fig7)
+        pdf.savefig(fig9, facecolor=FIG_BG); plt.close(fig9)
+
+        # ── Page 10 : Solver Stats ───────────────────────────────────────────
+        print("  [10/11] Solver stats …")
+        fig10 = page_solver_stats(solves_df, title_str)
+        pdf.savefig(fig10, facecolor=FIG_BG); plt.close(fig10)
+
+        # ── Page 11 : Control Inputs ─────────────────────────────────────────
+        print("  [11/11] Control inputs …")
+        # Extract controls fz, mx, my, mz from cmd_df_abs (they are logged in all_solves)
+        cmd_ctrl = cmd_df_abs[["fz", "mx", "my", "mz"]].values
+        # For theta, we might need to find it in solves_df if it's there
+        fig11 = page_controls(time, cmd_df_abs, cmd_ctrl, title_str)
+        pdf.savefig(fig11, facecolor=FIG_BG); plt.close(fig11)
 
         # PDF metadata
         d = pdf.infodict()
