@@ -18,11 +18,11 @@ def generate_launch_description():
     It sends an OCP/profile to a running planner and triggers command_seq.
 
     Terminal A:
-      ros2 launch comando_planner planner_launch.py
+    ros2 launch comando_planner planner_launch.py
 
     Terminal B:
-      ros2 launch comando_planner ocp_launch.py \
-        ocp_type:=stateswitch mode:=mpc n_replay:=7 command_seq:=1
+    ros2 launch comando_planner ocp_launch.py \
+        ocp_type:=landing mode:=open_loop n_replay:=5 command_seq:=1
     """
 
     args = [
@@ -30,7 +30,6 @@ def generate_launch_description():
         DeclareLaunchArgument('ocp_type', default_value='landing'),
         DeclareLaunchArgument('mode', default_value='mpc'),
         DeclareLaunchArgument('n_replay', default_value='4'),
-        DeclareLaunchArgument('mass_kg', default_value='0.027'),
         DeclareLaunchArgument('hover_target_x', default_value='0.0'),
         DeclareLaunchArgument('hover_target_y', default_value='0.0'),
         DeclareLaunchArgument('hover_target_z', default_value='0.0'),
@@ -43,7 +42,6 @@ def generate_launch_description():
         _set_param(node_name, 'ocp_type', LaunchConfiguration('ocp_type')),
         _set_param(node_name, 'mode', LaunchConfiguration('mode')),
         _set_param(node_name, 'n_replay', LaunchConfiguration('n_replay')),
-        _set_param(node_name, 'mass_kg', LaunchConfiguration('mass_kg')),
         _set_param(node_name, 'hover_target_x', LaunchConfiguration('hover_target_x')),
         _set_param(node_name, 'hover_target_y', LaunchConfiguration('hover_target_y')),
         _set_param(node_name, 'hover_target_z', LaunchConfiguration('hover_target_z')),

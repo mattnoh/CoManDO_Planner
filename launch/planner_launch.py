@@ -6,10 +6,13 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     """
-    Solver-ready launcher.
+    Bare planner launcher - infrastructure only.
 
-    Starts /comando_planner with subscriptions/publishers active and solver paused.
+    Starts /comando_planner with subscriptions/publishers active but unconfigured.
     Use ocp_launch.py to push an OCP profile and trigger command_seq.
+
+    OCP-related params (ocp_type, mode, n_replay, hover_target) are NOT set here.
+    They must be configured via ocp_launch.py before execution.
     """
 
     args = [
@@ -26,15 +29,6 @@ def generate_launch_description():
         DeclareLaunchArgument('terminal_freeze_enter_vel', default_value='0.10'),
         DeclareLaunchArgument('terminal_freeze_require_vel', default_value='false'),
         DeclareLaunchArgument('terminal_freeze_exit_pos', default_value='0.20'),
-
-        # Baseline defaults used before an OCP is commanded.
-        DeclareLaunchArgument('ocp_type', default_value='landing'),
-        DeclareLaunchArgument('mode', default_value='mpc'),
-        DeclareLaunchArgument('hover_target_x', default_value='0.0'),
-        DeclareLaunchArgument('hover_target_y', default_value='0.0'),
-        DeclareLaunchArgument('hover_target_z', default_value='1.0'),
-        DeclareLaunchArgument('n_replay', default_value='4'),
-        DeclareLaunchArgument('mass_kg', default_value='0.027'),
     ]
 
     node = Node(
@@ -57,15 +51,6 @@ def generate_launch_description():
             'terminal_freeze_require_vel': LaunchConfiguration('terminal_freeze_require_vel'),
             'terminal_freeze_exit_pos': LaunchConfiguration('terminal_freeze_exit_pos'),
 
-            'ocp_type': LaunchConfiguration('ocp_type'),
-            'mode': LaunchConfiguration('mode'),
-            'hover_target_x': LaunchConfiguration('hover_target_x'),
-            'hover_target_y': LaunchConfiguration('hover_target_y'),
-            'hover_target_z': LaunchConfiguration('hover_target_z'),
-            'n_replay': LaunchConfiguration('n_replay'),
-            'mass_kg': LaunchConfiguration('mass_kg'),
-
-            # Solver starts ready but paused.
             'start_paused': True,
             'command_seq': 0,
         }]

@@ -64,16 +64,20 @@ public:
         command_paused_.store(runtime_cfg.start_paused);
         last_command_seq_ = runtime_cfg.command_seq;
 
-        hover_target_.x() = runtime_cfg.hover_target.x();
-        hover_target_.y() = runtime_cfg.hover_target.y();
-        hover_target_.z() = runtime_cfg.hover_target.z();
+        hover_target_.x() = runtime_cfg.hover_target_x;
+        hover_target_.y() = runtime_cfg.hover_target_y;
+        hover_target_.z() = runtime_cfg.hover_target_z;
 
-        ocp_dt_ = OCPRegistry::getDT(ocp_type_);
-        setTerminalTarget(hover_target_);
-
-        rebuildMpcSolver();
-
-        replay_ticks_since_solve_.store(n_replay_);
+        if (runtime_cfg.isConfigured()) {
+            ocp_dt_ = runtime_cfg.ocp_dt;
+            setTerminalTarget(hover_target_);
+            rebuildMpcSolver();
+            replay_ticks_since_solve_.store(n_replay_);
+            is_configured_ = true;
+        } else {
+            ocp_dt_ = 0.0;
+            is_configured_ = false;
+        }
 
         sensor_cb_group_ = this->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -104,34 +108,25 @@ public:
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
 
-        if (mode_ == "mpc") {
-            solver_timer_ = this->create_wall_timer(
-                1ms,
-                std::bind(&PlannerNode::solverLoop, this),
-                solver_cb_group_);
-
-            const int replay_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
-            mpc_replay_timer_ = this->create_wall_timer(
-                std::chrono::milliseconds(replay_ms),
-                std::bind(&PlannerNode::mpcReplayTick, this),
-                replay_cb_group_);
-        } else {
-            startup_timer_ = this->create_wall_timer(
-                50ms,
-                std::bind(&PlannerNode::openLoopStartupCheck, this),
-                solver_cb_group_);
+        if (is_configured_) {
+            createModeTimers();
         }
 
         param_cb_handle_ = this->add_on_set_parameters_callback(
             std::bind(&PlannerNode::onSetParameters, this, std::placeholders::_1));
 
-        RCLCPP_INFO(this->get_logger(),
-            "Ready mode=%s platform=%s solver=%s ocp=%s ocp_dt=%.3fs n_replay=%d paused=%s",
-            mode_.c_str(), platform_.c_str(), solver_type_.c_str(),
-            ocp_type_.c_str(), ocp_dt_, n_replay_, command_paused_.load() ? "true" : "false");
-        RCLCPP_INFO(this->get_logger(),
-            "Command profile target: [%.3f, %.3f, %.3f] mass=%.4f",
-            hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_);
+        if (is_configured_) {
+            RCLCPP_INFO(this->get_logger(),
+                "Ready mode=%s platform=%s solver=%s ocp=%s ocp_dt=%.3fs n_replay=%d paused=%s",
+                mode_.c_str(), platform_.c_str(), solver_type_.c_str(),
+                ocp_type_.c_str(), ocp_dt_, n_replay_, command_paused_.load() ? "true" : "false");
+            RCLCPP_INFO(this->get_logger(),
+                "Command profile target: [%.3f, %.3f, %.3f] mass=%.4f",
+                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_);
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "Planner started UNCONFIGURED. Use ocp_launch.py to set ocp_type and mode.");
+        }
         RCLCPP_INFO(this->get_logger(),
             "To run next OCP from another terminal: set ocp/mode/n_replay/target then increment command_seq.");
     }
@@ -180,6 +175,31 @@ private:
         alipddp_mpc_ = std::make_unique<QuadrotorMPC>(cfg);
     }
 
+    void createModeTimers() {
+        if (mode_ == "mpc") {
+            if (!solver_timer_) {
+                solver_timer_ = this->create_wall_timer(
+                    1ms,
+                    std::bind(&PlannerNode::solverLoop, this),
+                    solver_cb_group_);
+            }
+            if (!mpc_replay_timer_ && ocp_dt_ > 0) {
+                const int replay_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
+                mpc_replay_timer_ = this->create_wall_timer(
+                    std::chrono::milliseconds(replay_ms),
+                    std::bind(&PlannerNode::mpcReplayTick, this),
+                    replay_cb_group_);
+            }
+        } else if (mode_ == "open_loop") {
+            if (!startup_timer_) {
+                startup_timer_ = this->create_wall_timer(
+                    50ms,
+                    std::bind(&PlannerNode::openLoopStartupCheck, this),
+                    solver_cb_group_);
+            }
+        }
+    }
+
     void resetForNewCommand() {
         trajectory_replayer_.clear();
         replay_ticks_since_solve_.store(n_replay_);
@@ -196,6 +216,9 @@ private:
     }
 
     void publishPausedHoverHoldTick() {
+        if (!is_configured_ || mass_kg_ <= 0.0) {
+            return;
+        }
         if (!maintain_hover_hold_) {
             return;
         }
@@ -230,6 +253,11 @@ private:
     }
 
     void holdHoverAndPause(const std::string& reason) {
+        if (!is_configured_ || mass_kg_ <= 0.0) {
+            RCLCPP_WARN(this->get_logger(),
+                "Cannot hold hover: planner not configured or mass_kg invalid.");
+            return;
+        }
         Eigen::VectorXd x_hover = hasState() ? getCurrentState() : Eigen::VectorXd::Zero(13);
         if (x_hover.size() < 13) {
             x_hover = Eigen::VectorXd::Zero(13);
@@ -257,7 +285,7 @@ private:
     }
 
     rcl_interfaces::msg::SetParametersResult onSetParameters(
-        const std::vector<rclcpp::Parameter>& params) {
+    const std::vector<rclcpp::Parameter>& params) {
         std::lock_guard<std::mutex> lk(command_mutex_);
 
         rcl_interfaces::msg::SetParametersResult result;
@@ -267,11 +295,12 @@ private:
         std::string new_ocp_type = ocp_type_;
         std::string new_mode = mode_;
         int new_n_replay = n_replay_;
-        double new_mass_kg = mass_kg_;
         Eigen::Vector3d new_target = hover_target_;
         int new_command_seq = last_command_seq_;
 
         bool profile_changed = false;
+        bool ocp_type_changed = false;
+        bool mode_changed = false;
 
         for (const auto& p : params) {
             if (p.get_name() == "ocp_type") {
@@ -284,27 +313,21 @@ private:
                     return result;
                 }
                 profile_changed = true;
+                ocp_type_changed = true;
             } else if (p.get_name() == "mode") {
                 new_mode = p.as_string();
-                if (new_mode != "mpc") {
+                if (new_mode != "mpc" && new_mode != "open_loop") {
                     result.successful = false;
-                    result.reason = "runtime mode switching supports only mpc";
+                    result.reason = "mode must be 'mpc' or 'open_loop'";
                     return result;
                 }
                 profile_changed = true;
+                mode_changed = true;
             } else if (p.get_name() == "n_replay") {
                 new_n_replay = p.as_int();
                 if (new_n_replay < 1) {
                     result.successful = false;
                     result.reason = "n_replay must be >= 1";
-                    return result;
-                }
-                profile_changed = true;
-            } else if (p.get_name() == "mass_kg") {
-                new_mass_kg = p.as_double();
-                if (new_mass_kg <= 0.0) {
-                    result.successful = false;
-                    result.reason = "mass_kg must be > 0";
                     return result;
                 }
                 profile_changed = true;
@@ -326,10 +349,24 @@ private:
             ocp_type_ = new_ocp_type;
             mode_ = new_mode;
             n_replay_ = new_n_replay;
-            mass_kg_ = new_mass_kg;
-            ocp_dt_ = OCPRegistry::getDT(ocp_type_);
+
+            if (ocp_type_changed || !is_configured_) {
+                ocp_dt_ = OCPRegistry::getDT(ocp_type_);
+                mass_kg_ = OCPRegistry::getDefaultMassKg(ocp_type_);
+                if (n_replay_ == 0) {
+                    n_replay_ = OCPRegistry::getDefaultNReplay(ocp_type_);
+                }
+            }
+
             setTerminalTarget(new_target);
             rebuildMpcSolver();
+
+            bool was_unconfigured = !is_configured_;
+            is_configured_ = !ocp_type_.empty() && !mode_.empty();
+
+            if (was_unconfigured && is_configured_) {
+                createModeTimers();
+            }
 
             resetForNewCommand();
             command_paused_.store(true);
@@ -343,6 +380,13 @@ private:
         }
 
         if (new_command_seq > last_command_seq_) {
+            if (!is_configured_) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "Cannot start execution: ocp_type and mode must be configured first.");
+                result.successful = false;
+                result.reason = "planner not configured";
+                return result;
+            }
             last_command_seq_ = new_command_seq;
             maintain_hover_hold_ = false;
             command_paused_.store(false);
@@ -784,6 +828,8 @@ private:
     Eigen::VectorXd paused_hover_state_ = Eigen::VectorXd::Zero(13);
     std::mutex command_mutex_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
+
+    bool is_configured_ = true;
 
     // BUG 2 FIX: Tracking circle state - t_abs and circle_target parameters
     double t_abs_ = 0.0;

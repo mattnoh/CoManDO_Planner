@@ -8,17 +8,18 @@
 #include "ocp_registry.hpp"
 
 struct PlannerRuntimeConfig {
-    std::string ocp_type = "landing";
+    std::string ocp_type = "";
     std::string drone_name = "cf_1";
     bool enable_logging = true;
     std::string platform = "crazyflie";
     std::string solver = "alipddp";
-    std::string mode = "mpc";
+    std::string mode = "";
 
-    Eigen::Vector3d hover_target = Eigen::Vector3d(0.0, 0.0, 1.0);
+    double hover_target_x = 0.0;
+    double hover_target_y = 0.0;
+    double hover_target_z = 0.0;
 
     int n_replay = 0;
-    double mass_kg = 0.0;
 
     std::string target_odom_topic = "/target/odom";
     std::string target_accel_topic = "/target/accel";
@@ -33,6 +34,11 @@ struct PlannerRuntimeConfig {
     int command_seq = 0;
 
     double ocp_dt = 0.0;
+    double mass_kg = 0.0;
+
+    bool isConfigured() const {
+        return !ocp_type.empty() && !mode.empty();
+    }
 };
 
 inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
@@ -41,9 +47,11 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     node->declare_parameter("ocp_type", cfg.ocp_type);
     cfg.ocp_type = node->get_parameter("ocp_type").as_string();
 
-    cfg.ocp_dt = OCPRegistry::getDT(cfg.ocp_type);
-    cfg.n_replay = OCPRegistry::getDefaultNReplay(cfg.ocp_type);
-    cfg.mass_kg = OCPRegistry::getDefaultMassKg(cfg.ocp_type);
+    if (cfg.isConfigured()) {
+        cfg.ocp_dt = OCPRegistry::getDT(cfg.ocp_type);
+        cfg.n_replay = OCPRegistry::getDefaultNReplay(cfg.ocp_type);
+        cfg.mass_kg = OCPRegistry::getDefaultMassKg(cfg.ocp_type);
+    }
 
     node->declare_parameter("drone_name", cfg.drone_name);
     node->declare_parameter("enable_logging", cfg.enable_logging);
@@ -51,12 +59,11 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     node->declare_parameter("solver", cfg.solver);
     node->declare_parameter("mode", cfg.mode);
 
-    node->declare_parameter("hover_target_x", cfg.hover_target.x());
-    node->declare_parameter("hover_target_y", cfg.hover_target.y());
-    node->declare_parameter("hover_target_z", cfg.hover_target.z());
+    node->declare_parameter("hover_target_x", cfg.hover_target_x);
+    node->declare_parameter("hover_target_y", cfg.hover_target_y);
+    node->declare_parameter("hover_target_z", cfg.hover_target_z);
 
     node->declare_parameter("n_replay", cfg.n_replay);
-    node->declare_parameter("mass_kg", cfg.mass_kg);
 
     node->declare_parameter("target_odom_topic", cfg.target_odom_topic);
     node->declare_parameter("target_accel_topic", cfg.target_accel_topic);
@@ -76,12 +83,11 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     cfg.solver = node->get_parameter("solver").as_string();
     cfg.mode = node->get_parameter("mode").as_string();
 
-    cfg.hover_target.x() = node->get_parameter("hover_target_x").as_double();
-    cfg.hover_target.y() = node->get_parameter("hover_target_y").as_double();
-    cfg.hover_target.z() = node->get_parameter("hover_target_z").as_double();
+    cfg.hover_target_x = node->get_parameter("hover_target_x").as_double();
+    cfg.hover_target_y = node->get_parameter("hover_target_y").as_double();
+    cfg.hover_target_z = node->get_parameter("hover_target_z").as_double();
 
     cfg.n_replay = node->get_parameter("n_replay").as_int();
-    cfg.mass_kg = node->get_parameter("mass_kg").as_double();
 
     cfg.target_odom_topic = node->get_parameter("target_odom_topic").as_string();
     cfg.target_accel_topic = node->get_parameter("target_accel_topic").as_string();
