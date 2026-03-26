@@ -1,214 +1,80 @@
 # Chapter 3: How the MPC Works
 
-This chapter describes the internals of `QuadrotorMPC`: state/control layout, how the receding horizon warm-start works, why the problem is reused rather than recreated, and the reasoning behind each design decision.
+This chapter describes the internal mechanics of `QuadrotorMPC`, the `OCPRegistry` architecture, and the mathematical foundations of the problem formulations.
 
 ---
 
-## 1. Problem Structure
+## 1. Problem Formulation
 
-The MPC solves an Optimal Control Problem over a finite horizon of N steps, producing:
+The MPC solves an **Optimal Control Problem (OCP)** over a finite horizon of $N$ steps, producing an optimal state trajectory $X$ and control sequence $U$.
 
-```
-X = [ x[0], x[1], ..., x[N] ]       state trajectory   (N+1 nodes)
-U = [ u[0], u[1], ..., u[N-1] ]     control trajectory (N nodes)
-```
+### 1.1 State Space (13D)
+The state vector $x \in \mathbb{R}^{13}$ is defined as:
+- **0–2**: Position $p_W$ (World frame, ENU)
+- **3–5**: Velocity $v_W$ (World frame, ENU)
+- **6–9**: Unit Quaternion $q_{BW}$ ($w, x, y, z$)
+- **10–12**: Angular Rate $\omega_B$ (Body frame, rad/s)
 
-Each `x[k]` is the 13-dimensional state:
+### 1.2 Control Space (4D)
+The control vector $u \in \mathbb{R}^4$ is defined as:
+- **0**: Total Thrust $f_z$ (along body-z axis)
+- **1–3**: Body Moments $M_x, M_y, M_z$
 
-```
-x[k] = [ px, py, pz,           position       (0:2)
-          vx, vy, vz,           velocity        (3:5)
-          qw, qx, qy, qz,       quaternion      (6:9)
-          wx, wy, wz ]          angular rate    (10:12)
-```
-
-Each `u[k]` is the 4-dimensional control:
-
-```
-u[k] = [ fz_B, body-z thrust (index 0)
-Mx, My, Mz ] body-frame moments (indices 1:3)
-```
-
-> **Note:** Previous versions used 6 inputs `[fx, fy, fz, mx, my, mz]` representing full body-frame forces and torques. This was reduced to 4 inputs because quadrotor thrust acts only along the body-z axis — rotors cannot produce lateral forces directly. See [Chapter 4: Debugging Log](04_debugging_log.md#10-model-validation-via-open-loop-testing) for the rationale and validation process.
-u[k] = [ fx, fy, fz,           body-frame force   (0:2)
-          mx, my, mz ]          body-frame torque  (3:5)
-```
-
-The dynamics constraint at every step:
-
-```
-x[k+1] = f( x[k], u[k] )
-```
-
-where `f` is the quadrotor rigid-body dynamics integrated over one OCP time step `dt`.
+> [!NOTE]
+> Previous iterations used 6 controls. This was reduced to 4 to match the physical actuators of a quadrotor, which cannot produce independent lateral forces.
 
 ---
 
-## 2. OCP Types
+## 2. The OCP Registry Architecture
 
-| `ocp_type` | Class | Terminal condition |
-|---|---|---|
-| `"hover"` | `HoverOCP` | Tracks a user-supplied 13-dim `terminal_state` |
-| `"landing"` | `LandingOCP` | Terminal constraint embedded in the OCP |
+To support diverse flight behaviors (Hover, Landing, Moving Target Tracking) without bloating the core planner code, we use a **Registry Pattern**.
 
-`dt` and `HORIZON` are static constants on each class (e.g. `HoverOCP::DT`, `HoverOCP::HORIZON`).
-
----
-
-## 3. What DDP Actually Reads
-
-DDP's contract with the caller:
-
-- **x[0]** — fixed initial condition (current measured state). You provide this.
-- **U = [u[0]..u[N-1]]** — initial guess for the control sequence. You provide this.
-- **x[1..N]** — computed by the solver's own forward rollout. These are always overwritten before the first backward pass regardless of what you set.
-
-x[1..N] passed from outside have no effect. The first thing ALIPDDP does is recompute the entire state trajectory from x[0] and U.
+### 2.1 OCPDescriptor
+Each OCP is defined by an `OCPDescriptor` in `include/ocp_registry.hpp`, containing:
+- **`dt`**: The time-step for this specific formulation.
+- **`transform_state`**: A callback to modify the current state before solving (e.g., converting world-frame position to relative-frame for `stateswitch`).
+- **`post_process_result`**: A callback to modify the solver's output (e.g., converting a relative trajectory back to absolute world coordinates for `tracking_circle`).
+- **`create`**: A factory function that instantiates the concrete `OptimalControlProblem`.
 
 ---
 
-## 4. Receding Horizon: The Shift Count
+## 3. Advanced OCP Formulations
 
-At time `t`, the solver returns the optimal U for the window `[t, t+N*dt]`. The solver fires again at `t + solver_period`. Between those two ticks, the drone has consumed:
+### 3.1 `stateswitch` (Moving Target)
+- **Frame**: Relative (Drone - Target).
+- **Dynamics**: Includes target velocity in the relative state transition.
+- **Variable Time**: Includes a time-step $\theta$ as a decision variable to optimize landing timing.
 
-```
-n_shift = round( solver_period / ocp_dt )
-```
-
-steps of the trajectory. The correct warm-start for the new window `[t+solver_period, t+solver_period+N*dt]` is U shifted forward by `n_shift`:
-
-```
-U_warm[k] = U_prev[k + n_shift]    for k = 0 .. N-1-n_shift
-U_warm[k] = U_prev[N-1]            for k = N-n_shift .. N-1   (hold last)
-```
-
-**What went wrong before.** `shiftWarmStart()` always shifted by exactly 1 regardless of `solver_period`. If `solver_period = 100ms` and `ocp_dt = 50ms`, the correct shift is 2. Shifting by 1 left the warm-start one step behind the drone's actual position in the trajectory. After a few solves the reference drifted away from reality, forcing the solver to work increasingly hard to close the gap — and the published trajectory appeared jagged, as if solving from cold each time.
+### 3.2 `tracking_circle` (Circular Target)
+- **Problem**: Pre-calculates a circular target trajectory.
+- **Baking**: The relative dynamics are "baked-in" using `TargetSnapshot` parameters (Center, Radius, Omega).
+- **Output**: The solver returns a relative-frame solution, which the Registry's `post_process_result` converts back to an absolute world-frame trajectory using the known target motion model.
 
 ---
 
-## 5. Problem Reuse vs Recreation
+## 4. Receding Horizon & Warm-Starting
 
-### What `create()` does
+The planner uses **Warm-Starting** to achieve real-time performance.
 
-`HoverOCP::create(current_state, terminal_state)` and `LandingOCP::create(current_state)` both accept `current_state` as an argument. Inside, they:
+### 4.1 The Shift Count (`n_shift`)
+Between two solves, the drone moves forward by `n_shift` steps of the previous plan.
+To provide a good initial guess for the next solve, the previous solution $(X, U, K)$ is shifted forward:
+- $U_{warm}[k] = U_{prev}[k + n\_shift]$
+- $X_{warm}[k] = X_{prev}[k + n\_shift]$
+- $K_{warm}[k] = K_{prev}[k + n\_shift]$ (Feedback gains)
 
-1. Set `x[0] = current_state` on the problem
-2. Seed U with a gravity-compensating hover from the current quaternion: `u0 = [q^{-1} * [0,0,m*g], 0,0,0]`
-3. Possibly build a reference trajectory interpolated from `current_state` to `terminal_state` for running costs
-
-Point 3 is the critical one. If `create()` re-interpolates the reference from the current measured state on every call, calling it every solve creates a **different cost landscape every tick**. The warm-start U that was optimal for the previous landscape is a poor (or irrelevant) seed for the new one. The solver effectively cold-starts every tick — which is exactly the "jagged path" symptom.
-
-### What we do now
-
-`create()` is called **only when the problem genuinely needs to change**:
-
-- First solve ever (cold start, `problem_ == nullptr`)
-- Terminal state changed (`setTerminalState()` sets `need_problem_rebuild_ = true`)
-
-On all other solves we **reuse `problem_`** and only update:
-1. `x[0]` via `setInitialState(0, current_state)` — the solver's initial condition
-2. `U` via `setInitialControl(i, prev_U_[i])` after shifting — the warm-start seed
-
-The cost landscape is identical to the previous solve, so the warm-start U is a valid and strong initial guess.
-
-```
-cold start (first call or terminal changed):
-    problem_ = create(current_state, terminal_state)
-    → U seeded by create() with gravity hover
-    → x[0] set by create()
-
-warm start (all subsequent calls):
-    problem_->setInitialState(0, current_state)
-    shift prev_U_ forward by n_shift
-    problem_->setInitialControl(i, prev_U_[i]) for i in 0..N-1
-    → cost landscape unchanged from previous solve
-    → warm-start U is a good initial guess
-```
-
-### Solver recreation
-
-Even though `problem_` is reused, the solver is still recreated on every call:
-
-```cpp
-solver_.reset();
-solver_ = make_shared<ALIPDDP<double>>(*problem_);
-solver_->init(solver_params_);
-solver_->solve();
-```
-
-This is because ALIPDDP stores internal workspace allocated in its constructor. Recreating the solver but passing it the same (updated) `problem_` object is safe and ensures no stale workspace state from the previous iteration.
+### 4.2 Handling Ambiguity
+Warm-starting feedback gains ($K$) is critical when using ALIPDDP. It ensures the first backward pass of the new solve starts from a nearly optimal control law, often reducing the iteration count by 50-80% compared to a cold start.
 
 ---
 
-## 6. The `prev_X_` Shift — Kept, Not Used by Solver
+## 5. Solver: ALIPDDP
 
-`shiftWarmStart()` shifts both `prev_X_` and `prev_U_` forward by `n_shift` steps.
-
-`prev_X_` is shifted but is **not passed to the solver**. DDP recomputes x[1..N] in its own forward rollout — any states set from outside are immediately overwritten. `prev_X_` is kept in memory for potential future use (e.g. a custom initialiser that does accept an X seed). It has no effect on the current solution.
-
----
-
-## 7. Cold Start Path
-
-On the first solve (or after `setTerminalState()`), `create()` seeds U with the gravity-compensating hover:
-
-```
-f0 = q_current^{-1} * [0, 0, m*g]   (rotate gravity to body frame)
-u0 = [f0, 0, 0, 0]                   (no torques)
-U = [u0, u0, ..., u0]                (N copies)
-```
-
-This is correct and already uses the real current quaternion — better than any seed we could construct externally. No explicit cold-start code is needed in `setupProblem()`.
+The backend solver is **ALIPDDP (Augmented Lagrangian Iterative Parabolic Differential Dynamic Programming)**.
+- **Dynamics**: Second-order rigid-body dynamics.
+- **Constraints**: Handles thrust limits, tilt constraints, and glideslope constraints via the Augmented Lagrangian method.
+- **Hot-Swap**: The solver object is recreated on every solve to ensure a clean internal workspace, while the `OptimalControlProblem` is reused to preserve the objective function landscape.
 
 ---
 
-## 8. Calling the Solver
-
-```
-solve(current_state, n_shift):
-    1. setupProblem(current_state, n_shift)
-       - if cold start: create() → problem_ set, U seeded by create()
-       - if warm start: setInitialState(0, x_current)
-                        shiftWarmStart(n_shift) → prev_U_ shifted
-                        setInitialControl(i, prev_U_[i])
-    2. solver_.reset()
-       solver_ = ALIPDDP(*problem_)
-       solver_.init(params)
-       solver_.solve()
-    3. X_result = solver_.getResX()   → [x[0], x[1], ..., x[N]]
-       U_result = solver_.getResU()   → [u[0], u[1], ..., u[N-1]]
-    4. cache prev_X_ = X_result  (for future use, not read by solver)
-              prev_U_ = U_result  (warm-start seed for next solve)
-              has_prev_solution_ = true
-    5. return X_result[1] as next_state, full X and U in result
-```
-
----
-
-## 9. Terminal State Update
-
-```cpp
-mpc_->setTerminalState(new_terminal_13dim);
-```
-
-This sets `has_prev_solution_ = false` and `need_problem_rebuild_ = true`. The next solve calls `create()` with the new terminal, rebuilding the cost, then runs cold from the hover seed. Subsequent solves reuse the new problem.
-
----
-
-## 10. Required Header Changes
-
-`quadrotor_mpc.hpp` needs these additions:
-
-```cpp
-// In public:
-Result solve(const Eigen::VectorXd& current_state, int n_shift = 1);
-
-// In private:
-void shiftWarmStart(int n_shift);
-void setupProblem(const Eigen::VectorXd& current_state, int n_shift);
-bool need_problem_rebuild_ = true;
-```
-
----
-
-[Back to Chapter 2: Planner Node Setup](02_planner_node_setup.md)
+[Next Chapter: Debugging Log](04_debugging_log.md)

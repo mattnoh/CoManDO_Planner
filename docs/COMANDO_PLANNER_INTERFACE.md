@@ -2,610 +2,170 @@
 
 ## Overview
 
-CoManDO Planner is a platform-agnostic MPC planner for quadrotor control. This document describes the ROS interface for the **Crazyflie** and **PX4 platforms** using the **ALIPDDP solver**.
+CoManDO Planner is a platform-agnostic MPC planner for quadrotor control. It uses a **Registry-based architecture** to support multiple Optimal Control Problem (OCP) formulations (Landing, Hover, Moving Target Tracking) using the **ALIPDDP solver**.
 
 **Node name:** `comando_planner`
 **Package:** `comando_planner`
 
 ### Architecture
 
+The planner is decoupled from specific OCP physics via the `OCPRegistry`. This allows adding new behaviors by simply registering a new `OCPDescriptor`.
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      comando_planner                        │
-│                                                             │
-│  StateMonitor (thread-safe state ownership)                 │
-│  ├─ cf_state_ / px4_state_ ◄── /{drone}/pose, /{drone}/odom│
-│  └─ target_state_ ◄── /target/odom, /target/accel          │
-│       (for stateswitch OCP only)                           │
-│                                                             │
-│  Solver Callback Group                                      │
-│  └─► solverLoop() ──► ALIPDDP solve                        │
-│       └─► TrajectoryReplayer.updatePlan()                  │
-│                                                             │
-│  Replay Callback Group                                      │
-│  └─► mpcReplayTick() ──► TrajectoryReplayer.sample()       │
-│       └─► publishCommand() ──► /{drone}/cmd_full_state     │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          comando_planner                                │
+│                                                                         │
+│  StateMonitor (thread-safe state ownership)                             │
+│  ├─ cf_state_ / px4_state_ ◄── /{drone}/pose, /{drone}/odom            │
+│  └─ target_state_ ◄── /target/odom, /target/accel                      │
+│                                                                         │
+│  OCP Registry                                                           │
+│  └─► [hover, landing, stateswitch, tracking_circle]                     │
+│       └─► OCPDescriptor (dt, mass, transform_cb, post_process_cb)       │
+│                                                                         │
+│  Solver Callback Group                                                  │
+│  └─► solverLoop()                                                       │
+│       ├─► getCurrentState()                                             │
+│       ├─► transform_state() (optional, e.g. for relative OCPs)          │
+│       ├─► ALIPDDP solve                                                 │
+│       └─► TrajectoryReplayer.updatePlan()                               │
+│                                                                         │
+│  Replay Callback Group                                                  │
+│  └─► mpcReplayTick() (Timer: ocp_dt)                                    │
+│       ├─► trajectory_replayer_.sample()                                 │
+│       ├─► resolve relative state to absolute (if is_relative_plan)      │
+│       └─► publishCommand() ──► /{drone}/cmd_full_state                 │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 1. ROS Parameters
 
-### Launch Parameters
+### Launch Parameters (Infrastructure)
 
-Defined in `launch/planner_launch.py`:
+Defined in `launch/planner_launch.py`. These connect the planner to the hardware and environment.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `drone_name` | string | `"cf_1"` | Drone namespace for topic prefixing |
+| `drone_name` | string | `"cf_1"` | Drone namespace |
+| `platform` | string | `"crazyflie"` | Platform: `"crazyflie"` or `"px4"` |
+| `solver` | string | `"alipddp"` | Solver backend |
 | `enable_logging` | bool | `true` | Enable CSV logging to `./logs/` |
-| `ocp_type` | string | `"landing"` | OCP formulation: `"landing"`, `"hover"`, or `"stateswitch"` |
-| `n_replay` | int | `4` | Setpoints sent per solve cycle |
-| `platform` | string | `"crazyflie"` | Hardware platform: `"crazyflie"` or `"px4"` |
-| `solver` | string | `"alipddp"` | Solver backend (ALIPDDP only) |
-| `mode` | string | `"mpc"` | Execution mode: `"mpc"` or `"openloop"` |
-| `hover_target_x` | double | `0.0` | Target x position [m] |
-| `hover_target_y` | double | `0.0` | Target y position [m] |
-| `hover_target_z` | double | `0.0` | Target z position [m] (0.0 = land) |
+| `target_odom_topic`| string | `"/target/odom"` | External target tracking topic |
+| `target_accel_topic`| string | `"/target/accel"`| External target acceleration topic |
 
-### Runtime Parameters
+### Runtime Parameters (Configurable via `ocp_launch.py`)
+
+These parameters define the behavior and can be updated dynamically via ROS parameters or manually using `ros2 param set`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ocp_type` | string | `""` | OCP formulation: `"landing"`, `"hover"`, `"stateswitch"`, `"tracking_circle"` |
+| `mode` | string | `"mpc"` | `"mpc"` (closed-loop) or `"open_loop"` |
+| `n_replay` | int | `4` | Number of setpoints sent per solve cycle |
+| `hover_target_x/y/z` | double | `0.0` | Global target position (for absolute OCPs) |
+| `mass_kg` | double | Varies | Quadrotor mass (default provided by OCP) |
+| `command_seq` | int | `0` | Increment to trigger a newly configured profile |
+
+### OCP-Specific Parameters (e.g. `tracking_circle`)
+
+When using specific OCPs like `tracking_circle`, additional parameters are required:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `mass_kg` | `0.027` | Quadrotor mass [kg] |
-| `ocp_dt` | varies | Time step [s], set by OCP type |
+| `circle_center_x/y/z` | `0, 0, 0` | Center of the target circle |
+| `circle_R` | `0.5` | Radius of the circle [m] |
+| `circle_omega` | `1.0` | Angular velocity [rad/s] |
+| `circle_phi0` | `0.0` | Initial phase [rad] |
 
-### Target Tracker Parameters (for stateswitch OCP)
+### Terminal Freeze
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `target_odom_topic` | string | `"/target/odom"` | Target odometry topic |
-| `target_accel_topic` | string | `"/target/accel"` | Target acceleration topic |
-
-### Terminal Freeze Parameters
-
-Terminal freeze stops solving when the drone is close to the target to prevent unnecessary computation.
+Stops solving when the drone is stably within the target zone to save resources.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `enable_terminal_freeze` | bool | `true` | Enable terminal freeze feature |
-| `terminal_freeze_enter_pos` | double | `0.20` | Position error threshold to engage freeze [m] |
-| `terminal_freeze_enter_vel` | double | `0.10` | Velocity error threshold to engage freeze [m/s] |
-| `terminal_freeze_require_vel` | bool | `false` | Require velocity condition for freeze |
-| `terminal_freeze_exit_pos` | double | `0.20` | Position error threshold to release freeze [m] |
-
-**Terminal Freeze Behavior:**
-- **Engages when:** `pos_err < enter_pos` AND (`require_vel=false` OR `vel_err < enter_vel`)
-- **Releases when:** `pos_err > exit_pos`
-- Uses hysteresis to prevent chattering
-
-### n_replay Timing
-
-The solve interval is determined by: `n_replay × ocp_dt`
-
-| n_replay | ocp_dt | Solve Interval |
-|----------|--------|----------------|
-| 4 | 50ms | 200ms |
-| 10 | 50ms | 500ms |
+| `enable_terminal_freeze` | bool | `true` | Toggle terminal freeze |
+| `terminal_freeze_enter_pos`| double | `0.20` | Distance error to engage freeze [m] |
+| `terminal_freeze_enter_vel`| double | `0.10` | Velocity error to engage freeze [m/s] |
+| `terminal_freeze_require_vel`| bool | `false`| If true, velocity must also be low to freeze |
 
 ---
 
 ## 2. Inputs (Subscriptions)
 
-### State Estimation Topics (Crazyflie Platform)
+### State Estimation
 
-| Topic | Message Type | Rate | Purpose |
-|-------|--------------|------|---------|
-| `/{drone_name}/pose` | `geometry_msgs/msg/PoseStamped` | ~30Hz | Position + attitude |
-| `/{drone_name}/odom` | `nav_msgs/msg/Odometry` | ~30Hz | Linear + angular velocity |
+The planner subscribes to standard ROS2 state topics. High-rate updates are handled by a dedicated callback group.
 
-### Pose Message Fields
+- **Pose**: `/{drone_name}/pose` (`geometry_msgs/PoseStamped`)
+- **Odometry**: `/{drone_name}/odom` (`nav_msgs/Odometry`) - **Note**: Angular rates from Crazyswarm2 are in `deg/s` and are converted to `rad/s` internally.
 
-```
-geometry_msgs/PoseStamped
-├── header
-│   ├── stamp (time)
-│   └── frame_id (string)
-└── pose
-    ├── position
-    │   ├── x (float64) → state[0]
-    │   ├── y (float64) → state[1]
-    │   └── z (float64) → state[2]
-    └── orientation
-        ├── w (float64) → state[6]
-        ├── x (float64) → state[7]
-        ├── y (float64) → state[8]
-        └── z (float64) → state[9]
-```
+### Target Tracking
 
-### Odometry Message Fields
+For relative-frame OCPs (like `stateswitch`), the planner monitors an external target:
 
-```
-nav_msgs/Odometry
-├── header
-│   ├── stamp (time)
-│   └── frame_id (string)
-└── twist
-    └── twist
-        ├── linear
-        │   ├── x (float64) → state[3]
-        │   ├── y (float64) → state[4]
-        │   └── z (float64) → state[5]
-        └── angular
-            ├── x (float64) → state[10] (deg/s → rad/s)
-            ├── y (float64) → state[11] (deg/s → rad/s)
-            └── z (float64) → state[12] (deg/s → rad/s)
-```
+- **Target Odometry**: `{target_odom_topic}`
+- **Target Acceleration**: `{target_accel_topic}`
 
-**Note:** Crazyswarm2 publishes angular velocity in deg/s. The planner converts to rad/s:
-```cpp
-state(10) = msg->twist.twist.angular.x * (M_PI / 180.0);
-state(11) = msg->twist.twist.angular.y * (M_PI / 180.0);
-state(12) = msg->twist.twist.angular.z * (M_PI / 180.0);
-```
-
-### Target Tracker Topics (for stateswitch OCP)
-
-When using `ocp_type="stateswitch"`, the planner subscribes to target state:
-
-| Topic | Message Type | Purpose |
-|-------|--------------|---------|
-| `{target_odom_topic}` | `nav_msgs/msg/Odometry` | Target position and velocity |
-| `{target_accel_topic}` | `geometry_msgs/msg/AccelStamped` | Target acceleration |
-
-**Target State Requirements:**
-- Position and velocity from odometry message
-- Acceleration from `AccelStamped.linear`
-- State must be fresh (age < 0.2s) for solving to proceed
-
-### State Vector (13-dimensional)
-
-| Index | Symbol | Unit | Description |
-|-------|--------|------|-------------|
-| 0 | x | m | Position x (ENU frame) |
-| 1 | y | m | Position y |
-| 2 | z | m | Position z (up positive) |
-| 3 | vx | m/s | Linear velocity x |
-| 4 | vy | m/s | Linear velocity y |
-| 5 | vz | m/s | Linear velocity z |
-| 6 | qw | - | Quaternion w (scalar) |
-| 7 | qx | - | Quaternion x |
-| 8 | qy | - | Quaternion y |
-| 9 | qz | - | Quaternion z |
-| 10 | wx | rad/s | Angular velocity x |
-| 11 | wy | rad/s | Angular velocity y |
-| 12 | wz | rad/s | Angular velocity z |
+Target state must be fresh (age < 0.2s) for the solver to engage.
 
 ---
 
 ## 3. Outputs (Publications)
 
-### Command Topic
+### Control Commands
 
-| Topic | Message Type | Rate | Purpose |
-|-------|--------------|------|---------|
-| `/{drone_name}/cmd_full_state` | `crazyflie_interfaces/msg/FullState` | ocp_dt (varies by OCP) | Full state command |
+- **Full State**: `/{drone_name}/cmd_full_state` (`crazyflie_interfaces/msg/FullState`)
+- **Rate**: `ocp_dt` (set by the active OCP).
 
-### FullState Message Fields
+The command includes **Acceleration Feedforward**, computed as:
+$$a_{world} = R(q) \cdot [0, 0, f_z/m]^T + [0, 0, -g]^T$$
 
-```
-crazyflie_interfaces/FullState
-├── header
-│   ├── stamp (time)
-│   └── frame_id ("world")
-├── pose
-│   ├── position
-│   │   ├── x (float32) ← commanded state[0]
-│   │   ├── y (float32) ← commanded state[1]
-│   │   └── z (float32) ← commanded state[2]
-│   └── orientation
-│       ├── w (float32) ← commanded state[6]
-│       ├── x (float32) ← commanded state[7]
-│       ├── y (float32) ← commanded state[8]
-│       └── z (float32) ← commanded state[9]
-├── twist
-│   ├── linear
-│   │   ├── x (float32) ← commanded state[3]
-│   │   ├── y (float32) ← commanded state[4]
-│   │   └── z (float32) ← commanded state[5]
-│   └── angular
-│       ├── x (float32) ← commanded state[10]
-│       ├── y (float32) ← commanded state[11]
-│       └── z (float32) ← commanded state[12]
-└── acc
-    ├── x (float32) ← feedforward acceleration
-    ├── y (float32) ← feedforward acceleration
-    └── z (float32) ← feedforward acceleration
-```
+### Visualization
 
-### Acceleration Feedforward
-
-Feedforward acceleration is computed from thrust command:
-
-```cpp
-// a_world = R(q) * [0, 0, fz/m] + [0, 0, -g]
-Eigen::Vector3d acc = q.toRotationMatrix() * Eigen::Vector3d(0, 0, fz / mass);
-acc(2) -= 9.81; // gravity
-```
-
-**Important:** The lower-level controller requires acceleration feedforward for good tracking. Zeroing this field causes tracking degradation.
-
-### Visualization Topic
-
-| Topic | Message Type | Purpose |
-|-------|--------------|---------|
-| `/{drone_name}/planned_trajectory` | `nav_msgs/msg/Path` | Planned trajectory for RViz |
+- **Planned Trajectory**: `/{drone_name}/planned_trajectory` (`nav_msgs/msg/Path`) - Displays the N-step horizon in RViz.
 
 ---
 
-## 4. Solver Interface
+## 4. OCP Registry & Formulations
 
-### Input
+The planner uses an `OCPRegistry` to manage different problem types.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `current_state` | `Eigen::VectorXd(13)` | Current state estimate (absolute frame) |
-| `target_accel` | `Eigen::Vector3d` | Target acceleration (for stateswitch OCP) |
+| OCP Type | Formulation | State Space | Relative? | Notes |
+|----------|-------------|-------------|-----------|-------|
+| `"hover"` | Fixed Target | Absolute (13D) | No | Simple stabilization |
+| `"landing"` | Terminal Constraint | Absolute (13D) | No | Precise vertical landing |
+| `"stateswitch"`| Variable Time | Relative (14D) | **Yes** | Landing on moving targets |
+| `"tracking_circle"`| TV Dynamics | Absolute (13D) | No* | Landing on circular trajectory |
 
-### Output (QuadrotorMPC::Result)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `success` | `bool` | Solve succeeded |
-| `state_trajectory` | `std::vector<Eigen::VectorXd>` | N+1 states |
-| `control_trajectory` | `std::vector<Eigen::VectorXd>` | N controls |
-| `solve_time_ms` | `double` | Solve duration [ms] |
-| `solve_iters` | `int` | ALIPDDP iterations |
-
-**Note:** For `stateswitch` OCP, the state trajectory is in the **relative frame** (drone position minus target position).
-
-### Control Vector (4-dimensional, landing/hover OCP)
-
-| Index | Symbol | Unit | Description |
-|-------|--------|------|-------------|
-| 0 | fz_B | N | Body-z thrust force |
-| 1 | Mx | N·m | Body-x moment |
-| 2 | My | N·m | Body-y moment |
-| 3 | Mz | N·m | Body-z moment |
-
-### Control Vector (5-dimensional, stateswitch OCP)
-
-| Index | Symbol | Unit | Description |
-|-------|--------|------|-------------|
-| 0 | fz_B | N | Body-z thrust force |
-| 1 | Mx | N·m | Body-x moment |
-| 2 | My | N·m | Body-y moment |
-| 3 | Mz | N·m | Body-z moment |
-| 4 | θ | s | Time step duration |
+*\*`tracking_circle` solves in a "baked-in" relative frame and post-processes the result to absolute coordinates before replaying.*
 
 ---
 
-## 5. Timing Model
+## 5. Timing & Replay Model
 
-### Thread Architecture
+The planner operates on a **Solve-while-Replay** model:
 
-Three callback groups prevent blocking:
+1. **Solve Tick**: Triggered every `n_replay` steps. It captures a state snapshot ($x_0$), solves the OCP, and hands the plan to the `TrajectoryReplayer`.
+2. **Replay Tick**: Every `ocp_dt`, the `TrajectoryReplayer` samples the current active plan based on the elapsed time since the solve started.
 
-1. **sensor_cb_group_**: Updates state from pose/odom/target callbacks
-2. **solver_cb_group_**: Runs MPC solver (1ms poll)
-3. **replay_cb_group_**: Streams commands (ocp_dt interval)
-
-### State Management
-
-The `StateMonitor` class provides thread-safe access to:
-- `cf_state_` / `px4_state_`: Platform-specific state
-- `target_state_`: Target state for stateswitch OCP
-
-### Solver Loop
-
-```
-Timer: 1ms poll
-└─► if (replay_ticks_since_solve_ >= n_replay)
-    ├─► if (terminal_freeze_) check release condition
-    ├─► getCurrentState()
-    ├─► getTargetSnapshot() [for stateswitch]
-    ├─► solver.solve(state, target_accel)
-    ├─► trajectory_replayer_.updatePlan(...)
-    ├─► is_primed_ = true
-    └─► replay_ticks_since_solve_ = 0
-```
-
-### Replay Loop
-
-```
-Timer: ocp_dt interval
-└─► if (!is_primed_) return
-├─► trajectory_replayer_.sample(now, ocp_dt)
-├─► if (plan_is_relative)
-│   ├─► get target position/velocity
-│   └─► transform relative state to absolute
-└─► publishCommand(x_cmd, u_cmd)
-```
-
-### Solve-Command Relationship
-
-```
-Time:  |----|----|----|----|----|----|----|----|----|
-Solve: S1 ─────────────────────► S2
-       │                        │
-       ├─► cmd[1]               ├─► cmd[k+1]
-       ├─► cmd[2]               ├─► cmd[k+2]
-       ├─► cmd[3]               ├─► ...
-       └─► cmd[4] (n_replay=4)  └─► cmd[k+n_replay]
-
-k = round(solve_time_ms / ocp_dt_ms)
-```
-
-### Terminal Freeze
-
-Terminal freeze prevents unnecessary solving when the drone is near its target:
-
-```
-Engage: pos_err < enter_pos AND (not require_vel OR vel_err < enter_vel)
-Release: pos_err > exit_pos
-```
-
-This uses hysteresis to prevent rapid engage/release cycles.
+This architecture ensures that even if a solve takes 100ms, the drone continues to follow the last valid trajectory at high frequency (e.g., 20Hz or 50Hz).
 
 ---
 
-## 6. OCP Formulations (Reference)
+## 6. Logging (`logs/`)
 
-### Common Structure (Landing/Hover)
+For every execution, a new timestamped directory is created:
 
-| Element | Dimension | Description |
-|---------|-----------|-------------|
-| State `x` | 13 | Position, velocity, quaternion, angular velocity |
-| Control `u` | 4 | Thrust + 3 moments |
-| Horizon `N` | 100 | Number of stages |
-| Time step `dt` | 0.05s | Fixed |
-
-### Cost Function Structure
-
-```
-J = Σ [ stage_cost(x_k, u_k) ] + terminal_cost(x_N)
-    k=0..N-1
-```
-
-**Stage Cost Components:**
-- State tracking: `||x - x_ref||²_Q`
-- Control effort: `||u - u_ref||²_R`
-- Control slew rate: `||u - u_prev||²_S`
-- Trajectory consistency (optional): `||x - x_prev||²_W`
-
-**Terminal Cost:**
-- Terminal state penalty: `||x_N - x_ref||²_P`
-
-### Constraint Types
-
-| Type | Symbol | Description |
-|------|--------|-------------|
-| Inequality | NO | Thrust limits (FMIN, FMAX) |
-| Second-order cone | SOC | Glideslope, tilt cone, moment limits |
-
-### Landing OCP (`ocp_landing.hpp`)
-
-- Horizon: N = 100
-- dt = 0.05s
-- FMIN = 0.08 N, FMAX = 0.6 N
-- Glideslope = 60°
-- Tilt cone = 60°
-
-### Hover OCP (`ocp_hover.hpp`)
-
-- Horizon: N = 100
-- dt = 0.05s
-- FMAX = 1.2 N
-
-### Stateswitch OCP (`ocp_stateswitch.hpp`)
-
-**Purpose:** Landing on a moving target using relative-frame formulation.
-
-| Element | Dimension | Description |
-|---------|-----------|-------------|
-| State `x` | 14 | [position(3), velocity(3), quaternion(4), angular_rate(3), time(1)] |
-| Control `u` | 5 | Thrust, 3 moments, time step θ |
-| Horizon `N` | 30 | Number of stages |
-| Time step θ | 0.05-0.2s | Variable (decision variable) |
-
-**State Vector (14-dimensional):**
-
-| Index | Symbol | Unit | Description |
-|-------|--------|------|-------------|
-| 0-2 | p_rel | m | Relative position (drone - target) |
-| 3-5 | v_rel | m/s | Relative velocity (drone - target) |
-| 6-9 | q | - | Quaternion (absolute) |
-| 10-12 | ω | rad/s | Angular velocity |
-| 13 | t | s | Time from solve start |
-
-**Cost Function:**
-- Stage cost: Minimize time + velocity/angular rate regularization
-- Terminal cost: Penalize position error, velocity error, attitude error
-
-**Constraints:**
-- Thrust limits: FMIN ≤ fz ≤ FMAX
-- Moment limits: ||[Mx, My, Mz]||₂ ≤ τ_max
-- Time step bounds: θ_L ≤ θ ≤ θ_H (0.05s to 0.2s)
-- Floor constraint: z ≥ 0
-- Glideslope: √(x² + y²) ≤ tan(γ) · z
-- Vertical velocity: vz ≥ -VZ_LAND_MAX
-
-### Weight Matrices (Landing OCP)
-
-```cpp
-// State cost Q (13-dim diagonal)
-Q_DIAG = [2.0, 2.0, 2.0,    // position
-          3.0, 3.0, 4.0,    // velocity
-          0.1, 0.1, 0.1, 0.1, // quaternion
-          0.05, 0.05, 0.05] // angular velocity
-
-// Control cost R (4-dim diagonal)
-R_DIAG = [1e-3, 1e-4/J², 1e-4/J², 1e-4/J²]
-
-// Slew rate cost S (4-dim diagonal)
-S_DIAG = [5e-3, 1e-1/J², 1e-1/J², 1e-1/J²]
-
-// Terminal cost P (13-dim diagonal)
-P_DIAG = [1000, 1000, 1000,  // position
-          500, 500, 500,     // velocity
-          500, 500, 500, 500, // quaternion
-          200, 200, 200]     // angular velocity
-```
+- `all_solves.csv`: The full predicted trajectory (X and U) for every solve iteration. For relative OCPs, this includes the target state snapshot.
+- `commanded_state.csv`: The actual commands streamed to the hardware.
+- `actual_state.csv`: The measured states received during the run.
 
 ---
 
-## 7. Logging Format
+## 7. Integration Checklist for New OCPs
 
-### Log Directory Structure
-
-```
-./logs/{drone_name}_{ocp_type}_{mode}_{solver}_{YYYYMMDD_HHMMSS}/
-├── all_solves.csv
-├── commanded_state.csv
-└── actual_state.csv
-```
-
-### all_solves.csv
-
-Solver trajectory output for each solve.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| solve_num | int | Solve index |
-| solve_time_ms | float | Solve duration |
-| solve_iters | int | ALIPDDP iterations |
-| node | int | Trajectory node index (0..N) |
-| t | float | Time from solve start (node × dt) |
-| x, y, z | float | Position [m] |
-| vx, vy, vz | float | Velocity [m/s] |
-| qw, qx, qy, qz | float | Quaternion |
-| wx, wy, wz | float | Angular velocity [rad/s] |
-| fz, mx, my, mz | float | Control (thrust, moments) |
-
-### commanded_state.csv
-
-Commands sent to hardware.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| timestamp | float | Wall clock time [s] |
-| solve_num | int | Active solve index |
-| [state 13] | float | Commanded state |
-| [control 4] | float | Commanded control |
-| acc_x, acc_y, acc_z | float | Feedforward acceleration |
-
-### actual_state.csv
-
-Measured state for comparison.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| timestamp | float | Wall clock time [s] |
-| solve_num | int | Active solve index |
-| [state 13] | float | Measured state |
-
----
-
-## 8. File Structure
-
-### Core Source Files
-
-| File | Purpose |
-|------|---------|
-| `src/planner_node.cpp` | Main ROS node, timer callbacks, logging |
-| `src/quadrotor_mpc.cpp` | ALIPDDP solver wrapper, warm-start logic |
-
-### Header Files
-
-| File | Purpose |
-|------|---------|
-| `include/quadrotor_mpc.hpp` | MPC class interface |
-| `include/ocp_registry.hpp` | OCP factory and parameter lookup |
-| `include/state_monitor.hpp` | Thread-safe state ownership |
-| `include/trajectory_replayer.hpp` | Time-indexed trajectory sampling |
-| `include/planner_runtime_config.hpp` | Parameter loading |
-| `include/ocp/ocp_landing.hpp` | Landing problem formulation |
-| `include/ocp/ocp_hover.hpp` | Hover problem formulation |
-| `include/ocp/ocp_stateswitch.hpp` | State-switch problem formulation |
-| `include/platform/crazyflie.hpp` | Crazyflie I/O abstraction |
-| `include/platform/px4.hpp` | PX4 I/O abstraction |
-| `include/platform/target_tracker.hpp` | Target state subscriptions |
-
-### Launch Files
-
-| File | Purpose |
-|------|---------|
-| `launch/planner_launch.py` | ROS2 launch file with parameters |
-
----
-
-## 9. Integration Checklist
-
-### Adding a New OCP Type
-
-1. **Create OCP header** (`include/ocp/ocp_new.hpp`):
-   - Define constants (HORIZON, DT, MASS, etc.)
-   - Define solver parameters (SOLVER_REG1_MIN, SOLVER_REG2_MIN, etc.)
-   - Implement `getSolverParams()` function that returns a `Param` struct
-   - Implement stage cost class
-   - Implement terminal cost class
-   - Implement constraint classes
-   - Implement `create()` factory function
-
-2. **Register in OCPRegistry** (`include/ocp_registry.hpp`):
-   - Add include: `#include "ocp/ocp_new.hpp"`
-   - Add to `getDT()` switch
-   - Add to `getSolverParams()` switch: `if (ocp_type == "new") return NewOCP::getSolverParams();`
-   - Add to `create()` factory
-
-3. **Solver parameters are defined inside each OCP namespace**:
-   - Each OCP defines its own `SOLVER_REG1_MIN`, `SOLVER_REG2_MIN`, `SOLVER_RHO`, etc.
-   - The `getSolverParams()` function assembles these into a `Param` struct
-   - No parameters are stored in the registry - it only delegates to each OCP
-
-4. **If OCP needs target tracking** (like stateswitch):
-   - Add target state handling in `StateMonitor`
-   - Configure target tracker subscriptions in planner node
-
-5. **Update launch file** (`launch/planner_launch.py`):
-   - Update ocp_type default if needed
-
-### Testing New OCP
-
-1. Run with logging enabled: `enable_logging:=true`
-2. Check all_solves.csv for convergence
-3. Compare commanded_state.csv vs actual_state.csv
-4. Monitor solve_time_ms for real-time feasibility
-
----
-
-## 10. Known Issues
-
-### Angular Velocity Units
-
-Crazyswarm2 publishes angular velocity in **deg/s**, not rad/s. The planner converts on input:
-```cpp
-state(10) = msg->twist.twist.angular.x * (M_PI / 180.0);
-```
-
-### State Initialization
-
-On startup, state is initialized to:
-```cpp
-current_state_ = Eigen::VectorXd::Zero(13);
-current_state_(6) = 1.0; // neutral quaternion w=1
-```
-
-Wait for both pose and odom before solving begins.
-
-### Acceleration Feedforward
-
-Setting acceleration feedforward to zero causes poor tracking. Always compute from thrust:
-```cpp
-acc = R(q) * [0, 0, fz/m] + [0, 0, -g]
-```
-
-### Target State Freshness (stateswitch OCP)
-
-The planner requires fresh target state (age < 0.2s) to proceed with solving. If target state is stale, the solver will wait and log a warning.
+1. **Define OCP Header**: Implement stage/terminal costs and dynamics in `include/ocp/`.
+2. **Add to Registry**: Register in `include/ocp_registry.hpp` with appropriate callbacks (transform, validate, post-process).
+3. **Configure Launch**: Add parameters to `launch/planner_launch.py` or the configuration scripts.
