@@ -42,7 +42,7 @@ public:
         // ── Parameters ──────────────────────────────────────────────────────
         center_x_   = declare_parameter<double>("center_x",   0.0);
         center_y_   = declare_parameter<double>("center_y",   0.0);
-        center_z_   = declare_parameter<double>("center_z",   1.5);
+        center_z_   = declare_parameter<double>("center_z",   0.3);
         radius_     = declare_parameter<double>("radius",     1.0);
         omega_      = declare_parameter<double>("omega",      0.01);
         phi0_       = declare_parameter<double>("phi0",       0.0);

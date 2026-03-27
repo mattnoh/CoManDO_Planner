@@ -437,9 +437,7 @@ private:
             x0(0), x0(1), x0(2), x0(3), x0(4), x0(5));
     }
 
-        const Eigen::Vector3d target_accel = target_snapshot.acceleration;
-
-        SolverResult result = callSolver(x0, target_accel);
+        SolverResult result = callSolver(x0, target_snapshot);
         if (desc.post_process_result) {
             desc.post_process_result(result, target_snapshot);
         }
@@ -564,7 +562,7 @@ private:
     }
 
     SolverResult callSolver(const Eigen::VectorXd& state,
-                            const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero()) {
+                            const TargetSnapshot& target_snapshot = TargetSnapshot{}) {
         SolverResult result;
         if (solver_type_ == "alipddp" && alipddp_mpc_) {
             double t_abs = this->now().seconds();
@@ -574,10 +572,10 @@ private:
                 if (desc.needs_target_trajectory) {
                     runtime_cfg_.target_accel_buffer = state_monitor_.getTargetAccelBuffer();
                 }
-                extra = desc.prepare_extra(runtime_cfg_, t_abs);
+                extra = desc.prepare_extra(runtime_cfg_, t_abs, target_snapshot);
             }
 
-            auto r = alipddp_mpc_->solve(state, target_accel, extra, t_abs);
+            auto r = alipddp_mpc_->solve(state, target_snapshot.acceleration, extra, t_abs);
             
             result.success = r.success;
             result.next_state = r.next_state;
@@ -633,6 +631,17 @@ private:
         }
 
         auto desc = OCPRegistry::getDescriptor(ocp_type_);
+        TargetSnapshot target_snapshot = getTargetSnapshot();
+
+        if (desc.needs_target_trajectory || desc.validate_target) {
+            if (!target_snapshot.valid) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "[OpenLoop] IDLE — waiting for valid target state...");
+                publishPausedHoverHoldTick();
+                return;
+            }
+        }
+
         if (desc.needs_target_trajectory) {
             if (!state_monitor_.hasTargetTrajectory(this->now())) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -646,7 +655,7 @@ private:
 
         Eigen::VectorXd x0 = getCurrentState();
         RCLCPP_INFO(this->get_logger(), "[OpenLoop] Solving...");
-        SolverResult result = callSolver(x0);
+        SolverResult result = callSolver(x0, target_snapshot);
 
         if (desc.post_process_result) {
             TargetSnapshot mock_t = getTargetSnapshot();

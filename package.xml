@@ -20,6 +20,8 @@
   <exec_depend>px4_msgs</exec_depend>
   <!-- Eigen for linear algebra -->
   <depend>eigen</depend>
+  <!-- ALIPDDP library (Integrated as sibling) -->
+  <!-- <depend>alipddp</depend> -->
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
   <export>

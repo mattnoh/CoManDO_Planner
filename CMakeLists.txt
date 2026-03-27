@@ -18,6 +18,9 @@ find_package(trajectory_msgs REQUIRED)
 find_package(crazyflie_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 
+# ── Include ALIPDDP solver as a standalone sibling ────────────────────────────
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../ALIPDDP-main ${CMAKE_CURRENT_BINARY_DIR}/alipddp)
+
 # ── Optional: PX4 messages ────────────────────────────────────────────────────
 find_package(px4_msgs QUIET)
 if(px4_msgs_FOUND)
@@ -38,8 +41,6 @@ macro(configure_target TARGET_NAME)
   target_include_directories(${TARGET_NAME} PRIVATE
     ${EIGEN3_INCLUDE_DIR}
     include
-    ${CMAKE_SOURCE_DIR}/../ALIPDDP-main/alipddp
-    ${CMAKE_SOURCE_DIR}/../ALIPDDP-main/problem_maker
   )
 
   if(px4_msgs_FOUND)
@@ -47,7 +48,7 @@ macro(configure_target TARGET_NAME)
   endif()
 
   target_link_libraries(${TARGET_NAME}
-    ${CMAKE_SOURCE_DIR}/../ALIPDDP-main/build/libalipddp_library.a
+    alipddp_library
   )
 
   set(_AMENT_DEPS

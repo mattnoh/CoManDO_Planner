@@ -88,7 +88,7 @@ struct OCPDescriptor {
     std::function<void(SolverResult&,
         const TargetSnapshot&)>              post_process_result;
     
-    std::function<std::any(const PlannerRuntimeConfig& cfg, double t_abs)> prepare_extra;
+    std::function<std::any(const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& tgt_snap)> prepare_extra;
 
     std::function<void(planner_logging::SolveLogMeta& meta, const std::any& extra_params, const std::any& runtime_cfg)> prepare_log_meta;
 
@@ -188,7 +188,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                     }
                 }
             },
-            [](const PlannerRuntimeConfig& cfg, double t_abs) {
+            [](const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& /*tgt_snap*/) {
                 // Return ct so create() can use it AND post_process_result can use it.
                 TrackingCircleOCP::TrackingCircleExtra ex;
                 ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
@@ -240,12 +240,19 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                     }
                 }
             },
-            [](const PlannerRuntimeConfig& cfg, double t_abs) {
+            [](const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& tgt_snap) {
                 TrackingCircleTargetOCP::TrackingCircleTargetExtra ex;
                 ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
                 ex.tgt.R = cfg.circle_R;
                 ex.tgt.omega = cfg.circle_omega;
-                ex.tgt.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
+                
+                if (tgt_snap.valid) {
+                    double ph = std::atan2(tgt_snap.position.y() - ex.tgt.center.y(), 
+                                           tgt_snap.position.x() - ex.tgt.center.x());
+                    ex.tgt.phi0 = ph - ex.tgt.omega * t_abs;
+                } else {
+                    ex.tgt.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
+                }
                 ex.t_abs = t_abs;
                 
                 if (cfg.target_accel_buffer.has_value()) {
