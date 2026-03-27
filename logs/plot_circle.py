@@ -316,6 +316,23 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
                 # Show circle rim in relative frame (where drone wants to be)
                 ax.plot(R*np.cos(_rt), R*np.sin(_rt), np.zeros_like(_rt), color="#d12be6", lw=1.0, ls="--", alpha=0.3)
 
+            # Glideslope cone
+            apex = np.array([0, 0, 0]) if is_rel else tgt_pos[-1]
+            z_apex = apex[2]
+            z_rim = z_apex + CONE_H
+            
+            # Draw rim
+            ax.plot(apex[0] + rim_r * np.cos(_rt), 
+                    apex[1] + rim_r * np.sin(_rt), 
+                    np.full_like(_rt, z_rim), 
+                    color=CONE_COL, lw=1.2, alpha=0.4, ls="-", zorder=3)
+            # Draw spokes
+            for th in _ct:
+                ax.plot([apex[0], apex[0] + rim_r * np.cos(th)],
+                        [apex[1], apex[1] + rim_r * np.sin(th)],
+                        [z_apex, z_rim],
+                        color=CONE_COL, lw=0.8, alpha=0.3, zorder=3)
+
             # First-solve reference (dotted, faint)
             ax.plot(ftraj[:, 0], ftraj[:, 1], ftraj[:, 2],
                 color=C_FIRST, lw=1.4, ls=":", alpha=0.55, zorder=3)
@@ -335,8 +352,9 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
                 ax.plot(traj[j:j+2, 0], traj[j:j+2, 1], traj[j:j+2, 2],
                         color=c, lw=2.2, alpha=0.90, zorder=5)
 
-            # Body-frame axes at replanning instants
-            for ridx in replan_idx:
+            # Body-frame axes at 10 sampled points along the trajectory
+            body_indices = np.linspace(0, len(traj) - 1, 10, dtype=int)
+            for ridx in body_indices:
                 if ridx >= len(traj): continue
                 pos = traj[ridx]
                 R_mat = quat_to_rotmat(*quats[ridx])
@@ -355,6 +373,7 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
                     Line2D([0],[0], color="#d12be6", lw=2.5,         label="Target"),
                     Line2D([0],[0], color=C_CMD,    lw=1.5, ls="--",  label="Commanded"),
                     Line2D([0],[0], color=C_FIRST,  lw=1.4, ls=":",   label="First plan"),
+                    Line2D([0],[0], color=CONE_COL, lw=1.2,           label="Glideslope"),
                 ]
                 _legend(ax, handles, loc="upper right", fontsize=9)
 
