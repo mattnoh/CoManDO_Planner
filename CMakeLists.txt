@@ -41,6 +41,7 @@ macro(configure_target TARGET_NAME)
   target_include_directories(${TARGET_NAME} PRIVATE
     ${EIGEN3_INCLUDE_DIR}
     include
+    config
   )
 
   if(px4_msgs_FOUND)
@@ -73,13 +74,6 @@ add_executable(comando_planner
 )
 configure_target(comando_planner)
 
-# ── Executable 2: stateswitch OCP test
-add_executable(test_stateswitch_ocp
-  src/test_stateswitch_ocp.cpp
-  ${SHARED_SOURCES}
-)
-configure_target(test_stateswitch_ocp)
-
 # ── Executable 3: target_publisher
 add_executable(target_publisher src/target_publisher.cpp)
 configure_target(target_publisher)
@@ -90,7 +84,6 @@ ament_target_dependencies(target_publisher rclcpp nav_msgs geometry_msgs traject
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner
-    test_stateswitch_ocp
     target_publisher
   DESTINATION lib/${PROJECT_NAME}
 )

@@ -19,7 +19,7 @@ struct PlannerRuntimeConfig {
 
     double circle_center_x = 0.0;
     double circle_center_y = 0.0;
-    double circle_center_z = 1.5;
+    double circle_center_z = 0.3;
     double circle_R = 2.0;
     double circle_omega = 0.4;
     double circle_phi0 = 0.0;
