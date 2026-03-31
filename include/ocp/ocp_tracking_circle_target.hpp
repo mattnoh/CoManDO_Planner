@@ -12,12 +12,24 @@
 ///   vector. Solves the "frozen acceleration" problem.
 ///
 /// • Terminal constraint: RelInterceptCon (5-dim) — p_rel=0 (3) + vxy_rel=0 (2).
-///   vz is NOT constrained, allowing controlled descent via RelTermCost.
+///   In relative-frame dynamics the target is always at the origin, so vxy_rel=0
+///   simply means "arrive co-moving with the target in XY" — it does NOT force
+///   the drone to orbit. vz is left to RelTermCost for controlled descent.
 ///
 /// • Terminal cost: RelTermCost — soft penalties on rz, (vz-vz_ref), attitude,
-///   and angular velocity. Prevents over-constraining the problem.
+///   and angular velocity.
 ///
-/// • Stage cost: TimeCost with vz_ref tracking throughout trajectory.
+/// • Stage cost: TimeCost — time-optimal + vz_ref tracking (w_vz=0.5) matching
+///   the original cpp. No w_xy, no w_z (both fight the glideslope).
+///
+/// • Warm-start: pure geometric straight-line — states set directly to
+///   p(k) = p0_rel*(N-k)/N, v(k) = v_desired (constant), quaternion = identity.
+///   No dynamic propagation. This guarantees X[N] = (0,0,0,...) exactly so the
+///   terminal constraint starts at zero violation. Works for any feasible p0_rel.
+///
+/// • Solver params: rho=15, rhoT=500, rho_mul=8.
+///   rhoT raised from 100 — with N=80 stages the accumulated stage cost is ~80x
+///   a single stage, so rhoT=100 is too weak to dominate the terminal constraint.
 ///
 /// • Output: Absolute coordinates (converted from relative frame internally).
 ///
@@ -42,8 +54,6 @@
 #include <cmath>
 #include <vector>
 #include <memory>
-
-#include "target/circular_target.hpp"
 
 namespace TrackingCircleTargetOCP {
 
@@ -87,8 +97,6 @@ static const double GS_TAN = std::tan(GS_DEG * M_PI / 180.0);
 static constexpr double VZ_LAND_MAX = 2.5;
 static constexpr double VZ_REF = -0.15;
 
-// ── Circular target included from "target/circular_target.hpp" ───────────────
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Quad6DOFVarTimeRelativeTV — time-varying target acceleration
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,171 +138,130 @@ public:
         res(IDX_DT) = x(IDX_DT) + u(IDX_THETA);
         return res;
     }
-
-    Eigen::VectorXd propagate14(const Eigen::VectorXd& x14,
-                                 const Eigen::VectorXd& u_phys,
-                                 double Th) const {
-        double tabs = x14(IDX_DT) + t0_abs_;
-        auto xd = x14.segment(0, this->NX_PHYS);
-
-        Eigen::Vector3d a1 = buf_.getAccel(tabs);
-        auto k1 = this->xdot_impl(xd, u_phys, a1);
-        Eigen::Vector3d a2 = buf_.getAccel(tabs + 0.5*Th);
-        auto k2 = this->xdot_impl(xd + 0.5*Th*k1, u_phys, a2);
-        Eigen::Vector3d a3 = buf_.getAccel(tabs + 0.5*Th);
-        auto k3 = this->xdot_impl(xd + 0.5*Th*k2, u_phys, a3);
-        Eigen::Vector3d a4 = buf_.getAccel(tabs + Th);
-        auto k4 = this->xdot_impl(xd + Th*k3, u_phys, a4);
-
-        Eigen::VectorXd xn14(14);
-        xn14.segment(0, this->NX_PHYS) = xd + (Th/6.0)*(k1+2*k2+2*k3+k4);
-        xn14.segment(6, 4).normalize();
-        xn14(IDX_DT) = x14(IDX_DT) + Th;
-        return xn14;
-    }
 };
 
 // ── TimeCost ──────────────────────────────────────────────────────────────────
-/// w_z has been intentionally removed — it was antagonistic with GlideslopeCon_rel.
-/// The glideslope enforces |xy_rel| ≤ tan_gs·z, so forcing z→0 via w_z before
-/// XY offset is small enough causes the solver to hit the cone, level off, and
-/// orbit-match to reduce XY. Instead, descent is guided purely by vz_stage_ref
-/// (more aggressive than the terminal VZ_REF) with a loose w_vz weight.
-///
-/// w_u keeps quu positive-definite (well-conditioned DDP backward pass).
-/// w_xy softly penalises lateral offset, complementing the hard glideslope cone.
+// Matches the original cpp exactly:
+//   • u(IDX_THETA)            — minimize total time
+//   • eps * (||v||² + ||ω||²) — numerical damping (1e-4)
+//   • w_vz * (vz - vz_ref)²  — shapes descent rate throughout (w_vz=0.5)
+//
+// No w_xy (fights the glideslope as z→0 the allowed XY shrinks).
+// No w_z  (directly antagonistic to GlideslopeCon_rel).
+// No w_u  (cpp has zero quu; DDP converges fine with the vz term filling qxx(5,5)).
 template<typename Scalar>
 class TimeCost : public StageCostBase<Scalar> {
-    Scalar eps_, w_vz_, vz_ref_, w_u_, w_xy_;
+    Scalar eps_, w_vz_, vz_ref_;
 public:
-    explicit TimeCost(double e           = 1e-4,
-                      double w_vz        = 0.1,    // loose — just a guide
-                      double vz_ref      = -0.5,   // more aggressive than terminal
-                      double w_u         = 0.01,
-                      double w_xy        = 0.2)
-        : eps_(static_cast<Scalar>(e)),
-          w_vz_(static_cast<Scalar>(w_vz)),
-          vz_ref_(static_cast<Scalar>(vz_ref)),
-          w_u_(static_cast<Scalar>(w_u)),
-          w_xy_(static_cast<Scalar>(w_xy)) {}
+    explicit TimeCost(double e      = 1e-4,
+                      double w_vz   = 0.5,
+                      double vz_ref = VZ_REF)
+        : eps_   (static_cast<Scalar>(e)),
+          w_vz_  (static_cast<Scalar>(w_vz)),
+          vz_ref_(static_cast<Scalar>(vz_ref)) {}
 
     Scalar q(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         Scalar dvz = x(5) - vz_ref_;
         return u(IDX_THETA)
-             + eps_*(x.segment(3,3).squaredNorm()+x.segment(10,3).squaredNorm())
-             + w_vz_*dvz*dvz
-             + w_u_ *u.head(4).squaredNorm()
-             + w_xy_*(x(0)*x(0) + x(1)*x(1));
+             + eps_*(x.segment(3,3).squaredNorm() + x.segment(10,3).squaredNorm())
+             + w_vz_*dvz*dvz;
     }
     Vector<Scalar> qx(const Vector<Scalar>& x, const Vector<Scalar>&) const override {
-        Vector<Scalar> g=Vector<Scalar>::Zero(NX_SS);
-        g(0)  = Scalar(2)*w_xy_*x(0);
-        g(1)  = Scalar(2)*w_xy_*x(1);
-        g.segment(3,3) = Scalar(2)*eps_*x.segment(3,3);
-        g(5) += Scalar(2)*w_vz_*(x(5) - vz_ref_);
+        Vector<Scalar> g = Vector<Scalar>::Zero(NX_SS);
+        g.segment(3,3)  = Scalar(2)*eps_*x.segment(3,3);
+        g(5)           += Scalar(2)*w_vz_*(x(5) - vz_ref_);
         g.segment(10,3) = Scalar(2)*eps_*x.segment(10,3);
         return g;
     }
-    Vector<Scalar> qu(const Vector<Scalar>&, const Vector<Scalar>& u) const override {
-        Vector<Scalar> g=Vector<Scalar>::Zero(NU_SS);
+    Vector<Scalar> qu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
+        Vector<Scalar> g = Vector<Scalar>::Zero(NU_SS);
         g(IDX_THETA) = Scalar(1);
-        g.head(4) += Scalar(2)*w_u_*u.head(4);
         return g;
     }
     Matrix<Scalar> qxx(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        Matrix<Scalar> H=Matrix<Scalar>::Zero(NX_SS,NX_SS);
-        H(0,0)  = Scalar(2)*w_xy_;
-        H(1,1)  = Scalar(2)*w_xy_;
-        for(int i=3;i<6;++i) H(i,i)=Scalar(2)*eps_;
-        for(int i=10;i<13;++i) H(i,i)=Scalar(2)*eps_;
+        Matrix<Scalar> H = Matrix<Scalar>::Zero(NX_SS, NX_SS);
+        for(int i=3;  i<6;  ++i) H(i,i) = Scalar(2)*eps_;
+        for(int i=10; i<13; ++i) H(i,i) = Scalar(2)*eps_;
         H(5,5) += Scalar(2)*w_vz_;
         return H;
     }
     Matrix<Scalar> quu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        Matrix<Scalar> H=Matrix<Scalar>::Zero(NU_SS,NU_SS);
-        for(int i=0;i<4;++i) H(i,i)=Scalar(2)*w_u_;
-        return H;
+        return Matrix<Scalar>::Zero(NU_SS, NU_SS);
     }
     Matrix<Scalar> qxu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        return Matrix<Scalar>::Zero(NX_SS,NU_SS);
+        return Matrix<Scalar>::Zero(NX_SS, NU_SS);
     }
 };
 
 // ── RelTermCost ───────────────────────────────────────────────────────────────
+// Soft terminal costs on quantities NOT covered by the hard equality
+// RelInterceptCon (which handles p_rel=0 and vxy_rel=0).
+//   • wz   — soft pull on rz² (redundant with hard constraint, but cheap insurance)
+//   • wvz  — steer vz toward vz_ref at touchdown
+//   • watt — upright at touchdown (qx,qy → 0)
+//   • wom  — not spinning at touchdown
 template<typename Scalar>
 class RelTermCost : public TerminalCostBase<Scalar> {
-    double wz_, wvz_, wvxy_, watt_, wom_, vz_ref_;
+    double wz_, wvz_, watt_, wom_, vz_ref_;
 public:
-    /// wvxy: soft penalty on vxy_rel at touchdown — replaces the old hard
-    ///   vxy_rel=0 equality. High enough to discourage large lateral impact
-    ///   velocity, but soft enough that the solver can trade it off against
-    ///   a more direct approach rather than being forced to orbit-match first.
-    explicit RelTermCost(double wz  = 1000.0,
-                         double wvz = 2000.0,
-                         double wvxy = 500.0,   // NEW — was implicitly ∞ (hard)
-                         double watt = 200.0,
-                         double wom  = 100.0,
+    explicit RelTermCost(double wz    = 1000.0,
+                         double wvz   = 2000.0,
+                         double watt  = 200.0,
+                         double wom   = 100.0,
                          double vz_ref = VZ_REF)
-        : wz_(wz), wvz_(wvz), wvxy_(wvxy), watt_(watt), wom_(wom), vz_ref_(vz_ref) {}
+        : wz_(wz), wvz_(wvz), watt_(watt), wom_(wom), vz_ref_(vz_ref) {}
 
     Scalar p(const Vector<Scalar>& x) const override {
         Scalar ez   = x(2)*x(2);
         Scalar evz  = (x(5) - Scalar(vz_ref_)) * (x(5) - Scalar(vz_ref_));
-        Scalar evxy = x(3)*x(3) + x(4)*x(4);   // vxy_rel soft penalty (NEW)
         Scalar eatt = x(7)*x(7) + x(8)*x(8);
         Scalar eom  = x.template segment<3>(10).squaredNorm();
-        return Scalar(wz_)*ez + Scalar(wvz_)*evz + Scalar(wvxy_)*evxy
-             + Scalar(watt_)*eatt + Scalar(wom_)*eom;
+        return Scalar(wz_)*ez + Scalar(wvz_)*evz + Scalar(watt_)*eatt + Scalar(wom_)*eom;
     }
     Vector<Scalar> px(const Vector<Scalar>& x) const override {
         Vector<Scalar> g = Vector<Scalar>::Zero(x.size());
-        g(2) = Scalar(2*wz_)  * x(2);
-        g(3) = Scalar(2*wvxy_)* x(3);   // NEW
-        g(4) = Scalar(2*wvxy_)* x(4);   // NEW
+        g(2) = Scalar(2*wz_) * x(2);
         g(5) = Scalar(2*wvz_) * (x(5) - Scalar(vz_ref_));
-        g(7) = Scalar(2*watt_)* x(7);
-        g(8) = Scalar(2*watt_)* x(8);
+        g(7) = Scalar(2*watt_) * x(7);
+        g(8) = Scalar(2*watt_) * x(8);
         g.segment(10,3) = Scalar(2*wom_) * x.segment(10,3);
         return g;
     }
     Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
         Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
-        H(2,2)  = Scalar(2*wz_);
-        H(3,3)  = Scalar(2*wvxy_);  // NEW
-        H(4,4)  = Scalar(2*wvxy_);  // NEW
-        H(5,5)  = Scalar(2*wvz_);
-        H(7,7)  = Scalar(2*watt_);
-        H(8,8)  = Scalar(2*watt_);
+        H(2,2)   = Scalar(2*wz_);
+        H(5,5)   = Scalar(2*wvz_);
+        H(7,7)   = Scalar(2*watt_);
+        H(8,8)   = Scalar(2*watt_);
         H(10,10) = H(11,11) = H(12,12) = Scalar(2*wom_);
         return H;
     }
 };
 
 // ── RelInterceptCon ───────────────────────────────────────────────────────────
-/// 4-dim hard equality: p_rel = 0  (3)  +  vz_rel = vz_land  (1).
-///
-/// vxy_rel = 0 has been intentionally removed from the hard constraint.
-/// Forcing it here compelled the solver to first match the target's circular
-/// orbit velocity (the "orbit-then-drop" artifact). Moving it into RelTermCost
-/// as a soft penalty lets the solver find a diagonal diving approach instead.
+// 5-dim hard equality (matches original cpp): p_rel=0 (3) + vxy_rel=0 (2).
+//
+// vxy_rel=0 in the RELATIVE frame means the drone arrives co-moving with the
+// target in XY — exactly what you want for a landing. It does NOT force the
+// drone to orbit. vz is left to RelTermCost (soft) so the solver can arrive
+// with a controlled non-zero sink rate rather than a forced dead stop.
 template<typename Scalar>
 class RelInterceptCon : public TerminalConstraintBase<Scalar> {
-    Scalar vz_land_;
 public:
-    explicit RelInterceptCon(double vz_land = VZ_REF) : vz_land_(vz_land) {
+    RelInterceptCon() {
         this->constraint_type = ConstraintType::EQ;
-        this->dim_cT = 4;   // p_rel(3) + vz_rel(1) — vxy dropped to soft cost
+        this->dim_cT = 5;
     }
     Vector<Scalar> cT(const Vector<Scalar>& x) const override {
-        Vector<Scalar> c(4);
-        c(0) = x(0); c(1) = x(1); c(2) = x(2);  // p_rel = 0
-        c(3) = x(5) - vz_land_;                   // vz_rel = vz_land
+        Vector<Scalar> c(5);
+        c(0) = x(0); c(1) = x(1); c(2) = x(2);  // p_rel → 0
+        c(3) = x(3); c(4) = x(4);                 // vxy_rel → 0
         return c;
     }
     Matrix<Scalar> cTx(const Vector<Scalar>&) const override {
-        Matrix<Scalar> J = Matrix<Scalar>::Zero(4, NX_SS);
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(5, NX_SS);
         J(0,0)=Scalar(1); J(1,1)=Scalar(1); J(2,2)=Scalar(1);
-        J(3,5)=Scalar(1); // dc/dvz_rel
+        J(3,3)=Scalar(1); J(4,4)=Scalar(1);
         return J;
     }
 };
@@ -424,11 +391,18 @@ public:
 };
 
 // ── Solver params ─────────────────────────────────────────────────────────────
+// rhoT raised to 500: with N=80 stages the accumulated stage cost is ~80x a
+// single stage. rhoT=100 was too weak to dominate the terminal constraint
+// against that accumulated cost — the solver reported KKT convergence while
+// the terminal violation was still meters off.
 inline Param getSolverParams() {
     Param p;
     p.reg1_min = 1e-2; p.reg2_min = 0.5; p.mu_mul = 0.1;
-    p.rho = 5.0; p.rhoT = 50.0; p.rho_mul = 5.0;
-    p.tolerance = 1e-3; p.max_iter = 1000;
+    p.rho      = 15.0;
+    p.rhoT     = 500.0;  // was 100 — raised to enforce terminal constraint
+    p.rho_mul  = 8.0;
+    p.tolerance = 2e-3;
+    p.max_iter  = 1000;
     p.is_quaternion_in_state = false;
     return p;
 }
@@ -451,19 +425,17 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     dyn->setJb(J_B);
     dyn->setTargetAccel(buf.getAccel(t0_abs));
 
-    // w_vz=0.1 (loose guide), vz_ref=-0.5 (aggressive stage descent),
-    // w_u=thrust reg, w_xy=soft overhead. w_z removed — fights the glideslope.
-    auto cost  = std::make_shared<TimeCost<double>>(1e-4, 0.1, -0.5, 0.01, 0.2);
-    // wvxy=500: soft vxy_rel penalty — replaces the old hard vxy_rel=0 equality
-    auto tcost = std::make_shared<RelTermCost<double>>(1000.0, 2000.0, 500.0, 200.0, 100.0, VZ_REF);
+    auto cost  = std::make_shared<TimeCost<double>>(1e-4, 0.5, VZ_REF);
+    auto tcost = std::make_shared<RelTermCost<double>>(1000.0, 2000.0, 200.0, 100.0, VZ_REF);
+
     auto cfmin = std::make_shared<FminCon<double>>();
     auto cfmax = std::make_shared<FmaxCon<double>>();
     auto cmom  = std::make_shared<MomentCon<double>>();
     auto cth   = std::make_shared<ThetaBounds<double>>(th_min, th_max);
     auto czfl  = std::make_shared<ZFloorCon<double>>();
-    auto cvz   = std::make_shared<VzMinCon<double>>(-4.0);
+    auto cvz   = std::make_shared<VzMinCon<double>>(-VZ_LAND_MAX);
     auto cgs   = std::make_shared<GlideslopeCon_rel<double>>();
-    auto cterm = std::make_shared<RelInterceptCon<double>>(VZ_REF);
+    auto cterm = std::make_shared<RelInterceptCon<double>>();
 
     for(int k=0; k<N; ++k) {
         problem->setStageDynamics(k, dyn);
@@ -479,8 +451,9 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     problem->setTerminalCost(tcost);
     problem->addTerminalConstraint(cterm);
 
+    // ── Initial relative state ────────────────────────────────────────────────
     Eigen::VectorXd x0_rel(NX);
-    x0_rel.head(3) = x0_abs.head(3) - circ.pos(t0_abs);
+    x0_rel.head(3)      = x0_abs.head(3)      - circ.pos(t0_abs);
     x0_rel.segment(3,3) = x0_abs.segment(3,3) - circ.vel(t0_abs);
     x0_rel.segment(6,7) = x0_abs.segment(6,7);
 
@@ -489,30 +462,49 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     x0ss(IDX_DT) = 0.0;
     problem->setInitialState(0, x0ss);
 
-    Eigen::VectorXd sim14(NX_SS);
-    sim14.segment(0,NX) = x0_rel;
-    sim14(IDX_DT) = 0.0;
+    // ── Warm-start: pure geometric straight-line ──────────────────────────────
+    //
+    // This is a single-shot solve — there is no receding horizon, so the
+    // warm-start only exists to put DDP in the basin of a good local minimum.
+    //
+    // States are set directly to the geometric straight line from p0_rel to the
+    // origin — no dynamic propagation. This guarantees:
+    //   • Every state is exactly on the straight line (cone-feasible by convexity)
+    //   • X[N].head(5) = 0 exactly — terminal constraint starts at zero violation
+    //   • Works for any p0_rel inside the cone, no dependence on a specific start
+    //
+    // Controls are set to hover thrust — just enough to keep the solver from
+    // starting with wildly infeasible inputs. DDP will move them immediately.
+
+    const double T_total = N * th_init;
+    const Eigen::Vector3d p0_rel_ws = x0_rel.head(3);
+    const Eigen::Vector3d v_desired = -p0_rel_ws / T_total;  // constant velocity to arrive at origin
 
     for(int k=0; k<N; ++k) {
-        Eigen::VectorXd u0(NU_SS); u0.setZero();
-        Eigen::Vector3d p0 = sim14.head(3);
-        Eigen::Vector3d v0 = sim14.segment(3,3);
-        double T_rem = (N - k) * th_init;
-        if(T_rem < th_init) T_rem = th_init;
-        Eigen::Vector3d a_req = 2.0*(-p0 - v0*T_rem) / (T_rem*T_rem);
-        a_req.z() = std::max(a_req.z(), (-VZ_LAND_MAX - v0.z()) / T_rem);
-        Eigen::Vector3d fw = MASS*(a_req - GRAVITY);
-        double fz = std::max((double)FMIN, std::min((double)FMAX, fw.norm()));
-        u0(0) = fz;
+        // State: interpolate straight line
+        double frac = static_cast<double>(N - k) / N;
+        Eigen::VectorXd xk(NX_SS);
+        xk.setZero();
+        xk.head(3)      = p0_rel_ws * frac;
+        xk.segment(3,3) = v_desired;
+        xk(6)           = 1.0;           // quaternion w=1, identity rotation
+        xk(IDX_DT)      = k * th_init;
+        problem->setInitialState(k, xk);
+
+        // Control: hover thrust, nominal timestep
+        Eigen::VectorXd u0(NU_SS);
+        u0.setZero();
+        u0(0)         = MASS * 9.81;
         u0(IDX_THETA) = th_init;
-
         problem->setInitialControl(k, u0);
-
-        Eigen::VectorXd sim14_next = dyn->propagate14(sim14, u0.head(NU), th_init);
-        sim14_next(2) = std::max(sim14_next(2), 0.0);
-        problem->setInitialState(k+1, sim14_next);
-        sim14 = sim14_next;
     }
+
+    // Terminal state: exactly at origin
+    Eigen::VectorXd xN(NX_SS);
+    xN.setZero();
+    xN(6)      = 1.0;
+    xN(IDX_DT) = N * th_init;
+    problem->setInitialState(N, xN);
 
     return problem;
 }
@@ -529,7 +521,7 @@ inline std::vector<Eigen::VectorXd> convertToAbsolute(
         double tabs = t0_abs + DT;
 
         Eigen::VectorXd x_abs(NX);
-        x_abs.head(3) = X_rel[k].head(3) + tgt.pos(tabs);
+        x_abs.head(3)      = X_rel[k].head(3)      + tgt.pos(tabs);
         x_abs.segment(3,3) = X_rel[k].segment(3,3) + tgt.vel(tabs);
         x_abs.segment(6,7) = X_rel[k].segment(6,7);
         X_abs[k] = x_abs;

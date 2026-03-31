@@ -89,7 +89,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
 {
     Result result;
     result.success = false;
-    auto t0 = chrono::high_resolution_clock::now();
+    auto t0 = chrono::steady_clock::now();
 
     try {
         target_accel_ = target_accel;
@@ -146,8 +146,9 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
         auto K_result = solver_->getResK();
 
         result.solve_time_ms = chrono::duration<double, milli>(
-            chrono::high_resolution_clock::now() - t0).count();
-        result.solve_timestamp = chrono::steady_clock::now();
+            chrono::steady_clock::now() - t0).count();
+        result.solve_timestamp = t0;
+        result.constraint_error = solver_->getError();
         result.solve_iters = static_cast<int>(solver_->getAllCost().size());
         result.extra_params = extra_params;
         last_solve_ms_ = result.solve_time_ms;

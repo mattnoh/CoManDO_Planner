@@ -9,3 +9,4 @@ The system is designed with a **Registry-based architecture**, allowing for easy
 2. [Planner Node Setup](02_planner_node_setup.md)
 3. [How the MPC Works](03_mpc.md)
 4. [Debugging Log – Full Timeline](04_debugging_log.md)
+5. [Relative Dynamics & Intercept Math](05_mathematical_tutorial.md)

@@ -8,6 +8,8 @@
 
 The system is built on a modular, **Registry-Driven Architecture**. This decouples the core solver logic from specific Optimal Control Problem (OCP) formulations.
 
+For a deep dive into the math, see the **[Relative Dynamics & Intercept Tutorial](docs/CoManDO_planner/05_mathematical_tutorial.md)**.
+
 - **`planner_node`**: A generic ROS2 node that handles state estimation, solver execution, and command dispatch. It is entirely agnostic of the OCP type being solved.
 - **`OCPRegistry`**: A central factory where OCP descriptors are registered. Each descriptor provides the necessary callbacks for state transformation, parameter preparation, and logging.
 - **Target Models**: Standardized models for circular and arbitrary target trajectories located in `include/target/`.

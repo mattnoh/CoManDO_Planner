@@ -60,7 +60,6 @@ public:
             ocp_dt_ = runtime_cfg.ocp_dt;
             setTerminalTarget(hover_target_);
             rebuildMpcSolver();
-            replay_ticks_since_solve_.store(n_replay_);
             is_configured_ = true;
         } else {
             ocp_dt_ = 0.0;
@@ -194,7 +193,6 @@ private:
 
     void resetForNewCommand() {
         trajectory_replayer_.clear();
-        replay_ticks_since_solve_.store(n_replay_);
         is_primed_.store(false);
         terminal_freeze_.store(false);
         stale_warning_count_ = 0;
@@ -382,10 +380,6 @@ private:
             return;
         }
 
-        if (replay_ticks_since_solve_.load() < n_replay_) {
-            return;
-        }
-
         Eigen::VectorXd x0_abs = getCurrentState();
         TargetSnapshot target_snapshot = getTargetSnapshot();
 
@@ -442,12 +436,23 @@ private:
             desc.post_process_result(result, target_snapshot);
         }
 
+        // Trajectory Validation
+        bool valid = true;
         if (!result.success || result.state_trajectory.size() < 2) {
-            RCLCPP_WARN(this->get_logger(), "Solve FAILED - holding");
-            Eigen::VectorXd x_hold = x0_abs;
-            x_hold.segment(3, 3).setZero();
-            x_hold.segment(10, 3).setZero();
-            publishCommand(x_hold, Eigen::VectorXd::Zero(4));
+            RCLCPP_WARN(this->get_logger(), "Solve FAILED — keeping previous trajectory locally");
+            valid = false;
+        } else if (result.constraint_error > max_constraint_error_) {
+            RCLCPP_WARN(this->get_logger(), "Solve constraint error (%.3f) > threshold (%.3f) — keeping previous trajectory",
+                        result.constraint_error, max_constraint_error_);
+            valid = false;
+        } else if (!validateTrajectory(result.state_trajectory, result.control_trajectory)) {
+            RCLCPP_WARN(this->get_logger(), "Solve physical bounds violated — keeping previous trajectory");
+            valid = false;
+        }
+
+        if (!valid) {
+            // Do NOT publish hover hold here! The replayer keeps playing the old trajectory.
+            // The solver will immediately retry on the next 1ms tick.
             return;
         }
 
@@ -467,7 +472,6 @@ private:
             result.solve_timestamp,
             ocp_dt_);
 
-        replay_ticks_since_solve_.store(0);
         is_primed_.store(true);
 
         publishTrajectory(result.state_trajectory);
@@ -508,7 +512,6 @@ private:
 
         auto replay = trajectory_replayer_.sample(Clock::now(), ocp_dt_);
         if (!replay.has_plan) {
-            replay_ticks_since_solve_.fetch_add(1);
             return;
         }
 
@@ -551,7 +554,6 @@ private:
             }
         }
 
-        replay_ticks_since_solve_.fetch_add(1);
         publishCommand(x_cmd, u_cmd);
 
         if (logging_enabled_ && logging_initialized_) {
@@ -559,6 +561,34 @@ private:
             logger_.logActualState(act, active_solve_num);
             logger_.logCommandedState(x_cmd, u_cmd, active_solve_num);
         }
+    }
+
+    bool validateTrajectory(const std::vector<Eigen::VectorXd>& X, const std::vector<Eigen::VectorXd>& U) {
+        if (X.size() < 2) return false;
+        
+        // Physical bounds checking
+        for (size_t k = 0; k < X.size(); ++k) {
+            if (X[k].size() < 13) continue;
+            // Altitude check (reject negative altitude)
+            if (X[k](2) < -0.05) return false;
+            
+            // Velocity check (reject > 20 m/s)
+            if (X[k].segment(3, 3).norm() > 20.0) return false;
+            
+            // Angular rate check (reject > 50 rad/s)
+            if (X[k].segment(10, 3).norm() > 50.0) return false;
+        }
+        
+        if (!U.empty()) {
+            for (size_t k = 0; k < U.size(); ++k) {
+                // Thrust bounds (FMAX is ~0.6-0.7 for crazyflie, let's say max 10.0 to be safe across platforms)
+                if (U[k].size() > 0 && (U[k](0) < -0.1 || U[k](0) > 20.0)) {
+                    return false;
+                }
+            }
+        }
+        
+        return true;
     }
 
     SolverResult callSolver(const Eigen::VectorXd& state,
@@ -582,6 +612,7 @@ private:
             result.state_trajectory = r.state_trajectory;
             result.control_trajectory = r.control_trajectory;
             result.solve_time_ms = r.solve_time_ms;
+            result.constraint_error = r.constraint_error;
             result.solve_iters = r.solve_iters;
             result.solve_timestamp = r.solve_timestamp;
             result.extra = r.extra_params;
@@ -751,6 +782,7 @@ private:
     PlannerRuntimeConfig runtime_cfg_;
     double mass_kg_ = 0.027;
     int n_replay_ = 4;
+    double max_constraint_error_ = 1.0;
 
     Eigen::Vector3d hover_target_ = Eigen::Vector3d::Zero();
     Eigen::VectorXd terminal_state_ = Eigen::VectorXd::Zero(13);
@@ -769,7 +801,6 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
 
     TrajectoryReplayer trajectory_replayer_;
-    std::atomic<int> replay_ticks_since_solve_{0};
 
     StateMonitor state_monitor_;
 
