@@ -155,40 +155,65 @@ public:
 };
 
 // ── TimeCost ──────────────────────────────────────────────────────────────────
+/// w_z has been intentionally removed — it was antagonistic with GlideslopeCon_rel.
+/// The glideslope enforces |xy_rel| ≤ tan_gs·z, so forcing z→0 via w_z before
+/// XY offset is small enough causes the solver to hit the cone, level off, and
+/// orbit-match to reduce XY. Instead, descent is guided purely by vz_stage_ref
+/// (more aggressive than the terminal VZ_REF) with a loose w_vz weight.
+///
+/// w_u keeps quu positive-definite (well-conditioned DDP backward pass).
+/// w_xy softly penalises lateral offset, complementing the hard glideslope cone.
 template<typename Scalar>
 class TimeCost : public StageCostBase<Scalar> {
-    Scalar eps_, w_vz_, vz_ref_;
+    Scalar eps_, w_vz_, vz_ref_, w_u_, w_xy_;
 public:
-    explicit TimeCost(double e=1e-4, double w_vz=0.5, double vz_ref=VZ_REF)
+    explicit TimeCost(double e           = 1e-4,
+                      double w_vz        = 0.1,    // loose — just a guide
+                      double vz_ref      = -0.5,   // more aggressive than terminal
+                      double w_u         = 0.01,
+                      double w_xy        = 0.2)
         : eps_(static_cast<Scalar>(e)),
           w_vz_(static_cast<Scalar>(w_vz)),
-          vz_ref_(static_cast<Scalar>(vz_ref)) {}
+          vz_ref_(static_cast<Scalar>(vz_ref)),
+          w_u_(static_cast<Scalar>(w_u)),
+          w_xy_(static_cast<Scalar>(w_xy)) {}
 
     Scalar q(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
         Scalar dvz = x(5) - vz_ref_;
         return u(IDX_THETA)
              + eps_*(x.segment(3,3).squaredNorm()+x.segment(10,3).squaredNorm())
-             + w_vz_*dvz*dvz;
+             + w_vz_*dvz*dvz
+             + w_u_ *u.head(4).squaredNorm()
+             + w_xy_*(x(0)*x(0) + x(1)*x(1));
     }
     Vector<Scalar> qx(const Vector<Scalar>& x, const Vector<Scalar>&) const override {
         Vector<Scalar> g=Vector<Scalar>::Zero(NX_SS);
+        g(0)  = Scalar(2)*w_xy_*x(0);
+        g(1)  = Scalar(2)*w_xy_*x(1);
         g.segment(3,3) = Scalar(2)*eps_*x.segment(3,3);
-        g.segment(10,3) = Scalar(2)*eps_*x.segment(10,3);
         g(5) += Scalar(2)*w_vz_*(x(5) - vz_ref_);
+        g.segment(10,3) = Scalar(2)*eps_*x.segment(10,3);
         return g;
     }
-    Vector<Scalar> qu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        Vector<Scalar> g=Vector<Scalar>::Zero(NU_SS); g(IDX_THETA)=Scalar(1); return g;
+    Vector<Scalar> qu(const Vector<Scalar>&, const Vector<Scalar>& u) const override {
+        Vector<Scalar> g=Vector<Scalar>::Zero(NU_SS);
+        g(IDX_THETA) = Scalar(1);
+        g.head(4) += Scalar(2)*w_u_*u.head(4);
+        return g;
     }
     Matrix<Scalar> qxx(const Vector<Scalar>&, const Vector<Scalar>&) const override {
         Matrix<Scalar> H=Matrix<Scalar>::Zero(NX_SS,NX_SS);
+        H(0,0)  = Scalar(2)*w_xy_;
+        H(1,1)  = Scalar(2)*w_xy_;
         for(int i=3;i<6;++i) H(i,i)=Scalar(2)*eps_;
         for(int i=10;i<13;++i) H(i,i)=Scalar(2)*eps_;
         H(5,5) += Scalar(2)*w_vz_;
         return H;
     }
     Matrix<Scalar> quu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        return Matrix<Scalar>::Zero(NU_SS,NU_SS);
+        Matrix<Scalar> H=Matrix<Scalar>::Zero(NU_SS,NU_SS);
+        for(int i=0;i<4;++i) H(i,i)=Scalar(2)*w_u_;
+        return H;
     }
     Matrix<Scalar> qxu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
         return Matrix<Scalar>::Zero(NX_SS,NU_SS);
@@ -198,57 +223,78 @@ public:
 // ── RelTermCost ───────────────────────────────────────────────────────────────
 template<typename Scalar>
 class RelTermCost : public TerminalCostBase<Scalar> {
-    double wz_, wvz_, watt_, wom_, vz_ref_;
+    double wz_, wvz_, wvxy_, watt_, wom_, vz_ref_;
 public:
-    explicit RelTermCost(double wz=1000.0, double wvz=2000.0,
-                         double watt=200.0, double wom=100.0, double vz_ref=VZ_REF)
-        : wz_(wz), wvz_(wvz), watt_(watt), wom_(wom), vz_ref_(vz_ref) {}
+    /// wvxy: soft penalty on vxy_rel at touchdown — replaces the old hard
+    ///   vxy_rel=0 equality. High enough to discourage large lateral impact
+    ///   velocity, but soft enough that the solver can trade it off against
+    ///   a more direct approach rather than being forced to orbit-match first.
+    explicit RelTermCost(double wz  = 1000.0,
+                         double wvz = 2000.0,
+                         double wvxy = 500.0,   // NEW — was implicitly ∞ (hard)
+                         double watt = 200.0,
+                         double wom  = 100.0,
+                         double vz_ref = VZ_REF)
+        : wz_(wz), wvz_(wvz), wvxy_(wvxy), watt_(watt), wom_(wom), vz_ref_(vz_ref) {}
 
     Scalar p(const Vector<Scalar>& x) const override {
-        Scalar ez = x(2)*x(2);
-        Scalar evz = (x(5) - Scalar(vz_ref_)) * (x(5) - Scalar(vz_ref_));
+        Scalar ez   = x(2)*x(2);
+        Scalar evz  = (x(5) - Scalar(vz_ref_)) * (x(5) - Scalar(vz_ref_));
+        Scalar evxy = x(3)*x(3) + x(4)*x(4);   // vxy_rel soft penalty (NEW)
         Scalar eatt = x(7)*x(7) + x(8)*x(8);
-        Scalar eom = x.template segment<3>(10).squaredNorm();
-        return Scalar(wz_)*ez + Scalar(wvz_)*evz + Scalar(watt_)*eatt + Scalar(wom_)*eom;
+        Scalar eom  = x.template segment<3>(10).squaredNorm();
+        return Scalar(wz_)*ez + Scalar(wvz_)*evz + Scalar(wvxy_)*evxy
+             + Scalar(watt_)*eatt + Scalar(wom_)*eom;
     }
     Vector<Scalar> px(const Vector<Scalar>& x) const override {
         Vector<Scalar> g = Vector<Scalar>::Zero(x.size());
-        g(2) = Scalar(2*wz_) * x(2);
+        g(2) = Scalar(2*wz_)  * x(2);
+        g(3) = Scalar(2*wvxy_)* x(3);   // NEW
+        g(4) = Scalar(2*wvxy_)* x(4);   // NEW
         g(5) = Scalar(2*wvz_) * (x(5) - Scalar(vz_ref_));
-        g(7) = Scalar(2*watt_) * x(7);
-        g(8) = Scalar(2*watt_) * x(8);
+        g(7) = Scalar(2*watt_)* x(7);
+        g(8) = Scalar(2*watt_)* x(8);
         g.segment(10,3) = Scalar(2*wom_) * x.segment(10,3);
         return g;
     }
     Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
         Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
-        H(2,2) = Scalar(2*wz_);
-        H(5,5) = Scalar(2*wvz_);
-        H(7,7) = Scalar(2*watt_);
-        H(8,8) = Scalar(2*watt_);
+        H(2,2)  = Scalar(2*wz_);
+        H(3,3)  = Scalar(2*wvxy_);  // NEW
+        H(4,4)  = Scalar(2*wvxy_);  // NEW
+        H(5,5)  = Scalar(2*wvz_);
+        H(7,7)  = Scalar(2*watt_);
+        H(8,8)  = Scalar(2*watt_);
         H(10,10) = H(11,11) = H(12,12) = Scalar(2*wom_);
         return H;
     }
 };
 
 // ── RelInterceptCon ───────────────────────────────────────────────────────────
+/// 4-dim hard equality: p_rel = 0  (3)  +  vz_rel = vz_land  (1).
+///
+/// vxy_rel = 0 has been intentionally removed from the hard constraint.
+/// Forcing it here compelled the solver to first match the target's circular
+/// orbit velocity (the "orbit-then-drop" artifact). Moving it into RelTermCost
+/// as a soft penalty lets the solver find a diagonal diving approach instead.
 template<typename Scalar>
 class RelInterceptCon : public TerminalConstraintBase<Scalar> {
+    Scalar vz_land_;
 public:
-    RelInterceptCon() {
+    explicit RelInterceptCon(double vz_land = VZ_REF) : vz_land_(vz_land) {
         this->constraint_type = ConstraintType::EQ;
-        this->dim_cT = 5;
+        this->dim_cT = 4;   // p_rel(3) + vz_rel(1) — vxy dropped to soft cost
     }
     Vector<Scalar> cT(const Vector<Scalar>& x) const override {
-        Vector<Scalar> c(5);
-        c(0) = x(0); c(1) = x(1); c(2) = x(2);
-        c(3) = x(3); c(4) = x(4);
+        Vector<Scalar> c(4);
+        c(0) = x(0); c(1) = x(1); c(2) = x(2);  // p_rel = 0
+        c(3) = x(5) - vz_land_;                   // vz_rel = vz_land
         return c;
     }
     Matrix<Scalar> cTx(const Vector<Scalar>&) const override {
-        Matrix<Scalar> J = Matrix<Scalar>::Zero(5, NX_SS);
+        Matrix<Scalar> J = Matrix<Scalar>::Zero(4, NX_SS);
         J(0,0)=Scalar(1); J(1,1)=Scalar(1); J(2,2)=Scalar(1);
-        J(3,3)=Scalar(1); J(4,4)=Scalar(1);
+        J(3,5)=Scalar(1); // dc/dvz_rel
         return J;
     }
 };
@@ -405,16 +451,19 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     dyn->setJb(J_B);
     dyn->setTargetAccel(buf.getAccel(t0_abs));
 
-    auto cost = std::make_shared<TimeCost<double>>(1e-4, 0.5, VZ_REF);
-    auto tcost = std::make_shared<RelTermCost<double>>(1000.0, 2000.0, 200.0, 100.0, VZ_REF);
+    // w_vz=0.1 (loose guide), vz_ref=-0.5 (aggressive stage descent),
+    // w_u=thrust reg, w_xy=soft overhead. w_z removed — fights the glideslope.
+    auto cost  = std::make_shared<TimeCost<double>>(1e-4, 0.1, -0.5, 0.01, 0.2);
+    // wvxy=500: soft vxy_rel penalty — replaces the old hard vxy_rel=0 equality
+    auto tcost = std::make_shared<RelTermCost<double>>(1000.0, 2000.0, 500.0, 200.0, 100.0, VZ_REF);
     auto cfmin = std::make_shared<FminCon<double>>();
     auto cfmax = std::make_shared<FmaxCon<double>>();
-    auto cmom = std::make_shared<MomentCon<double>>();
-    auto cth = std::make_shared<ThetaBounds<double>>(th_min, th_max);
-    auto czfl = std::make_shared<ZFloorCon<double>>();
-    auto cvz = std::make_shared<VzMinCon<double>>(-VZ_LAND_MAX);
-    auto cgs = std::make_shared<GlideslopeCon_rel<double>>();
-    auto cterm = std::make_shared<RelInterceptCon<double>>();
+    auto cmom  = std::make_shared<MomentCon<double>>();
+    auto cth   = std::make_shared<ThetaBounds<double>>(th_min, th_max);
+    auto czfl  = std::make_shared<ZFloorCon<double>>();
+    auto cvz   = std::make_shared<VzMinCon<double>>(-4.0);
+    auto cgs   = std::make_shared<GlideslopeCon_rel<double>>();
+    auto cterm = std::make_shared<RelInterceptCon<double>>(VZ_REF);
 
     for(int k=0; k<N; ++k) {
         problem->setStageDynamics(k, dyn);
