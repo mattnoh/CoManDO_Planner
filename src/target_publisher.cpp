@@ -44,7 +44,7 @@ public:
         center_y_   = declare_parameter<double>("center_y",   0.0);
         center_z_   = declare_parameter<double>("center_z",   0.2);
         radius_     = declare_parameter<double>("radius",     1.0);
-        omega_      = declare_parameter<double>("omega",      0.1);
+        omega_      = declare_parameter<double>("omega",      0.4);
         phi0_       = declare_parameter<double>("phi0",       0.0);
         publish_hz_ = declare_parameter<double>("publish_hz", 100.0);
         frame_id_   = declare_parameter<std::string>("frame_id", "world");

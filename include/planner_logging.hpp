@@ -135,6 +135,13 @@ public:
                     meta.circle_radius * meta.circle_omega * std::cos(phi),
                     0.0
                 );
+            } else if (meta.is_relative_plan) {
+                // Propagate target using constant-acceleration assumption matching Quad6DOFVarTimeRelative
+                tgt_p = meta.target_snapshot_pos + 
+                        meta.target_snapshot_vel * t_node + 
+                        0.5 * meta.target_snapshot_acc * t_node * t_node;
+                tgt_v = meta.target_snapshot_vel + 
+                        meta.target_snapshot_acc * t_node;
             }
 
             Eigen::VectorXd x_abs = Eigen::VectorXd::Zero(13);

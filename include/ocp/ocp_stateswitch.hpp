@@ -49,7 +49,7 @@ static const Eigen::Vector3d GRAVITY(0.0, 0.0, -9.81);
 // ── Glideslope parameters ─────────────────────────────────────────────────────
 static constexpr double GS_DEG = 60.0;
 static const double GS_TAN = std::tan(GS_DEG * M_PI / 180.0);
-static constexpr double VZ_LAND_MAX = 2.5;
+static constexpr double VZ_LAND_MAX = 1.5;
 
 // ── Solver parameters ─────────────────────────────────────────────────────────
 const double SOLVER_REG1_MIN = 1e-2;

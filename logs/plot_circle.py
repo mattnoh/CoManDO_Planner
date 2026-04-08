@@ -161,20 +161,25 @@ def compute_commanded_states(actual_df, solves_df):
     """
     state_cols = ["x", "y", "z", "vx", "vy", "vz",
                   "qw", "qx", "qy", "qz", "wx", "wy", "wz",
-                  "fz", "mx", "my", "mz", "theta"]
+                  "fz", "mx", "my", "mz", "theta",
+                  "tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz"]
 
     # all_solves.csv uses abs_ and rel_ prefixes for state, but not for controls
     _abs = {"x": "abs_x", "y": "abs_y", "z": "abs_z",
             "vx": "abs_vx", "vy": "abs_vy", "vz": "abs_vz",
             "qw": "abs_qw", "qx": "abs_qx", "qy": "abs_qy", "qz": "abs_qz",
             "wx": "abs_wx", "wy": "abs_wy", "wz": "abs_wz",
-            "fz": "fz", "mx": "mx", "my": "my", "mz": "mz", "theta": "theta"}
+            "fz": "fz", "mx": "mx", "my": "my", "mz": "mz", "theta": "theta",
+            "tgt_x": "tgt_x", "tgt_y": "tgt_y", "tgt_z": "tgt_z",
+            "tgt_vx": "tgt_vx", "tgt_vy": "tgt_vy", "tgt_vz": "tgt_vz"}
     
     _rel = {"x": "rel_x", "y": "rel_y", "z": "rel_z",
             "vx": "rel_vx", "vy": "rel_vy", "vz": "rel_vz",
             "qw": "rel_qw", "qx": "rel_qx", "qy": "rel_qy", "qz": "rel_qz",
             "wx": "rel_wx", "wy": "rel_wy", "wz": "rel_wz",
-            "fz": "fz", "mx": "mx", "my": "my", "mz": "mz", "theta": "theta"}
+            "fz": "fz", "mx": "mx", "my": "my", "mz": "mz", "theta": "theta",
+            "tgt_x": "tgt_x", "tgt_y": "tgt_y", "tgt_z": "tgt_z",
+            "tgt_vx": "tgt_vx", "tgt_vy": "tgt_vy", "tgt_vz": "tgt_vz"}
 
     # Build dict: solve_num → sorted DataFrame of nodes
     solve_groups = {int(sn): grp.sort_values("node").reset_index(drop=True)
@@ -228,22 +233,11 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
     time_actual = actual_df["timestamp"].values
     t_rel = time_actual - time_actual[0]
 
-    # --- Target circle parameters (for tracking_circle OCP) -------------------
-    meta = solves_df.iloc[0]
-    c_x = meta.get("circle_center_x", 0.0)
-    c_y = meta.get("circle_center_y", 0.0)
-    c_z = meta.get("circle_center_z", 1.0)
-    R = meta.get("circle_radius", 0.0)
-    omega = meta.get("circle_omega", 0.0)
-    phi0 = meta.get("circle_phi0", 0.0)
-    t_abs0 = meta.get("circle_t_abs", 0.0)
-
-    # Reconstruct target trajectory for actual simulation time
-    t_span = t_abs0 + t_rel
-    tgt_x = c_x + R * np.cos(omega * t_span + phi0)
-    tgt_y = c_y + R * np.sin(omega * t_span + phi0)
-    tgt_z = np.full_like(t_span, c_z)
-    tgt_pos = np.stack([tgt_x, tgt_y, tgt_z], axis=1)
+    # --- Target trajectory ----------------------------------------------------
+    # Extract target from the commanded node directly!
+    tgt_df = cmd_df_abs[["tgt_x", "tgt_y", "tgt_z"]]
+    tgt_df = tgt_df.fillna(method="bfill").fillna(method="ffill")
+    tgt_pos = tgt_df.values
 
     # Relative actual position
     rel_pos = dpos - tgt_pos
@@ -264,8 +258,17 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
     XY_LIM_ABS = max(float(np.abs(dpos[:, :2]).max()) * 1.2, float(np.abs(tgt_pos[:, :2]).max()) * 1.2, 1.5)
     Z_LIM_ABS  = max(float(dpos[:, 2].max()) * 1.2, 1.5)
     
+    R = float(solves_df.iloc[0].get("circle_radius", 0.0))
     XY_LIM_REL = max(float(np.abs(rel_pos[:, :2]).max()) * 1.2, R * 1.2 if R > 0 else 1.5)
     Z_LIM_REL  = max(float(rel_pos[:, 2].max()) * 1.2, 1.5)
+    
+    # We want z=0 in the relative frame plot to be the ground ONLY IF the user wants it,
+    # but in relative frame z=0 IS the target.
+    # The actual ground is at rz = -target_z.
+    # We will center the z-axis to show both ground and target.
+    avg_tgt_z = float(np.mean(tgt_pos[:, 2]))
+    max_rel_z = max(float(rel_pos[:, 2].max()) * 1.2, 1.5)
+    min_rel_z = min(float(rel_pos[:, 2].min()) * 1.2, -avg_tgt_z)
 
     # ── Cone geometry ─────────────────────────────────────────────────────────
     rim_r  = GS_TAN * CONE_H
@@ -292,29 +295,42 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
             ax.view_init(elev=ELEV_VIEW, azim=azim)
             ax.set_xlim(-lim_xy, lim_xy)
             ax.set_ylim(-lim_xy, lim_xy)
-            ax.set_zlim(0 if not is_rel else -lim_z, lim_z)
+            
+            if is_rel:
+                ax.set_zlim(min_rel_z, max_rel_z)
+            else:
+                ax.set_zlim(0, lim_z)
+                
             ax.set_box_aspect([2, 2, 1.5])
             ax.set_xlabel(xlbl, labelpad=6)
             ax.set_ylabel(ylbl, labelpad=6)
             ax.set_zlabel(zlbl, labelpad=6)
 
-            # Ground / Target Plane
+            # Ground Plane
             _gx = np.array([[-lim_xy, lim_xy], [-lim_xy, lim_xy]])
             _gy = np.array([[-lim_xy, -lim_xy], [lim_xy, lim_xy]])
-            ax.plot_surface(_gx, _gy, np.zeros_like(_gx),
-                            color=GROUND_COL if not is_rel else "#dcdcdc", 
+            ground_z = -avg_tgt_z if is_rel else 0.0
+            ax.plot_surface(_gx, _gy, np.full_like(_gx, ground_z),
+                            color=GROUND_COL, 
                             alpha=0.3, linewidth=0, antialiased=False)
+                            
+            if is_rel:
+                # Plot the target plane at rz=0
+                ax.plot_surface(_gx, _gy, np.zeros_like(_gx),
+                                color="#dcdcdc", 
+                                alpha=0.15, linewidth=0, antialiased=False)
 
             if not is_rel:
                 # Target circle trajectory (thick magenta) in absolute frame
-                ax.plot(tgt_pos[:, 0], tgt_pos[:, 1], tgt_pos[:, 2], color="#d12be6", lw=2.5, ls="-", alpha=0.85, zorder=2, label="Target circle")
+                ax.plot(tgt_pos[:, 0], tgt_pos[:, 1], tgt_pos[:, 2], color="#d12be6", lw=2.5, ls="-", alpha=0.85, zorder=2, label="Target trajectory")
                 # Target current position
                 ax.plot([tgt_pos[-1, 0]], [tgt_pos[-1, 1]], [tgt_pos[-1, 2]], "o", color="#d12be6", markersize=8)
             else:
                 # Target at origin in relative frame
                 ax.plot([0], [0], [0], "o", color="#d12be6", markersize=10, label="Target (origin)")
                 # Show circle rim in relative frame (where drone wants to be)
-                ax.plot(R*np.cos(_rt), R*np.sin(_rt), np.zeros_like(_rt), color="#d12be6", lw=1.0, ls="--", alpha=0.3)
+                if R > 1e-6:
+                    ax.plot(R*np.cos(_rt), R*np.sin(_rt), np.zeros_like(_rt), color="#d12be6", lw=1.0, ls="--", alpha=0.3)
 
             # Glideslope cone
             apex = np.array([0, 0, 0]) if is_rel else tgt_pos[-1]
@@ -710,18 +726,16 @@ def build_plots(data_dir, out_path=None, elev=22):
         pdf.savefig(fig5, facecolor=FIG_BG); plt.close(fig5)
 
         # ── Page 6 : Relative Position & Velocity ─────────────────────────────
-        print("  [6/10] Relative states …")
-        # Target trajectory over actual time
-        meta = solves_df.iloc[0]
-        c_x, c_y, c_z = meta.get("circle_center_x", 0.0), meta.get("circle_center_y", 0), meta.get("circle_center_z", 1.0)
-        R, omega, phi0, t0_abs = meta.get("circle_radius", 0.0), meta.get("circle_omega", 0), meta.get("circle_phi0", 0), meta.get("circle_t_abs", 0)
-        t_span = t0_abs + (time)
-        tgt_x = c_x + R * np.cos(omega * t_span + phi0)
-        tgt_y = c_y + R * np.sin(omega * t_span + phi0)
-        tgt_z = np.full_like(t_span, c_z)
-        tgt_vx = -R * omega * np.sin(omega * t_span + phi0)
-        tgt_vy = R * omega * np.cos(omega * t_span + phi0)
-        tgt_vz = np.zeros_like(t_span)
+        # Extract target trajectory from commanded states
+        tgt_df = cmd_df_abs[["tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz"]]
+        tgt_df = tgt_df.fillna(method="bfill").fillna(method="ffill")
+        
+        tgt_x = tgt_df["tgt_x"].values
+        tgt_y = tgt_df["tgt_y"].values
+        tgt_z = tgt_df["tgt_z"].values
+        tgt_vx = tgt_df["tgt_vx"].values
+        tgt_vy = tgt_df["tgt_vy"].values
+        tgt_vz = tgt_df["tgt_vz"].values
         
         actual_rel_pos = actual_pos - np.stack([tgt_x, tgt_y, tgt_z], axis=1)
         actual_rel_vel = actual_vel - np.stack([tgt_vx, tgt_vy, tgt_vz], axis=1)
