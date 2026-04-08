@@ -4,19 +4,21 @@ When integrating an actual hardware target (e.g., a real moving robot tracked by
 
 ## Required ROS Topics
 
-Your target estimator must publish on **three topics**. By default, the planner expects:
+For `tracking_circle_target`, the planner treats your target estimator/predictor as an external ROS producer. It does **not** assume any internal circular model.
+
+Your target estimator should publish on the following topics. By default, the planner expects:
 
 | Topic | Message Type | Rate | Purpose |
 |---|---|---|---|
-| `/target/odom` | `nav_msgs/msg/Odometry` | Fast (~50-100Hz) | Immediate feedback. Provides the drone with the target's current position and velocity to compute instantaneous tracking errors. |
-| `/target/accel` | `geometry_msgs/msg/AccelStamped` | Fast (~50-100Hz) | Immediate feedback. Provides the target's current instantaneous acceleration to feed forward into the MPC dynamics. |
-| `/target/predicted_trajectory` | `trajectory_msgs/msg/MultiDOFJointTrajectory` | Slow (~1-10Hz) | Future prediction. Required by OCPs like `tracking_circle_target` that need to know the *future* trajectory to plan intercepts or landings over the MPC horizon. |
+| `/target/odom` | `nav_msgs/msg/Odometry` | Fast (~50-100Hz) | Immediate feedback. Provides the target's current position and velocity. |
+| `/target/predicted_accel` | `trajectory_msgs/msg/MultiDOFJointTrajectory` | Slow (~1-10Hz) | Future prediction. Required by `tracking_circle_target`; planner consumes `header.stamp`, `time_from_start`, and `accelerations[0].linear`. |
+| `/target/accel` | `geometry_msgs/msg/AccelStamped` | Fast (~50-100Hz) | Optional diagnostics stream. Not required by `tracking_circle_target`. |
 
 ---
 
 ## 1. Setting up the Target Estimator Node
 
-### The `Odometry` and `AccelStamped` Streams
+### The `Odometry` Stream (required) and `AccelStamped` Stream (optional diagnostics)
 
 These two topics are standard. When you observe the moving target via your Kalman Filter or Motion Capture:
 
@@ -27,17 +29,18 @@ These two topics are standard. When you observe the moving target via your Kalma
    - `odom.twist.twist.linear` -> Target velocity (vx, vy, vz)
    - `accel.accel.linear` -> Target acceleration (ax, ay, az)
 
-### The `MultiDOFJointTrajectory` Prediction Stream
+### The `MultiDOFJointTrajectory` Predicted-Acceleration Stream
 
 This is the most critical for dynamic planning. You must predict where the target *will be* over the next few seconds (the planner horizon is roughly 4 seconds). 
 
-Even if you just assume constant velocity or constant acceleration from your Kalman filter, you must explicitly populate and publish this trajectory array so the planner's integration engine can look it up in `O(1)` time.
+Even if you assume constant velocity/acceleration in your estimator, you must explicitly publish this array so the planner can reconstruct future target position/velocity from current target odom plus future acceleration samples.
 
 **Requirements for the Trajectory message:**
 1. Let `N` be the number of predicted points (e.g., 80 to 400).
 2. The `header.stamp` of the message MUST be the absolute ROS time (`t=0` for the prediction).
 3. Populate the `points` array where each point has a `time_from_start` offset.
-4. **Crucial:** You must populate the `accelerations[0].linear` field for each point. The `tracking_circle_target` dynamics model primarily integrates the target over time using these future acceleration vectors.
+4. **Crucial:** Populate `accelerations[0].linear` for each point. This is the field consumed by the `tracking_circle_target` solver path.
+5. `transforms` and `velocities` are currently ignored by `tracking_circle_target` (safe to leave empty for first-pass integration).
 
 #### Minimal C++ Example (publishing a constant-acceleration prediction)
 
@@ -91,9 +94,18 @@ traj_pub_->publish(traj);
 The planner features a robust state machine when waiting for hardware data.
 
 **If the OCP needs future target data (e.g., `tracking_circle_target`):**
-1. The planner will power on and immediately check for the `/target/predicted_trajectory` topic.
+1. The planner will power on and immediately check for the `/target/predicted_accel` topic.
 2. If it is empty, or the message's `header.stamp` is older than `2.0` seconds, the planner enters **Wait Mode**. 
-3. The drone will maintain a local position hold (hover), rejecting the open-loop command, and log: `[OpenLoop] IDLE — waiting for /target/predicted_trajectory...`.
+3. The drone will maintain a local position hold (hover), rejecting the open-loop command, and log: `[OpenLoop] IDLE — waiting for /target/predicted_accel...`.
 4. As soon as a fresh trajectory message arrives, the solver fires instantly, initializes the variables, and dispatches the tracking maneuver.
 
 This guarantees your drone will never blindly fly into undefined space waiting for a telemetry uplink.
+
+---
+
+## 3. `tracking_circle_target` Interface Contract (Current)
+
+- Solver-side OCP input is `x0_rel + t0_abs + TargetAccelBuffer`.
+- OCP dynamics consume only future target acceleration samples.
+- Planner keeps target pose/velocity from `/target/odom` so it can reconstruct world-frame target motion for command publishing and logging.
+- Reconstruction is interface plumbing, not part of the optimal-control model.

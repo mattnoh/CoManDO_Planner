@@ -23,6 +23,7 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <algorithm>
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
@@ -44,6 +45,7 @@ public:
         mass_kg_ = runtime_cfg.mass_kg;
         target_odom_topic_ = runtime_cfg.target_odom_topic;
         target_accel_topic_ = runtime_cfg.target_accel_topic;
+        target_predicted_accel_topic_ = runtime_cfg.target_predicted_accel_topic;
         drone_state_is_relative_ = runtime_cfg.drone_state_is_relative;
         drone_odom_topic_ = runtime_cfg.drone_odom_topic;
         enable_terminal_freeze_ = runtime_cfg.enable_terminal_freeze;
@@ -91,7 +93,8 @@ public:
         // Keep target subscriptions alive regardless of active OCP type,
         // so runtime OCP switching to stateswitch works without restart.
         platform::target_tracker::setup(
-            this, sensor_cb_group_, target_odom_topic_, target_accel_topic_,
+            this, sensor_cb_group_,
+            target_odom_topic_, target_accel_topic_, target_predicted_accel_topic_,
             state_monitor_.targetState(), state_monitor_.targetMutex(), target_handles_);
 
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
@@ -130,15 +133,139 @@ private:
     }
 
     bool hasFreshTargetState() const {
-        if (ocp_type_.empty()) return true;
-        bool needs_target = OCPRegistry::getDescriptor(ocp_type_).validate_target != nullptr;
-        return state_monitor_.hasFreshTargetState(needs_target, this->now());
+        if (ocp_type_.empty()) {
+            return true;
+        }
+        const auto desc = OCPRegistry::getDescriptor(ocp_type_);
+        if (!desc.validate_target) {
+            return true;
+        }
+        TargetSnapshot snapshot = state_monitor_.getTargetSnapshot(true, this->now());
+        return desc.validate_target(snapshot, this->now(), 0.2);
     }
 
     TargetSnapshot getTargetSnapshot() const {
         if (ocp_type_.empty()) return TargetSnapshot{true};
         bool needs_target = OCPRegistry::getDescriptor(ocp_type_).validate_target != nullptr;
         return state_monitor_.getTargetSnapshot(needs_target, this->now());
+    }
+
+    bool isTargetValidForDescriptor(const OCPDescriptor& desc,
+                                    const TargetSnapshot& snapshot) const {
+        if (desc.validate_target) {
+            return desc.validate_target(snapshot, this->now(), 0.2);
+        }
+        return snapshot.valid;
+    }
+
+    bool tryGetTrackingCircleTargetExtra(
+        const std::any& extra,
+        TrackingCircleTargetOCP::TrackingCircleTargetExtra& out) const {
+        if (!extra.has_value()) {
+            return false;
+        }
+        try {
+            out = std::any_cast<TrackingCircleTargetOCP::TrackingCircleTargetExtra>(extra);
+            return true;
+        } catch (const std::bad_any_cast&) {
+            return false;
+        }
+    }
+
+    double stateNodeTime(const Eigen::VectorXd& s, int index) const {
+        if (s.size() > 13) {
+            return s(13);
+        }
+        return index * ocp_dt_;
+    }
+
+    void integrateTargetSegment(Eigen::Vector3d& pos,
+                                Eigen::Vector3d& vel,
+                                double t_abs_start,
+                                double t_abs_end,
+                                const target_models::TargetAccelBuffer& buffer) const {
+        if (t_abs_end <= t_abs_start) {
+            return;
+        }
+        const double nominal_step = (buffer.dt > 1e-6) ? buffer.dt : 0.05;
+        const double integration_step = std::clamp(nominal_step, 0.005, 0.05);
+
+        double t = t_abs_start;
+        while (t < t_abs_end - 1e-9) {
+            const double h = std::min(integration_step, t_abs_end - t);
+            const Eigen::Vector3d a = buffer.getAccel(t);
+            pos += vel * h + 0.5 * a * h * h;
+            vel += a * h;
+            t += h;
+        }
+    }
+
+    // tracking_circle_target OCP uses only future target acceleration.
+    // Current target pose/velocity is still required here so planner-side
+    // interface plumbing can reconstruct absolute target motion for command
+    // publishing and logs. This is not part of the OCP model itself.
+    std::vector<Eigen::VectorXd> reconstructTrackingCircleTargetAbsoluteTrajectory(
+        const std::vector<Eigen::VectorXd>& rel_traj,
+        const Eigen::Vector3d& target_pos0,
+        const Eigen::Vector3d& target_vel0,
+        const target_models::TargetAccelBuffer& buffer,
+        double t0_abs,
+        std::vector<Eigen::Vector3d>* target_pos_nodes = nullptr,
+        std::vector<Eigen::Vector3d>* target_vel_nodes = nullptr) const {
+        std::vector<Eigen::VectorXd> abs_traj;
+        abs_traj.reserve(rel_traj.size());
+        if (rel_traj.empty()) {
+            return abs_traj;
+        }
+
+        if (target_pos_nodes) {
+            target_pos_nodes->clear();
+            target_pos_nodes->reserve(rel_traj.size());
+        }
+        if (target_vel_nodes) {
+            target_vel_nodes->clear();
+            target_vel_nodes->reserve(rel_traj.size());
+        }
+
+        Eigen::Vector3d tgt_pos = target_pos0;
+        Eigen::Vector3d tgt_vel = target_vel0;
+        double prev_t_node = 0.0;
+
+        for (int i = 0; i < static_cast<int>(rel_traj.size()); ++i) {
+            const Eigen::VectorXd& x_rel = rel_traj[i];
+            if (x_rel.size() < 13) {
+                if (target_pos_nodes) {
+                    target_pos_nodes->push_back(tgt_pos);
+                }
+                if (target_vel_nodes) {
+                    target_vel_nodes->push_back(tgt_vel);
+                }
+                abs_traj.push_back(x_rel);
+                continue;
+            }
+
+            const double raw_t_node = stateNodeTime(x_rel, i);
+            const double t_node = std::max(prev_t_node, raw_t_node);
+            integrateTargetSegment(tgt_pos, tgt_vel,
+                                   t0_abs + prev_t_node,
+                                   t0_abs + t_node,
+                                   buffer);
+            prev_t_node = t_node;
+
+            if (target_pos_nodes) {
+                target_pos_nodes->push_back(tgt_pos);
+            }
+            if (target_vel_nodes) {
+                target_vel_nodes->push_back(tgt_vel);
+            }
+
+            Eigen::VectorXd x_abs = x_rel;
+            x_abs.segment(0, 3) = x_rel.segment(0, 3) + tgt_pos;
+            x_abs.segment(3, 3) = x_rel.segment(3, 3) + tgt_vel;
+            abs_traj.push_back(x_abs);
+        }
+
+        return abs_traj;
     }
 
     Eigen::VectorXd getCurrentState() const {
@@ -162,6 +289,32 @@ private:
             return result.state_trajectory;
         }
 
+        if (result.target_world_pos_trajectory.size() == result.state_trajectory.size() &&
+            result.target_world_vel_trajectory.size() == result.state_trajectory.size()) {
+            std::vector<Eigen::VectorXd> traj_abs = result.state_trajectory;
+            for (int i = 0; i < static_cast<int>(traj_abs.size()); ++i) {
+                auto& s = traj_abs[i];
+                if (s.size() < 13) {
+                    continue;
+                }
+                s.segment(0, 3) += result.target_world_pos_trajectory[i];
+                s.segment(3, 3) += result.target_world_vel_trajectory[i];
+            }
+            return traj_abs;
+        }
+
+        if (ocp_type_ == "tracking_circle_target") {
+            TrackingCircleTargetOCP::TrackingCircleTargetExtra ex;
+            if (tryGetTrackingCircleTargetExtra(result.extra, ex)) {
+                return reconstructTrackingCircleTargetAbsoluteTrajectory(
+                    result.state_trajectory,
+                    result.target_snapshot_pos,
+                    result.target_snapshot_vel,
+                    ex.buf,
+                    ex.t_abs);
+            }
+        }
+
         std::vector<Eigen::VectorXd> traj_abs = result.state_trajectory;
         for (int i = 0; i < static_cast<int>(traj_abs.size()); ++i) {
             auto& s = traj_abs[i];
@@ -169,10 +322,7 @@ private:
                 continue;
             }
 
-            double t_node = i * ocp_dt_;
-            if (s.size() > 13) {
-                t_node = s(13);
-            }
+            const double t_node = stateNodeTime(s, i);
 
             const Eigen::Vector3d tgt_p = result.target_snapshot_pos +
                                           result.target_snapshot_vel * t_node +
@@ -309,7 +459,6 @@ private:
 
         bool profile_changed = false;
         bool ocp_type_changed = false;
-        bool mode_changed = false;
 
         for (const auto& p : params) {
             if (p.get_name() == "ocp_type") {
@@ -331,7 +480,6 @@ private:
                     return result;
                 }
                 profile_changed = true;
-                mode_changed = true;
             } else if (p.get_name() == "n_replay") {
                 new_n_replay = p.as_int();
                 if (new_n_replay < 1) {
@@ -355,6 +503,12 @@ private:
         }
 
         if (profile_changed) {
+            if (new_ocp_type == "tracking_circle_target" && new_mode == "mpc") {
+                result.successful = false;
+                result.reason = "tracking_circle_target supports open_loop only";
+                return result;
+            }
+
             ocp_type_ = new_ocp_type;
             mode_ = new_mode;
             n_replay_ = new_n_replay;
@@ -397,6 +551,11 @@ private:
                 result.reason = "planner not configured";
                 return result;
             }
+            if (ocp_type_ == "tracking_circle_target" && mode_ == "mpc") {
+                result.successful = false;
+                result.reason = "tracking_circle_target supports open_loop only";
+                return result;
+            }
             last_command_seq_ = new_command_seq;
             maintain_hover_hold_ = false;
             command_paused_.store(false);
@@ -415,6 +574,11 @@ private:
             return;
         }
         if (command_paused_.load()) {
+            return;
+        }
+        if (ocp_type_ == "tracking_circle_target") {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "tracking_circle_target is open_loop-only; rejecting MPC solve loop");
             return;
         }
 
@@ -537,6 +701,9 @@ private:
             meta.target_snapshot_pos = result.target_snapshot_pos;
             meta.target_snapshot_vel = result.target_snapshot_vel;
             meta.target_snapshot_acc = result.target_snapshot_acc;
+            meta.target_world_pos_trajectory = result.target_world_pos_trajectory;
+            meta.target_world_vel_trajectory = result.target_world_vel_trajectory;
+            meta.target_motion_source = result.target_motion_source;
 
             auto desc = OCPRegistry::getDescriptor(ocp_type_);
             if (desc.prepare_log_meta) {
@@ -670,6 +837,11 @@ private:
             result.solve_iters = r.solve_iters;
             result.solve_timestamp = r.solve_timestamp;
             result.extra = r.extra_params;
+
+            result.target_snapshot_pos = target_snapshot.position;
+            result.target_snapshot_vel = target_snapshot.velocity;
+            result.target_snapshot_acc = target_snapshot.acceleration;
+            result.target_motion_source = "snapshot";
         }
         return result;
     }
@@ -717,9 +889,10 @@ private:
 
         auto desc = OCPRegistry::getDescriptor(ocp_type_);
         TargetSnapshot target_snapshot = getTargetSnapshot();
+        const bool target_valid_for_ocp = isTargetValidForDescriptor(desc, target_snapshot);
 
         if (desc.needs_target_trajectory || desc.validate_target) {
-            if (!target_snapshot.valid) {
+            if (!target_valid_for_ocp) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                     "[OpenLoop] IDLE — waiting for valid target state...");
                 publishPausedHoverHoldTick();
@@ -730,7 +903,7 @@ private:
         if (desc.needs_target_trajectory) {
             if (!state_monitor_.hasTargetTrajectory(this->now())) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "[OpenLoop] IDLE — waiting for /target/predicted_trajectory...");
+                    "[OpenLoop] IDLE — waiting for /target/predicted_accel...");
                 publishPausedHoverHoldTick();
                 return;
             }
@@ -743,8 +916,33 @@ private:
         SolverResult result = callSolver(x0, target_snapshot);
 
         if (desc.post_process_result) {
-            TargetSnapshot mock_t = getTargetSnapshot();
-            desc.post_process_result(result, mock_t);
+            desc.post_process_result(result, target_snapshot);
+        }
+
+        if (ocp_type_ == "tracking_circle_target" && result.is_relative_plan) {
+            TrackingCircleTargetOCP::TrackingCircleTargetExtra ex;
+            if (!tryGetTrackingCircleTargetExtra(result.extra, ex)) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "[OpenLoop] FAILED — tracking_circle_target missing predicted acceleration buffer");
+                return;
+            }
+
+            // Canonical interface reconstruction path used for replay, path
+            // publishing, and solve logging.
+            std::vector<Eigen::Vector3d> tgt_pos_nodes;
+            std::vector<Eigen::Vector3d> tgt_vel_nodes;
+            result.state_trajectory = reconstructTrackingCircleTargetAbsoluteTrajectory(
+                result.state_trajectory,
+                result.target_snapshot_pos,
+                result.target_snapshot_vel,
+                ex.buf,
+                ex.t_abs,
+                &tgt_pos_nodes,
+                &tgt_vel_nodes);
+            result.target_world_pos_trajectory = std::move(tgt_pos_nodes);
+            result.target_world_vel_trajectory = std::move(tgt_vel_nodes);
+            result.target_motion_source = "odom+predicted_accel";
+            result.is_relative_plan = false;
         }
 
         if (!result.success || result.state_trajectory.size() < 2) {
@@ -770,6 +968,9 @@ private:
                 meta.target_snapshot_pos = result.target_snapshot_pos;
                 meta.target_snapshot_vel = result.target_snapshot_vel;
                 meta.target_snapshot_acc = result.target_snapshot_acc;
+                meta.target_world_pos_trajectory = result.target_world_pos_trajectory;
+                meta.target_world_vel_trajectory = result.target_world_vel_trajectory;
+                meta.target_motion_source = result.target_motion_source;
 
                 auto desc = OCPRegistry::getDescriptor(ocp_type_);
                 if (desc.prepare_log_meta) {
@@ -827,6 +1028,7 @@ private:
     std::string drone_odom_topic_;
     std::string target_odom_topic_ = "/target/odom";
     std::string target_accel_topic_ = "/target/accel";
+    std::string target_predicted_accel_topic_ = "/target/predicted_accel";
 
     bool enable_terminal_freeze_ = true;
     double terminal_freeze_enter_pos_ = 0.20;

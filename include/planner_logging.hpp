@@ -28,12 +28,17 @@ struct SolveLogMeta {
         Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
         Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
 
-        // Tracking circle target parameters
-        Eigen::Vector3d circle_center = Eigen::Vector3d::Zero();
-        double circle_radius = 0.0;
-        double circle_omega = 0.0;
-        double circle_phi0 = 0.0;
-        double circle_t_abs = 0.0;
+    // Optional node-wise reconstructed target trajectory (world frame).
+    std::vector<Eigen::Vector3d> target_world_pos_trajectory;
+    std::vector<Eigen::Vector3d> target_world_vel_trajectory;
+    std::string target_motion_source = "snapshot";
+
+    // Tracking circle legacy parameters (kept for compatibility).
+    Eigen::Vector3d circle_center = Eigen::Vector3d::Zero();
+    double circle_radius = 0.0;
+    double circle_omega = 0.0;
+    double circle_phi0 = 0.0;
+    double circle_t_abs = 0.0;
 };
 
 class CsvLogger {
@@ -63,7 +68,7 @@ public:
                         all_solves_log_.open(folder + "/all_solves.csv");
                         if (all_solves_log_.is_open()) {
         all_solves_log_
-            << "solve_num,solve_time_ms,solve_iters,coord_mode,node,t,theta,"
+            << "solve_num,solve_time_ms,solve_iters,coord_mode,target_motion_source,node,t,theta,"
             << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz,"
             << "circle_center_x,circle_center_y,circle_center_z,circle_radius,circle_omega,circle_phi0,circle_t_abs,"
             << "abs_x,abs_y,abs_z,abs_vx,abs_vy,abs_vz,abs_qw,abs_qx,abs_qy,abs_qz,abs_wx,abs_wy,abs_wz,"
@@ -111,6 +116,10 @@ public:
         }
 
         const double nan = std::numeric_limits<double>::quiet_NaN();
+        const bool has_reconstructed_target =
+            (meta.target_world_pos_trajectory.size() == traj.size()) &&
+            (meta.target_world_vel_trajectory.size() == traj.size());
+
         for (int i = 0; i < static_cast<int>(traj.size()); ++i) {
             const auto& s = traj[i];
             if (s.size() < 13) {
@@ -125,7 +134,10 @@ public:
             Eigen::Vector3d tgt_p = meta.target_snapshot_pos;
             Eigen::Vector3d tgt_v = meta.target_snapshot_vel;
 
-            if (meta.circle_radius > 1e-6) {
+            if (has_reconstructed_target) {
+                tgt_p = meta.target_world_pos_trajectory[i];
+                tgt_v = meta.target_world_vel_trajectory[i];
+            } else if (meta.circle_radius > 1e-6) {
                 double tabs = meta.circle_t_abs + t_node;
                 double phi = meta.circle_omega * tabs + meta.circle_phi0;
                 tgt_p = meta.circle_center + Eigen::Vector3d(
@@ -172,6 +184,7 @@ public:
                             << meta.solve_time_ms << ","
                             << meta.solve_iters << ","
                             << (meta.is_relative_plan ? "relative" : "absolute") << ","
+                            << meta.target_motion_source << ","
                             << i << "," << t_node << "," << theta << ","
                             << tgt_p.x() << ","
                             << tgt_p.y() << ","

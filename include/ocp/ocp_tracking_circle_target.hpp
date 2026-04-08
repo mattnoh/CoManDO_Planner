@@ -1,5 +1,5 @@
 /// @file ocp_tracking_circle_target.hpp
-/// @brief Single-shot OCP for quadrotor landing on a moving circular target.
+/// @brief Single-shot OCP for quadrotor landing on a moving target.
 ///
 /// Port of quad_cf_tracking_ol_circle_rel.cpp from ALIPDDP-main.
 ///
@@ -31,14 +31,14 @@
 ///   rhoT raised from 100 — with N=80 stages the accumulated stage cost is ~80x
 ///   a single stage, so rhoT=100 is too weak to dominate the terminal constraint.
 ///
-/// • Output: Absolute coordinates (converted from relative frame internally).
+/// • Output: Relative coordinates. Planner-side integration reconstructs
+///   absolute world-frame trajectories for publishing/logging.
 ///
 /// EXECUTION MODE: Open-loop only.
 /// ─────────────────────────────────────────────────────────────────────────
 
 #pragma once
 
-#include "target/circular_target.hpp"
 #include "target/target_accel_buffer.hpp"
 
 #include "optimal_control_problem.h"
@@ -410,7 +410,6 @@ inline Param getSolverParams() {
 // ── Factory function ──────────────────────────────────────────────────────────
 inline std::shared_ptr<OptimalControlProblem<double>> create(
     const Eigen::VectorXd& x0_rel,
-    const target_models::CircularTarget& /*circ*/,
     const target_models::TargetAccelBuffer& buf,
     double t0_abs,
     double th_init = TH_INIT,
@@ -503,30 +502,9 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     return problem;
 }
 
-// ── Convert relative trajectory to absolute coordinates ────────────────────────
-inline std::vector<Eigen::VectorXd> convertToAbsolute(
-    const std::vector<Eigen::VectorXd>& X_rel,
-    const target_models::CircularTarget& tgt,
-    double t0_abs)
-{
-    std::vector<Eigen::VectorXd> X_abs(X_rel.size());
-    for(size_t k=0; k<X_rel.size(); ++k) {
-        double DT = X_rel[k](IDX_DT);
-        double tabs = t0_abs + DT;
-
-        Eigen::VectorXd x_abs(NX);
-        x_abs.head(3)      = X_rel[k].head(3)      + tgt.pos(tabs);
-        x_abs.segment(3,3) = X_rel[k].segment(3,3) + tgt.vel(tabs);
-        x_abs.segment(6,7) = X_rel[k].segment(6,7);
-        X_abs[k] = x_abs;
-    }
-    return X_abs;
-}
-
 struct TrackingCircleTargetExtra {
     target_models::TargetAccelBuffer buf;
-    target_models::CircularTarget tgt;
-    double t_abs;
+    double t_abs = 0.0;
 };
 
 } // namespace TrackingCircleTargetOCP

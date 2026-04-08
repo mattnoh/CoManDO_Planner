@@ -17,7 +17,7 @@ The planner is decoupled from specific OCP physics via the `OCPRegistry`. This a
 │                                                                         │
 │  StateMonitor (thread-safe state ownership)                             │
 │  ├─ cf_state_ / px4_state_ ◄── /{drone}/pose, /{drone}/odom            │
-│  └─ target_state_ ◄── /target/odom, /target/accel, /target/predicted_trajectory  │
+│  └─ target_state_ ◄── /target/odom, /target/accel (optional), /target/predicted_accel │
 │                                                                         │
 │  OCP Registry                                                           │
 │  └─► [hover, landing, stateswitch, tracking_circle, tracking_circle_target]     │
@@ -53,7 +53,8 @@ Defined in `launch/planner_launch.py`. These connect the planner to the hardware
 | `solver` | string | `"alipddp"` | Solver backend |
 | `enable_logging` | bool | `true` | Enable CSV logging to `./logs/` |
 | `target_odom_topic`| string | `"/target/odom"` | External target tracking topic |
-| `target_accel_topic`| string | `"/target/accel"`| External target acceleration topic |
+| `target_accel_topic`| string | `"/target/accel"`| Optional live target acceleration diagnostics |
+| `target_predicted_accel_topic`| string | `"/target/predicted_accel"`| Future target acceleration buffer topic |
 
 ### Runtime Parameters (Configurable via `ocp_launch.py`)
 
@@ -106,10 +107,10 @@ The planner subscribes to standard ROS2 state topics. High-rate updates are hand
 For relative-frame OCPs (like `stateswitch`), the planner monitors an external target:
 
 - **Target Odometry**: `{target_odom_topic}`
-- **Target Acceleration**: `{target_accel_topic}`
-- **Predicted Trajectory**: `/target/predicted_trajectory` (`trajectory_msgs/MultiDOFJointTrajectory`)
+- **Target Acceleration (optional diagnostics)**: `{target_accel_topic}`
+- **Predicted Acceleration**: `{target_predicted_accel_topic}` (`trajectory_msgs/MultiDOFJointTrajectory`)
 
-Target state must be fresh (age < 0.2s) for closed-loop solver. Predicted trajectories must be fresh (age < 2.0s) for the `tracking_circle_target` solver to engage.
+For `tracking_circle_target`, target odometry must be fresh (age < 0.2s) and predicted acceleration buffers must be fresh (age < 2.0s) before the solver engages.
 
 ---
 
@@ -139,9 +140,11 @@ The planner uses an `OCPRegistry` to manage different problem types.
 | `"landing"` | Terminal Constraint | Absolute (13D) | No | Precise vertical landing |
 | `"stateswitch"`| Variable Time | Relative (14D) | **Yes** | Landing on moving targets (live feedback) |
 | `"tracking_circle"`| TV Dynamics | Absolute (13D) | No* | Analytical circular target tracking |
-| `"tracking_circle_target"`| TV Dynamics | Absolute (13D) | No* | Buffer-based tracking from ROS predictions |
+| `"tracking_circle_target"`| TV Dynamics | Relative (14D) internal, published absolute | Yes (internal) | Buffer-based tracking from ROS predicted accelerations |
 
-*\*`tracking_circle` solves in a "baked-in" relative frame and post-processes the result to absolute coordinates before replaying.*
+*\*`tracking_circle` solves in a "baked-in" relative frame and post-processes the result to absolute coordinates before replaying. `tracking_circle_target` also solves in relative form, while planner-side target reconstruction converts outputs to absolute world-frame commands and logs.*
+
+For `tracking_circle_target`, planner-side code no longer assumes circular target parameters (`R`, `omega`, `phi0`) or regenerates analytic target motion. The world-frame target path is reconstructed from solve-start `/target/odom` plus `/target/predicted_accel`.
 
 ---
 

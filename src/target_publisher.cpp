@@ -4,6 +4,14 @@
 /// Publishes on:
 ///   /target/odom   (nav_msgs/msg/Odometry)   — position + velocity
 ///   /target/accel  (geometry_msgs/msg/AccelStamped) — centripetal acceleration
+///   /target/predicted_accel (trajectory_msgs/msg/MultiDOFJointTrajectory)
+///       — future acceleration samples used by tracking_circle_target.
+///
+/// Integration note:
+///   tracking_circle_target consumes future acceleration from
+///   /target/predicted_accel inside the OCP. The planner uses /target/odom
+///   as the solve-start anchor to reconstruct world-frame target motion for
+///   command publishing and logging.
 ///
 /// Parameters (all declare_parameter with defaults):
 ///   center_x, center_y, center_z  — orbit center [m]   default: 0, 0, 1.5
@@ -18,8 +26,8 @@
 ///
 /// Usage:
 ///   ros2 run comando_planner circular_target_publisher
-///   ros2 run comando_planner circular_target_publisher \
-///       --ros-args -p radius:=3.0 -p omega:=0.5
+///   ros2 run comando_planner circular_target_publisher --ros-args
+///       -p radius:=3.0 -p omega:=0.5
 ///
 /// Quick check:
 ///   ros2 topic echo /target/odom --once
@@ -66,7 +74,7 @@ public:
         accel_pub_ = create_publisher<geometry_msgs::msg::AccelStamped>(
             "/target/accel", 10);
         traj_pub_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>(
-            "/target/predicted_trajectory", 10);
+            "/target/predicted_accel", 10);
 
         if (enable_relative_odom_) {
             rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(relative_odom_topic_, 10);

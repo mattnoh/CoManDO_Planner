@@ -54,6 +54,9 @@ struct SolverResult {
     Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
+    std::vector<Eigen::Vector3d> target_world_pos_trajectory;
+    std::vector<Eigen::Vector3d> target_world_vel_trajectory;
+    std::string target_motion_source = "snapshot";
     std::any extra;
 };
 
@@ -273,75 +276,55 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             OCPDescriptor::WarmStart::Shift,
             true, // needs_target_trajectory
             [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
-                if (t.valid) {
-                    Eigen::VectorXd xr = x;
-                    xr.segment(0, 3) -= t.position;
-                    xr.segment(3, 3) -= t.velocity;
-                    return xr;
-                }
-                return x;
+                Eigen::VectorXd xr = x;
+                xr.segment(0, 3) -= t.position;
+                xr.segment(3, 3) -= t.velocity;
+                return xr;
             },
-            nullptr, // validate_target
-            [](SolverResult& r, const TargetSnapshot& /*t*/) {
-                if (r.extra.has_value()) {
-                    try {
-                        auto ex = std::any_cast<TrackingCircleTargetOCP::TrackingCircleTargetExtra>(r.extra);
-                        // Convert relative trajectory to absolute using baked-in dynamics
-                        r.state_trajectory = TrackingCircleTargetOCP::convertToAbsolute(r.state_trajectory, ex.tgt, ex.t_abs);
-                        r.is_relative_plan = false;
-                    } catch (const std::bad_any_cast&) {
-                        std::cerr << "TrackingCircleTarget: bad_any_cast in post_process_result\n";
-                    }
+            [](const TargetSnapshot& t, const rclcpp::Time& now, double max_age) {
+                if (t.odom_timestamp.nanoseconds() <= 0) {
+                    return false;
                 }
+                const double age = (now - t.odom_timestamp).seconds();
+                const double kClockTol = 0.001;
+                return !(age < -kClockTol || age >= max_age);
             },
-            [](const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& tgt_snap) {
+            [](SolverResult& r, const TargetSnapshot& t) {
+                // The OCP state is relative by design; planner-side plumbing
+                // reconstructs absolute target motion for publications/logging.
+                r.is_relative_plan = true;
+                if (t.odom_timestamp.nanoseconds() > 0) {
+                    r.target_snapshot_pos = t.position;
+                    r.target_snapshot_vel = t.velocity;
+                } else {
+                    r.target_snapshot_pos.setZero();
+                    r.target_snapshot_vel.setZero();
+                }
+                r.target_snapshot_acc = t.acceleration;
+            },
+            [](const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& /*tgt_snap*/) {
                 TrackingCircleTargetOCP::TrackingCircleTargetExtra ex;
-                ex.tgt.center.setZero();
-                ex.tgt.R = 0.0;
-                ex.tgt.omega = 0.0;
-                ex.tgt.phi0 = 0.0;
-                if (tgt_snap.valid) {
-                    ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
-                    ex.tgt.R = cfg.circle_R;
-                    ex.tgt.omega = cfg.circle_omega;
-                    double ph = std::atan2(tgt_snap.position.y() - ex.tgt.center.y(), 
-                                           tgt_snap.position.x() - ex.tgt.center.x());
-                    ex.tgt.phi0 = ph - ex.tgt.omega * t_abs;
-                }
                 ex.t_abs = t_abs;
-                
+
                 if (cfg.target_accel_buffer.has_value()) {
                     ex.buf = cfg.target_accel_buffer.value();
-                } else {
-                    // Populate the buffer
-                    const int N_node = 80; // from ocp_tracking_circle_target.hpp N
-                    const double THH = 0.2; // worst-case dt
-                    const double buf_duration = N_node * THH + 1.0;
-                    ex.buf.populateFromModel(ex.tgt, t_abs, buf_duration, 0.05);
                 }
 
-                return std::any(ex); 
+                return std::any(ex);
             },
-            [](planner_logging::SolveLogMeta& meta, const std::any& extra_params, const std::any& /*runtime_cfg*/) {
-                try {
-                    auto ex = std::any_cast<TrackingCircleTargetOCP::TrackingCircleTargetExtra>(extra_params);
-                    meta.circle_center = ex.tgt.center;
-                    meta.circle_radius = ex.tgt.R;
-                    meta.circle_omega = ex.tgt.omega;
-                    meta.circle_phi0 = ex.tgt.phi0;
-                    meta.circle_t_abs = ex.t_abs;
-                } catch (const std::bad_any_cast&) {}
-            },
+            nullptr, // prepare_log_meta
             TrackingCircleTargetOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 if (a.extra.has_value()) {
                    try {
                        auto ex = std::any_cast<TrackingCircleTargetOCP::TrackingCircleTargetExtra>(a.extra);
-                       return TrackingCircleTargetOCP::create(a.current_state, ex.tgt, ex.buf, ex.t_abs);
+                       return TrackingCircleTargetOCP::create(a.current_state, ex.buf, ex.t_abs);
                    } catch (const std::bad_any_cast&) {}
                 }
-                // Fallback is dangerous here since buf is uninitialized, but we follow standard pattern
-                return TrackingCircleTargetOCP::create(a.current_state, target_models::getDefaultCircularTarget(), target_models::TargetAccelBuffer{}, a.t_abs);
+                return TrackingCircleTargetOCP::create(
+                    a.current_state,
+                    target_models::TargetAccelBuffer{},
+                    a.t_abs);
             }
         }}
     };

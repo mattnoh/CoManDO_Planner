@@ -46,9 +46,10 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     node->declare_parameter("drone_state_is_relative", cfg.drone_state_is_relative);
     node->declare_parameter("drone_odom_topic", cfg.drone_odom_topic);
 
-    // Topics for externernal target tracking <- need to work on this later
+    // Topics for external target tracking.
     node->declare_parameter("target_odom_topic", cfg.target_odom_topic);
     node->declare_parameter("target_accel_topic", cfg.target_accel_topic);
+    node->declare_parameter("target_predicted_accel_topic", cfg.target_predicted_accel_topic);
 
     node->declare_parameter("enable_terminal_freeze", cfg.enable_terminal_freeze);
     node->declare_parameter("terminal_freeze_enter_pos", cfg.terminal_freeze_enter_pos);
@@ -83,6 +84,7 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
 
     cfg.target_odom_topic = node->get_parameter("target_odom_topic").as_string();
     cfg.target_accel_topic = node->get_parameter("target_accel_topic").as_string();
+    cfg.target_predicted_accel_topic = node->get_parameter("target_predicted_accel_topic").as_string();
 
     cfg.enable_terminal_freeze = node->get_parameter("enable_terminal_freeze").as_bool();
     cfg.terminal_freeze_enter_pos = node->get_parameter("terminal_freeze_enter_pos").as_double();

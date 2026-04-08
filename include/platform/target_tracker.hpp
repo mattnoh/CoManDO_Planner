@@ -1,11 +1,12 @@
 /// @file target_tracker.hpp
-/// @brief Target-state subscriptions (odom + accel) for stateswitch OCP.
+/// @brief Target-state subscriptions (odom + optional live accel + predicted accel).
 ///
 /// EXPECTED ROS GRAPH (Target Tracker):
 /// - Planner node: `/comando_planner`
 /// - Input topics (from target estimator/sim): `<target_odom_topic>`,
-///   `<target_accel_topic>`
-/// - Typical defaults in launch: `/target/odom`, `/target/accel`
+///   `<target_accel_topic>` (optional diagnostics), `<predicted_accel_topic>`
+/// - Typical defaults in launch: `/target/odom`, `/target/accel`,
+///   `/target/predicted_accel`
 ///
 /// FIXES vs original:
 ///   BUG 1 — Single shared timestamp for two async topics.
@@ -40,8 +41,6 @@
 #include <string>
 
 #include "target/target_accel_buffer.hpp"
-#include <mutex>
-#include <string>
 
 namespace platform {
 namespace target_tracker {
@@ -61,28 +60,31 @@ struct TargetState {
     bool odom_received  = false;
     bool accel_received = false;
 
+    /// Odom-only freshness check, used by OCPs that only need target pose/velocity.
+    bool isOdomFresh(const rclcpp::Time& now, double max_age_sec = 0.2) const {
+        if (!odom_received) return false;
+        if (odom_timestamp.nanoseconds() <= 0) return false;
+        const double odom_age = (now - odom_timestamp).seconds();
+        const double kClockTol = 0.001;
+        return !(odom_age < -kClockTol || odom_age >= max_age_sec);
+    }
+
+    /// Live acceleration freshness check (diagnostic topic).
+    bool isAccelFresh(const rclcpp::Time& now, double max_age_sec = 0.2) const {
+        if (!accel_received) return false;
+        if (accel_timestamp.nanoseconds() <= 0) return false;
+        const double accel_age = (now - accel_timestamp).seconds();
+        const double kClockTol = 0.001;
+        return !(accel_age < -kClockTol || accel_age >= max_age_sec);
+    }
+
     /// Returns true only if BOTH topics have delivered at least one message
     /// AND both of their most recent messages are younger than max_age_sec.
     ///
     /// max_age_sec default = 0.2 s (5 Hz minimum acceptable rate).
     /// Raise to 0.5 s for slow targets; lower to 0.1 s for tight requirements.
     bool isFresh(const rclcpp::Time& now, double max_age_sec = 0.2) const {
-        if (!odom_received || !accel_received) return false;
-
-        // Guard against uninitialised timestamps (nanoseconds == 0 at default init).
-        if (odom_timestamp.nanoseconds()  <= 0) return false;
-        if (accel_timestamp.nanoseconds() <= 0) return false;
-
-        const double odom_age  = (now - odom_timestamp).seconds();
-        const double accel_age = (now - accel_timestamp).seconds();
-
-        // Allow a small negative tolerance (±1 ms) to absorb clock jitter and
-        // sim-time initialisation artefacts.
-        const double kClockTol = 0.001;
-        if (odom_age  < -kClockTol || odom_age  >= max_age_sec) return false;
-        if (accel_age < -kClockTol || accel_age >= max_age_sec) return false;
-
-        return true;
+        return isOdomFresh(now, max_age_sec) && isAccelFresh(now, max_age_sec);
     }
 
     /// Convenience: is the state currently valid (fresh with default tolerance)?
@@ -96,8 +98,8 @@ struct TargetState {
         return std::max(oa, aa);
     }
 
-    // Predicted trajectory cache
-    struct PredictedTrajectory {
+    // Predicted acceleration cache used by acceleration-driven OCPs.
+    struct PredictedAccel {
         rclcpp::Time origin_time{0, 0, RCL_ROS_TIME};
         target_models::TargetAccelBuffer accel_buffer;
         bool received = false;
@@ -108,18 +110,18 @@ struct TargetState {
             return (now - origin_time).seconds() < max_age_sec;
         }
     };
-    PredictedTrajectory predicted_trajectory;
+    PredictedAccel predicted_accel;
 };
 
 struct Handles {
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr       odom_sub;
     rclcpp::Subscription<geometry_msgs::msg::AccelStamped>::SharedPtr accel_sub;
-    rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr traj_sub;
+    rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr predicted_accel_sub;
 
     void reset() {
         odom_sub.reset();
         accel_sub.reset();
-        traj_sub.reset();
+        predicted_accel_sub.reset();
     }
 };
 
@@ -128,6 +130,7 @@ inline void setup(
     rclcpp::CallbackGroup::SharedPtr     callback_group,
     const std::string&                   odom_topic,
     const std::string&                   accel_topic,
+    const std::string&                   predicted_accel_topic,
     TargetState&                         target_state,
     std::mutex&                          target_mutex,
     Handles&                             handles)
@@ -160,42 +163,50 @@ inline void setup(
         opts);
 
     // ── Acceleration callback ────────────────────────────────────────────────
-    handles.accel_sub = node->create_subscription<geometry_msgs::msg::AccelStamped>(
-        accel_topic, 10,
-        [&target_state, &target_mutex, node](
-            const geometry_msgs::msg::AccelStamped::SharedPtr msg)
-        {
-            std::lock_guard<std::mutex> lk(target_mutex);
+    if (!accel_topic.empty()) {
+        handles.accel_sub = node->create_subscription<geometry_msgs::msg::AccelStamped>(
+            accel_topic, 10,
+            [&target_state, &target_mutex, node](
+                const geometry_msgs::msg::AccelStamped::SharedPtr msg)
+            {
+                std::lock_guard<std::mutex> lk(target_mutex);
 
-            target_state.acceleration << msg->accel.linear.x,
-                                         msg->accel.linear.y,
-                                         msg->accel.linear.z;
-            target_state.accel_received = true;
+                target_state.acceleration << msg->accel.linear.x,
+                                             msg->accel.linear.y,
+                                             msg->accel.linear.z;
+                target_state.accel_received = true;
 
-            // Update ONLY the accel timestamp; odom timestamp is unaffected.
-            target_state.accel_timestamp =
-                (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0)
-                    ? rclcpp::Time(msg->header.stamp)
-                    : node->now();
-        },
-        opts);
+                // Update ONLY the accel timestamp; odom timestamp is unaffected.
+                target_state.accel_timestamp =
+                    (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0)
+                        ? rclcpp::Time(msg->header.stamp)
+                        : node->now();
+            },
+            opts);
+    }
 
-    // ── Trajectory callback ──────────────────────────────────────────────────
-    handles.traj_sub = node->create_subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>(
-        "/target/predicted_trajectory", 10,
+    // ── Predicted acceleration callback ──────────────────────────────────────
+    handles.predicted_accel_sub = node->create_subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>(
+        predicted_accel_topic, 10,
         [&target_state, &target_mutex, node](
             const trajectory_msgs::msg::MultiDOFJointTrajectory::SharedPtr msg)
         {
-            if (msg->points.size() < 2) return;
+            if (msg->points.empty()) return;
 
             std::lock_guard<std::mutex> lk(target_mutex);
             
-            auto& traj = target_state.predicted_trajectory;
-            traj.origin_time = rclcpp::Time(msg->header.stamp);
+            auto& pred = target_state.predicted_accel;
+            pred.origin_time =
+                (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0)
+                    ? rclcpp::Time(msg->header.stamp)
+                    : node->now();
             
-            double t_start = traj.origin_time.seconds();
-            double dt = (rclcpp::Duration(msg->points[1].time_from_start) - 
-                         rclcpp::Duration(msg->points[0].time_from_start)).seconds();
+            const double t_start = pred.origin_time.seconds();
+            double dt = 0.05;
+            if (msg->points.size() > 1) {
+                dt = (rclcpp::Duration(msg->points[1].time_from_start) -
+                      rclcpp::Duration(msg->points[0].time_from_start)).seconds();
+            }
             
             std::vector<Eigen::Vector3d> accels;
             accels.reserve(msg->points.size());
@@ -209,16 +220,18 @@ inline void setup(
                 }
             }
             
-            traj.accel_buffer.t_start = t_start;
-            traj.accel_buffer.dt = dt <= 0.0 ? 0.05 : dt;
-            traj.accel_buffer.accels = std::move(accels);
-            traj.received = true;
+            pred.accel_buffer.t_start = t_start;
+            pred.accel_buffer.dt = dt <= 0.0 ? 0.05 : dt;
+            pred.accel_buffer.accels = std::move(accels);
+            pred.received = true;
         },
         opts);
 
     RCLCPP_INFO(node->get_logger(),
-        "[TargetTracker] Subscribed odom: %s  accel: %s  traj: /target/predicted_trajectory",
-        odom_topic.c_str(), accel_topic.c_str());
+        "[TargetTracker] Subscribed odom: %s  accel(diagnostics): %s  predicted_accel: %s",
+        odom_topic.c_str(),
+        accel_topic.empty() ? "<disabled>" : accel_topic.c_str(),
+        predicted_accel_topic.c_str());
 }
 
 } // namespace target_tracker

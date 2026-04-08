@@ -73,12 +73,12 @@ public:
 
     bool hasTargetTrajectory(const rclcpp::Time& now) const {
         std::lock_guard<std::mutex> lk(target_mutex_);
-        return target_state_.predicted_trajectory.isFresh(now, 2.0);
+        return target_state_.predicted_accel.isFresh(now, 2.0);
     }
 
     target_models::TargetAccelBuffer getTargetAccelBuffer() const {
         std::lock_guard<std::mutex> lk(target_mutex_);
-        return target_state_.predicted_trajectory.accel_buffer;
+        return target_state_.predicted_accel.accel_buffer;
     }
 
     Eigen::VectorXd getCurrentState(const std::string& platform) const {
