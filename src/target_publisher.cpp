@@ -12,6 +12,9 @@
 ///   phi0                           — initial phase [rad]    default: 0.0
 ///   publish_hz                     — publish rate [Hz]      default: 100.0
 ///   frame_id                       — header frame           default: "world"
+///   drone_odom_topic               — drone odom input       default: "/cf_1/odom"
+///   relative_odom_topic            — relative odom output   default: "/drone/relative_odometry"
+///   enable_relative_odom           — publish relative odom  default: true
 ///
 /// Usage:
 ///   ros2 run comando_planner circular_target_publisher
@@ -21,6 +24,7 @@
 /// Quick check:
 ///   ros2 topic echo /target/odom --once
 ///   ros2 topic echo /target/accel --once
+///   ros2 topic echo /drone/relative_odometry --once
 ///   ros2 topic hz /target/odom          # should print ~100 Hz
 ///   ros2 topic hz /target/accel         # should print ~100 Hz
 
@@ -33,6 +37,7 @@
 
 #include <cmath>
 #include <chrono>
+#include <mutex>
 
 class CircularTargetPublisher : public rclcpp::Node
 {
@@ -48,6 +53,9 @@ public:
         phi0_       = declare_parameter<double>("phi0",       0.0);
         publish_hz_ = declare_parameter<double>("publish_hz", 100.0);
         frame_id_   = declare_parameter<std::string>("frame_id", "world");
+        drone_odom_topic_ = declare_parameter<std::string>("drone_odom_topic", "/cf_1/odom");
+        relative_odom_topic_ = declare_parameter<std::string>("relative_odom_topic", "/drone/relative_odometry");
+        enable_relative_odom_ = declare_parameter<bool>("enable_relative_odom", true);
 
         // Record wall-clock start so visual phase matches requested phi0 at node startup
         phi0_ = phi0_ - omega_ * now().seconds();
@@ -60,6 +68,17 @@ public:
         traj_pub_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>(
             "/target/predicted_trajectory", 10);
 
+        if (enable_relative_odom_) {
+            rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(relative_odom_topic_, 10);
+            drone_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+                drone_odom_topic_, 10,
+                [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+                    std::lock_guard<std::mutex> lk(drone_mutex_);
+                    last_drone_odom_ = *msg;
+                    has_drone_odom_ = true;
+                });
+        }
+
         // ── Timer ────────────────────────────────────────────────────────────
         const auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<double>(1.0 / publish_hz_));
@@ -70,6 +89,11 @@ public:
             "[CircularTarget] center=(%.2f,%.2f,%.2f)  R=%.2f  ω=%.2f rad/s  "
             "%.0f Hz",
             center_x_, center_y_, center_z_, radius_, omega_, publish_hz_);
+        if (enable_relative_odom_) {
+            RCLCPP_INFO(get_logger(),
+                "[CircularTarget] Relative odom enabled: in=%s out=%s",
+                drone_odom_topic_.c_str(), relative_odom_topic_.c_str());
+        }
     }
 
 private:
@@ -132,6 +156,43 @@ private:
         accel.accel.angular.z = 0.0;
 
         accel_pub_->publish(accel);
+
+        if (enable_relative_odom_ && rel_odom_pub_) {
+            nav_msgs::msg::Odometry drone_odom_copy;
+            {
+                std::lock_guard<std::mutex> lk(drone_mutex_);
+                if (!has_drone_odom_) {
+                    goto maybe_publish_traj;
+                }
+                drone_odom_copy = last_drone_odom_;
+            }
+
+            const rclcpp::Time dstamp =
+                (drone_odom_copy.header.stamp.sec != 0 || drone_odom_copy.header.stamp.nanosec != 0)
+                ? rclcpp::Time(drone_odom_copy.header.stamp)
+                : stamp;
+            const double td = dstamp.seconds();
+
+            const auto p_tgt = tgt.pos(td);
+            const auto v_tgt = tgt.vel(td);
+
+            nav_msgs::msg::Odometry rel = drone_odom_copy;
+            rel.header.stamp = dstamp;
+            rel.header.frame_id = frame_id_;
+            rel.child_frame_id = "drone_relative";
+
+            rel.pose.pose.position.x = drone_odom_copy.pose.pose.position.x - p_tgt.x();
+            rel.pose.pose.position.y = drone_odom_copy.pose.pose.position.y - p_tgt.y();
+            rel.pose.pose.position.z = drone_odom_copy.pose.pose.position.z - p_tgt.z();
+
+            rel.twist.twist.linear.x = drone_odom_copy.twist.twist.linear.x - v_tgt.x();
+            rel.twist.twist.linear.y = drone_odom_copy.twist.twist.linear.y - v_tgt.y();
+            rel.twist.twist.linear.z = drone_odom_copy.twist.twist.linear.z - v_tgt.z();
+
+            rel_odom_pub_->publish(rel);
+        }
+
+maybe_publish_traj:
         
         static int publish_traj_counter = 0;
         if (publish_traj_counter++ % static_cast<int>(publish_hz_ / 10.0) == 0) {
@@ -195,12 +256,21 @@ private:
     double center_x_, center_y_, center_z_;
     double radius_, omega_, phi0_, publish_hz_;
     std::string frame_id_;
+    std::string drone_odom_topic_;
+    std::string relative_odom_topic_;
+    bool enable_relative_odom_ = true;
 
     // ── ROS handles ────────────────────────────────────────────────────────
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr        odom_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr        rel_odom_pub_;
     rclcpp::Publisher<geometry_msgs::msg::AccelStamped>::SharedPtr accel_pub_;
     rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr traj_pub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr     drone_odom_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
+
+    std::mutex drone_mutex_;
+    nav_msgs::msg::Odometry last_drone_odom_;
+    bool has_drone_odom_ = false;
 };
 
 int main(int argc, char* argv[])

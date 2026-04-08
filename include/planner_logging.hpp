@@ -83,8 +83,11 @@ public:
         actual_state_log_.open(folder + "/actual_state.csv");
         if (actual_state_log_.is_open()) {
             actual_state_log_
-                << "timestamp,solve_num,"
-                << "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz\n";
+                << "timestamp,solve_num,coord_mode,"
+                << "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
+                << "abs_x,abs_y,abs_z,abs_vx,abs_vy,abs_vz,abs_qw,abs_qx,abs_qy,abs_qz,abs_wx,abs_wy,abs_wz,"
+                << "rel_x,rel_y,rel_z,rel_vx,rel_vy,rel_vz,rel_qw,rel_qx,rel_qy,rel_qz,rel_wx,rel_wy,rel_wz,"
+                << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz\n";
         }
 
         initialized_ = all_solves_log_.is_open() &&
@@ -206,17 +209,45 @@ public:
         all_solves_log_.flush();
     }
 
-    void logActualState(const Eigen::VectorXd& state, int solve_num) {
+    void logActualState(const Eigen::VectorXd& state,
+                        int solve_num,
+                        const Eigen::Vector3d& target_pos = Eigen::Vector3d::Zero(),
+                        const Eigen::Vector3d& target_vel = Eigen::Vector3d::Zero(),
+                        const std::string& coord_mode = "absolute") {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!initialized_ || !actual_state_log_.is_open() || state.size() < 13) {
             return;
         }
 
-        actual_state_log_ << std::fixed << std::setprecision(6)
-                          << wallTimeSec() << "," << solve_num;
-        for (int i = 0; i < 13; ++i) {
-            actual_state_log_ << "," << state(i);
+        Eigen::VectorXd x_abs = state;
+        Eigen::VectorXd x_rel = state;
+        if (coord_mode == "relative") {
+            x_abs.segment(0, 3) = state.segment(0, 3) + target_pos;
+            x_abs.segment(3, 3) = state.segment(3, 3) + target_vel;
+            x_rel = state;
+        } else {
+            x_rel.segment(0, 3) = state.segment(0, 3) - target_pos;
+            x_rel.segment(3, 3) = state.segment(3, 3) - target_vel;
         }
+
+        actual_state_log_ << std::fixed << std::setprecision(6)
+                          << wallTimeSec() << "," << solve_num << "," << coord_mode;
+        for (int i = 0; i < 13; ++i) {
+            actual_state_log_ << "," << x_abs(i);
+        }
+        for (int i = 0; i < 13; ++i) {
+            actual_state_log_ << "," << x_abs(i);
+        }
+        for (int i = 0; i < 13; ++i) {
+            actual_state_log_ << "," << x_rel(i);
+        }
+        actual_state_log_ << ","
+                          << target_pos.x() << ","
+                          << target_pos.y() << ","
+                          << target_pos.z() << ","
+                          << target_vel.x() << ","
+                          << target_vel.y() << ","
+                          << target_vel.z();
         actual_state_log_ << "\n";
         actual_state_log_.flush();
     }

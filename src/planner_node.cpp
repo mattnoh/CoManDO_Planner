@@ -44,6 +44,8 @@ public:
         mass_kg_ = runtime_cfg.mass_kg;
         target_odom_topic_ = runtime_cfg.target_odom_topic;
         target_accel_topic_ = runtime_cfg.target_accel_topic;
+        drone_state_is_relative_ = runtime_cfg.drone_state_is_relative;
+        drone_odom_topic_ = runtime_cfg.drone_odom_topic;
         enable_terminal_freeze_ = runtime_cfg.enable_terminal_freeze;
         terminal_freeze_enter_pos_ = runtime_cfg.terminal_freeze_enter_pos;
         terminal_freeze_enter_vel_ = runtime_cfg.terminal_freeze_enter_vel;
@@ -75,7 +77,7 @@ public:
 
         if (platform_ == "crazyflie") {
             platform::crazyflie::setup(
-                this, sensor_cb_group_, drone_name_,
+                this, sensor_cb_group_, drone_name_, drone_odom_topic_,
                 state_monitor_.crazyflieState(), state_monitor_.stateMutex(), cf_handles_);
         } else if (platform_ == "px4") {
             platform::px4::setup(
@@ -116,6 +118,10 @@ public:
         }
         RCLCPP_INFO(this->get_logger(),
             "To run next OCP from another terminal: set ocp/mode/n_replay/target then increment command_seq.");
+        RCLCPP_INFO(this->get_logger(),
+            "Input state mode: %s (drone_odom_topic='%s')",
+            drone_state_is_relative_ ? "relative-pass-through" : "absolute-minus-target",
+            drone_odom_topic_.c_str());
     }
 
 private:
@@ -137,6 +143,48 @@ private:
 
     Eigen::VectorXd getCurrentState() const {
         return state_monitor_.getCurrentState(platform_);
+    }
+
+    Eigen::VectorXd convertStateToAbsoluteFrame(const Eigen::VectorXd& state) const {
+        if (!drone_state_is_relative_ || state.size() < 13) {
+            return state;
+        }
+
+        Eigen::VectorXd x_abs = state;
+        const auto [tgt_pos, tgt_vel] = state_monitor_.getTargetPositionVelocity();
+        x_abs.segment(0, 3) += tgt_pos;
+        x_abs.segment(3, 3) += tgt_vel;
+        return x_abs;
+    }
+
+    std::vector<Eigen::VectorXd> makeTrajectoryForPublishing(const SolverResult& result) const {
+        if (!result.is_relative_plan) {
+            return result.state_trajectory;
+        }
+
+        std::vector<Eigen::VectorXd> traj_abs = result.state_trajectory;
+        for (int i = 0; i < static_cast<int>(traj_abs.size()); ++i) {
+            auto& s = traj_abs[i];
+            if (s.size() < 13) {
+                continue;
+            }
+
+            double t_node = i * ocp_dt_;
+            if (s.size() > 13) {
+                t_node = s(13);
+            }
+
+            const Eigen::Vector3d tgt_p = result.target_snapshot_pos +
+                                          result.target_snapshot_vel * t_node +
+                                          0.5 * result.target_snapshot_acc * t_node * t_node;
+            const Eigen::Vector3d tgt_v = result.target_snapshot_vel +
+                                          result.target_snapshot_acc * t_node;
+
+            s.segment(0, 3) += tgt_p;
+            s.segment(3, 3) += tgt_v;
+        }
+
+        return traj_abs;
     }
 
     void setTerminalTarget(const Eigen::Vector3d& xyz) {
@@ -199,24 +247,26 @@ private:
     }
 
     void publishPausedHoverHoldTick() {
+        const Eigen::VectorXd x_now_abs = convertStateToAbsoluteFrame(getCurrentState());
         hover_controller::doHoverHoldTick(
             is_configured_,
             mass_kg_,
             maintain_hover_hold_,
             hasState(),
-            getCurrentState(),
+            x_now_abs,
             paused_hover_state_,
             [this](const auto& x, const auto& u) { publishCommand(x, u); }
         );
         // Logging is maintained if needed
             // Only log if OCP is active
             if (ocp_active_.load()) {
-                const Eigen::VectorXd x_now = getCurrentState();
+                const Eigen::VectorXd x_now = x_now_abs;
                 Eigen::VectorXd x_hold = (paused_hover_state_.size() >= 13)
                     ? paused_hover_state_
                     : hover_controller::makeHoverState(x_now);
                 Eigen::VectorXd u_hover = hover_controller::makeHoverControl(mass_kg_);
-                logger_.logActualState(x_now, -1);
+                const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
+                logger_.logActualState(x_now, -1, tgt_pos_now, tgt_vel_now, "absolute");
                 logger_.logCommandedState(x_hold, u_hover, -1);
             }
     }
@@ -227,7 +277,7 @@ private:
             is_configured_,
             mass_kg_,
             hasState(),
-            getCurrentState(),
+            convertStateToAbsoluteFrame(getCurrentState()),
             command_paused_,
             maintain_hover_hold_,
             paused_hover_state_,
@@ -385,14 +435,15 @@ private:
 
         Eigen::VectorXd x0 = x0_abs;
         auto desc = OCPRegistry::getDescriptor(ocp_type_);
-        if (desc.transform_state) {
+        const bool apply_registry_transform = (desc.transform_state != nullptr) && !drone_state_is_relative_;
+        if (apply_registry_transform) {
             x0 = desc.transform_state(x0_abs, target_snapshot);
         }
 
-        const double pos_err = (desc.transform_state != nullptr)
+        const double pos_err = apply_registry_transform
             ? x0.segment(0, 3).norm()
             : (x0_abs.segment(0, 3) - terminal_position_abs_).norm();
-        const double vel_err = (desc.transform_state != nullptr)
+        const double vel_err = apply_registry_transform
             ? x0.segment(3, 3).norm()
             : x0_abs.segment(3, 3).norm();
 
@@ -474,7 +525,7 @@ private:
 
         is_primed_.store(true);
 
-        publishTrajectory(result.state_trajectory);
+        publishTrajectory(makeTrajectoryForPublishing(result));
 
         if (logging_enabled_ && logging_initialized_) {
             planner_logging::SolveLogMeta meta;
@@ -557,8 +608,9 @@ private:
         publishCommand(x_cmd, u_cmd);
 
         if (logging_enabled_ && logging_initialized_) {
-            const Eigen::VectorXd act = getCurrentState();
-            logger_.logActualState(act, active_solve_num);
+            const Eigen::VectorXd act = convertStateToAbsoluteFrame(getCurrentState());
+            const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
+            logger_.logActualState(act, active_solve_num, tgt_pos_now, tgt_vel_now, "absolute");
             logger_.logCommandedState(x_cmd, u_cmd, active_solve_num);
         }
     }
@@ -599,13 +651,15 @@ private:
             auto desc = OCPRegistry::getDescriptor(ocp_type_);
             std::any extra;
             if (desc.prepare_extra) {
-                if (desc.needs_target_trajectory) {
-                    runtime_cfg_.target_accel_buffer = state_monitor_.getTargetAccelBuffer();
-                }
+                // Make the latest buffer available to OCP-specific prepare_extra
+                // callbacks; they decide whether to use it or fall back.
+                runtime_cfg_.target_accel_buffer = state_monitor_.getTargetAccelBuffer();
                 extra = desc.prepare_extra(runtime_cfg_, t_abs, target_snapshot);
             }
 
-            auto r = alipddp_mpc_->solve(state, target_snapshot.acceleration, extra, t_abs);
+            const Eigen::Vector3d target_accel =
+                target_snapshot.valid ? target_snapshot.acceleration : Eigen::Vector3d::Zero();
+            auto r = alipddp_mpc_->solve(state, target_accel, extra, t_abs);
             
             result.success = r.success;
             result.next_state = r.next_state;
@@ -725,7 +779,7 @@ private:
                 logger_.logSolveTrajectory(ol_ref_X_, ol_ref_U_, meta);
             }
         }
-        publishTrajectory(ol_ref_X_);
+        publishTrajectory(makeTrajectoryForPublishing(result));
 
         ol_replay_step_ = 0;
         ol_replay_start_time_ = Clock::now();
@@ -759,8 +813,9 @@ private:
         publishCommand(x_cmd, u_cmd);
 
         if (logging_enabled_ && logging_initialized_) {
-            Eigen::VectorXd act = getCurrentState();
-            logger_.logActualState(act, 0);
+            Eigen::VectorXd act = convertStateToAbsoluteFrame(getCurrentState());
+            const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
+            logger_.logActualState(act, 0, tgt_pos_now, tgt_vel_now, "absolute");
             logger_.logCommandedState(x_cmd, u_cmd, 0);
         }
 
@@ -768,6 +823,8 @@ private:
     }
 
     std::string ocp_type_, platform_, solver_type_, mode_, drone_name_;
+    bool drone_state_is_relative_ = false;
+    std::string drone_odom_topic_;
     std::string target_odom_topic_ = "/target/odom";
     std::string target_accel_topic_ = "/target/accel";
 

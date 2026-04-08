@@ -147,24 +147,29 @@ def _fig(suptitle, figsize=(16, 10)):
 #  Data loading & preprocessing
 # ═══════════════════════════════════════════════════════════════════════════════
 
+STATE_COLS = [
+    "x", "y", "z", "vx", "vy", "vz",
+    "qw", "qx", "qy", "qz", "wx", "wy", "wz",
+]
+CONTROL_COLS = ["fz", "mx", "my", "mz"]
+TARGET_COLS = ["tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz"]
+STREAM_COLS = STATE_COLS + CONTROL_COLS + ["theta"] + TARGET_COLS
+
 def load_data(data_dir):
     actual = pd.read_csv(os.path.join(data_dir, "actual_state.csv"))
     solves = pd.read_csv(os.path.join(data_dir, "all_solves.csv"))
-    return actual, solves
+    cmd_path = os.path.join(data_dir, "commanded_state.csv")
+    commanded = pd.read_csv(cmd_path) if os.path.exists(cmd_path) else None
+    return actual, solves, commanded
 
 
-def compute_commanded_states(actual_df, solves_df):
+def compute_solve_aligned_states(actual_df, solves_df):
     """
     For each row in actual_df (with a given solve_num), pull the corresponding
     planned node from all_solves.csv.  Node counter advances independently for
     each solve, so solve transitions always restart at node 0.
     """
-    state_cols = ["x", "y", "z", "vx", "vy", "vz",
-                  "qw", "qx", "qy", "qz", "wx", "wy", "wz",
-                  "fz", "mx", "my", "mz", "theta",
-                  "tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz"]
-
-    # all_solves.csv uses abs_ and rel_ prefixes for state, but not for controls
+    # all_solves.csv uses abs_ and rel_ prefixes for state, but not for controls.
     _abs = {"x": "abs_x", "y": "abs_y", "z": "abs_z",
             "vx": "abs_vx", "vy": "abs_vy", "vz": "abs_vz",
             "qw": "abs_qw", "qx": "abs_qx", "qy": "abs_qy", "qz": "abs_qz",
@@ -185,8 +190,8 @@ def compute_commanded_states(actual_df, solves_df):
     solve_groups = {int(sn): grp.sort_values("node").reset_index(drop=True)
                     for sn, grp in solves_df.groupby("solve_num")}
 
-    nan_row_abs = {c: np.nan for c in state_cols}
-    nan_row_rel = {c: np.nan for c in state_cols}
+    nan_row_abs = {c: np.nan for c in STREAM_COLS}
+    nan_row_rel = {c: np.nan for c in STREAM_COLS}
     node_idx = {}
     cmd_rows_abs = []
     cmd_rows_rel = []
@@ -202,11 +207,77 @@ def compute_commanded_states(actual_df, solves_df):
         grp  = solve_groups[sn]
         nidx = min(node_idx[sn], len(grp) - 1)
         r    = grp.iloc[nidx]
-        cmd_rows_abs.append({c: r[_abs[c]] if _abs[c] in r.index else np.nan for c in state_cols})
-        cmd_rows_rel.append({c: r[_rel[c]] if _rel[c] in r.index else np.nan for c in state_cols})
+        cmd_rows_abs.append({c: r[_abs[c]] if _abs[c] in r.index else np.nan for c in STREAM_COLS})
+        cmd_rows_rel.append({c: r[_rel[c]] if _rel[c] in r.index else np.nan for c in STREAM_COLS})
         node_idx[sn] += 1
 
     return pd.DataFrame(cmd_rows_abs), pd.DataFrame(cmd_rows_rel)
+
+
+def align_published_command(actual_df, commanded_df):
+    if commanded_df is None:
+        return None
+    req_cols = ["timestamp"] + STATE_COLS + CONTROL_COLS
+    if any(col not in commanded_df.columns for col in req_cols):
+        return None
+
+    left = actual_df[["timestamp"]].copy().sort_values("timestamp").reset_index()
+    right = commanded_df[req_cols].copy().sort_values("timestamp")
+    merged = pd.merge_asof(left, right, on="timestamp", direction="nearest")
+    merged = merged.set_index("index").sort_index()
+    return merged[STATE_COLS + CONTROL_COLS]
+
+
+def infer_actual_frame(actual_df, solve_abs_df, solve_rel_df, target_df, aligned_cmd=None):
+    if "coord_mode" in actual_df.columns:
+        modes = actual_df["coord_mode"].dropna().astype(str).str.lower().unique().tolist()
+        modes = [m for m in modes if m in ("absolute", "relative")]
+        if len(modes) == 1:
+            return modes[0], f"explicit coord_mode={modes[0]}"
+
+    has_abs_cols = all(f"abs_{c}" in actual_df.columns for c in STATE_COLS)
+    has_rel_cols = all(f"rel_{c}" in actual_df.columns for c in STATE_COLS)
+    if has_abs_cols and has_rel_cols:
+        return "absolute", "explicit abs_*/rel_* columns present"
+
+    if aligned_cmd is not None:
+        raw_xyz = actual_df[["x", "y", "z"]].to_numpy(dtype=float)
+        cmd_xyz = aligned_cmd[["x", "y", "z"]].to_numpy(dtype=float)
+        tgt_xyz = target_df[["tgt_x", "tgt_y", "tgt_z"]].to_numpy(dtype=float)
+        valid = np.isfinite(raw_xyz).all(axis=1) & np.isfinite(cmd_xyz).all(axis=1) & np.isfinite(tgt_xyz).all(axis=1)
+        if np.any(valid):
+            mae_abs = float(np.mean(np.linalg.norm(raw_xyz[valid] - cmd_xyz[valid], axis=1)))
+            mae_rel = float(np.mean(np.linalg.norm((raw_xyz[valid] + tgt_xyz[valid]) - cmd_xyz[valid], axis=1)))
+            inferred = "relative" if mae_rel < 0.8 * mae_abs else "absolute"
+            reason = f"inferred from published command proximity (mae_abs={mae_abs:.3f}, mae_rel={mae_rel:.3f})"
+            return inferred, reason
+
+    raw_xyz = actual_df[["x", "y", "z"]].to_numpy(dtype=float)
+    abs_xyz = solve_abs_df[["x", "y", "z"]].to_numpy(dtype=float)
+    rel_xyz = solve_rel_df[["x", "y", "z"]].to_numpy(dtype=float)
+    valid = np.isfinite(raw_xyz).all(axis=1) & np.isfinite(abs_xyz).all(axis=1) & np.isfinite(rel_xyz).all(axis=1)
+    if not np.any(valid):
+        return "absolute", "fallback (insufficient overlap for frame inference)"
+
+    mae_abs = float(np.mean(np.linalg.norm(raw_xyz[valid] - abs_xyz[valid], axis=1)))
+    mae_rel = float(np.mean(np.linalg.norm(raw_xyz[valid] - rel_xyz[valid], axis=1)))
+    inferred = "relative" if mae_rel < 0.7 * mae_abs else "absolute"
+    reason = f"inferred from solve-node proximity (mae_abs={mae_abs:.3f}, mae_rel={mae_rel:.3f})"
+    return inferred, reason
+
+
+def normalize_actual_absolute(actual_df, frame_mode, target_df):
+    has_abs_cols = all(f"abs_{c}" in actual_df.columns for c in STATE_COLS)
+    if has_abs_cols:
+        actual_abs = actual_df[[f"abs_{c}" for c in STATE_COLS]].copy()
+        actual_abs.columns = STATE_COLS
+        return actual_abs
+
+    actual_abs = actual_df[STATE_COLS].copy()
+    if frame_mode == "relative":
+        actual_abs[["x", "y", "z"]] = actual_abs[["x", "y", "z"]].to_numpy(dtype=float) + target_df[["tgt_x", "tgt_y", "tgt_z"]].to_numpy(dtype=float)
+        actual_abs[["vx", "vy", "vz"]] = actual_abs[["vx", "vy", "vz"]].to_numpy(dtype=float) + target_df[["tgt_vx", "tgt_vy", "tgt_vz"]].to_numpy(dtype=float)
+    return actual_abs
 
 
 def get_first_solve_traj(solves_df):
@@ -227,7 +298,7 @@ def find_solve_update_indices(actual_df):
 #  Page 1 – 3-D trajectory (4 views)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str):
+def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str, command_label):
     dpos  = actual_df[["x","y","z"]].values
     quats = actual_df[["qw","qx","qy","qz"]].values
     time_actual = actual_df["timestamp"].values
@@ -387,8 +458,8 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
                 handles = [
                     Line2D([0],[0], color=C_ACTUAL, lw=2.2,           label="Actual path"),
                     Line2D([0],[0], color="#d12be6", lw=2.5,         label="Target"),
-                    Line2D([0],[0], color=C_CMD,    lw=1.5, ls="--",  label="Commanded"),
-                    Line2D([0],[0], color=C_FIRST,  lw=1.4, ls=":",   label="First plan"),
+                    Line2D([0],[0], color=C_CMD,    lw=1.5, ls="--",  label=command_label),
+                    Line2D([0],[0], color=C_FIRST,  lw=1.4, ls=":",   label="Planned solve nodes"),
                     Line2D([0],[0], color=CONE_COL, lw=1.2,           label="Glideslope"),
                 ]
                 _legend(ax, handles, loc="upper right", fontsize=9)
@@ -402,7 +473,8 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _state_page(time, actual_vals, cmd_vals, first_time, first_vals,
-                labels, units, page_title, fig_title):
+                labels, units, page_title, fig_title,
+                command_label="published command", first_label="planned solve nodes"):
     """
     Generic state-plot page.
 
@@ -443,9 +515,9 @@ def _state_page(time, actual_vals, cmd_vals, first_time, first_vals,
 
         handles += [
             Line2D([0],[0], color=col, lw=2.2, ls="-",  label=f"{lbl}  actual"),
-            Line2D([0],[0], color=col, lw=1.8, ls="--", label=f"{lbl}  commanded"),
+             Line2D([0],[0], color=col, lw=1.8, ls="--", label=f"{lbl}  {command_label}"),
             Line2D([0],[0], color=col, lw=1.5, ls=":",
-                   alpha=0.55,                           label=f"{lbl}  first solve"),
+                 alpha=0.55,                           label=f"{lbl}  {first_label}"),
         ]
 
     _legend(ax, handles, loc="best", ncol=max(1, n_comp))
@@ -639,9 +711,35 @@ def build_plots(data_dir, out_path=None, elev=22):
     global ELEV_VIEW
     ELEV_VIEW = elev
 
-    actual_df, solves_df = load_data(data_dir)
-    cmd_df_abs, cmd_df_rel = compute_commanded_states(actual_df, solves_df)
-    first_traj           = get_first_solve_traj(solves_df)
+    actual_raw_df, solves_df, commanded_df = load_data(data_dir)
+    solve_df_abs, solve_df_rel = compute_solve_aligned_states(actual_raw_df, solves_df)
+    first_traj = get_first_solve_traj(solves_df)
+
+    target_df = solve_df_abs[TARGET_COLS].copy().fillna(method="bfill").fillna(method="ffill")
+    aligned_cmd = align_published_command(actual_raw_df, commanded_df)
+
+    frame_mode, frame_reason = infer_actual_frame(actual_raw_df, solve_df_abs, solve_df_rel, target_df, aligned_cmd)
+    actual_abs_state = normalize_actual_absolute(actual_raw_df, frame_mode, target_df)
+    actual_df = actual_raw_df.copy()
+    for col in STATE_COLS:
+        actual_df[col] = actual_abs_state[col].values
+
+    if aligned_cmd is None:
+        cmd_df_abs = solve_df_abs[STREAM_COLS].copy()
+        cmd_df_rel = solve_df_rel[STREAM_COLS].copy()
+        command_label = "reconstructed command"
+        print("  Warning: commanded_state.csv missing/incompatible; using reconstructed command from all_solves.csv")
+    else:
+        cmd_df_abs = solve_df_abs[STREAM_COLS].copy()
+        cmd_df_abs[STATE_COLS + CONTROL_COLS] = aligned_cmd[STATE_COLS + CONTROL_COLS].to_numpy()
+        cmd_df_rel = cmd_df_abs.copy()
+        cmd_df_rel[["x", "y", "z"]] = cmd_df_abs[["x", "y", "z"]].to_numpy(dtype=float) - target_df[["tgt_x", "tgt_y", "tgt_z"]].to_numpy(dtype=float)
+        cmd_df_rel[["vx", "vy", "vz"]] = cmd_df_abs[["vx", "vy", "vz"]].to_numpy(dtype=float) - target_df[["tgt_vx", "tgt_vy", "tgt_vz"]].to_numpy(dtype=float)
+        command_label = "published command"
+
+    print(f"  Actual frame mode: {frame_mode} ({frame_reason})")
+    if frame_mode == "relative":
+        print("  Applied relative->absolute conversion for actual_state.csv using target snapshots from all_solves.csv")
 
     title_str = os.path.basename(os.path.normpath(data_dir))
 
@@ -677,7 +775,7 @@ def build_plots(data_dir, out_path=None, elev=22):
 
         # ── Page 1 : 3-D views ─────────────────────────────────────────────────
         print("  [1/10] 3-D views (Abs/Rel) …")
-        fig1 = page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str)
+        fig1 = page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str, command_label)
         pdf.savefig(fig1, facecolor=FIG_BG); plt.close(fig1)
 
         # ── Page 2 : Position (Absolute) ──────────────────────────────────────
@@ -687,7 +785,8 @@ def build_plots(data_dir, out_path=None, elev=22):
             first_t, first_pos_abs,
             labels=["x", "y", "z"], units="m",
             page_title=f"{title_str}  —  Position (Absolute)",
-            fig_title="Absolute Position  [x, y, z]")
+            fig_title="Absolute Position  [x, y, z]",
+            command_label=command_label)
         pdf.savefig(fig2, facecolor=FIG_BG); plt.close(fig2)
 
         # ── Page 3 : Velocity (Absolute) ──────────────────────────────────────
@@ -697,7 +796,8 @@ def build_plots(data_dir, out_path=None, elev=22):
             first_t, first_vel_abs,
             labels=["vx", "vy", "vz"], units="m/s",
             page_title=f"{title_str}  —  Velocity (Absolute)",
-            fig_title="Absolute Velocity  [vx, vy, vz]")
+            fig_title="Absolute Velocity  [vx, vy, vz]",
+            command_label=command_label)
         # Reference vz_ref
         for ax in fig3.get_axes():
             if ax.get_title().startswith("Absolute Velocity"):
@@ -712,7 +812,8 @@ def build_plots(data_dir, out_path=None, elev=22):
             first_t, first_quat_abs,
             labels=["qw", "qx", "qy", "qz"], units="–",
             page_title=f"{title_str}  —  Quaternion",
-            fig_title="Attitude quaternion  [qw, qx, qy, qz]")
+            fig_title="Attitude quaternion  [qw, qx, qy, qz]",
+            command_label=command_label)
         pdf.savefig(fig4, facecolor=FIG_BG); plt.close(fig4)
 
         # ── Page 5 : Angular velocity ─────────────────────────────────────────
@@ -722,7 +823,8 @@ def build_plots(data_dir, out_path=None, elev=22):
             first_t, first_angv_abs,
             labels=["wx", "wy", "wz"], units="rad/s",
             page_title=f"{title_str}  —  Angular Velocity",
-            fig_title="Angular velocity  [wx, wy, wz]")
+            fig_title="Angular velocity  [wx, wy, wz]",
+            command_label=command_label)
         pdf.savefig(fig5, facecolor=FIG_BG); plt.close(fig5)
 
         # ── Page 6 : Relative Position & Velocity ─────────────────────────────
@@ -773,7 +875,7 @@ def build_plots(data_dir, out_path=None, elev=22):
             time, actual_pos, cmd_pos_abs,
             labels=["x", "y", "z"], units="m",
             page_title=f"{title_str}  —  Position Tracking Error",
-            fig_title="Position error  (actual − commanded)")
+            fig_title=f"Position error  (actual − {command_label})")
         pdf.savefig(fig8, facecolor=FIG_BG); plt.close(fig8)
 
         # ── Page 9 : Velocity error ───────────────────────────────────────────
@@ -782,7 +884,7 @@ def build_plots(data_dir, out_path=None, elev=22):
             time, actual_vel, cmd_vel_abs,
             labels=["vx", "vy", "vz"], units="m/s",
             page_title=f"{title_str}  —  Velocity Tracking Error",
-            fig_title="Velocity error  (actual − commanded)")
+            fig_title=f"Velocity error  (actual − {command_label})")
         pdf.savefig(fig9, facecolor=FIG_BG); plt.close(fig9)
 
         # ── Page 10 : Solver Stats ───────────────────────────────────────────
@@ -822,7 +924,7 @@ if __name__ == "__main__":
                         help="3-D view elevation angle [deg] (default: 22)")
     args = parser.parse_args()
 
-    actual_df, solves_df = load_data(args.dir)
+    actual_df, solves_df, _ = load_data(args.dir)
     print(f"  Actual states  : {len(actual_df)} rows")
     print(f"  Unique solves  : {solves_df['solve_num'].nunique()}")
 

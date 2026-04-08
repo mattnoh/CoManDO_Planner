@@ -144,27 +144,58 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             OCPDescriptor::WarmStart::Feedback,
             false, // needs_target_trajectory
             [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
-                Eigen::VectorXd xr = Eigen::VectorXd::Zero(13);
-                xr.segment(0, 3) = x.segment(0, 3) - t.position;
-                xr.segment(3, 3) = x.segment(3, 3) - t.velocity;
-                xr.segment(6, 7) = x.segment(6, 7);
-                return xr;
+                if (t.valid) {
+                    Eigen::VectorXd xr = x;
+                    xr.segment(0, 3) -= t.position;
+                    xr.segment(3, 3) -= t.velocity;
+                    return xr;
+                }
+                return x;
             },
-            [](const TargetSnapshot& t, const rclcpp::Time& /*now*/, double /*age*/) {
-                return t.valid; // state_monitor already handles freshness checks
-            },
+            nullptr, // validate_target
             [](SolverResult& r, const TargetSnapshot& t) {
-                r.is_relative_plan = true;
-                r.target_snapshot_pos = t.position;
-                r.target_snapshot_vel = t.velocity;
-                r.target_snapshot_acc = t.acceleration;
+                r.is_relative_plan = t.valid;
+                if (t.valid) {
+                    r.target_snapshot_pos = t.position;
+                    r.target_snapshot_vel = t.velocity;
+                    r.target_snapshot_acc = t.acceleration;
+                } else {
+                    r.target_snapshot_pos.setZero();
+                    r.target_snapshot_vel.setZero();
+                    r.target_snapshot_acc.setZero();
+                }
             },
-            nullptr, // prepare_extra
+            [](const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& /*tgt_snap*/) {
+                StateswitchOCP::StateswitchExtra ex;
+                ex.t0_abs = t_abs;
+
+                if (cfg.target_accel_buffer.has_value() && !cfg.target_accel_buffer->accels.empty()) {
+                    ex.buf = cfg.target_accel_buffer.value();
+                } else {
+                    target_models::CircularTarget circ;
+                    circ.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
+                    circ.R = cfg.circle_R;
+                    circ.omega = cfg.circle_omega;
+                    circ.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
+
+                    const double buf_dur = StateswitchOCP::HORIZON * StateswitchOCP::THH + 1.0;
+                    ex.buf.populateFromModel(circ, t_abs, buf_dur, 0.05);
+                }
+
+                return std::any(ex);
+            },
             nullptr, // prepare_log_meta
             StateswitchOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
+                StateswitchOCP::StateswitchExtra ex;
+                if (a.extra.has_value()) {
+                    try {
+                        ex = std::any_cast<StateswitchOCP::StateswitchExtra>(a.extra);
+                    } catch (const std::bad_any_cast&) {}
+                }
                 return StateswitchOCP::create(a.current_state, a.terminal_state,
-                                              a.prev_U, a.prev_X, a.target_accel, a.prev_K);
+                                              a.prev_U, a.prev_X, a.target_accel, a.prev_K,
+                                              ex.buf, ex.t0_abs);
             }
         }},
         {"tracking_circle", {
@@ -174,7 +205,15 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             TrackingCircleOCP::MASS,
             OCPDescriptor::WarmStart::Shift,
             false, // needs_target_trajectory
-            nullptr, // transform_state
+            [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
+                if (t.valid) {
+                    Eigen::VectorXd xr = x;
+                    xr.segment(0, 3) -= t.position;
+                    xr.segment(3, 3) -= t.velocity;
+                    return xr;
+                }
+                return x;
+            },
             nullptr, // validate_target
             [](SolverResult& r, const TargetSnapshot& /*t*/) {
                 if (r.extra.has_value()) {
@@ -189,13 +228,19 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                     }
                 }
             },
-            [](const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& /*tgt_snap*/) {
+            [](const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& tgt_snap) {
                 // Return ct so create() can use it AND post_process_result can use it.
                 TrackingCircleOCP::TrackingCircleExtra ex;
-                ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
-                ex.tgt.R = cfg.circle_R;
-                ex.tgt.omega = cfg.circle_omega;
-                ex.tgt.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
+                ex.tgt.center.setZero();
+                ex.tgt.R = 0.0;
+                ex.tgt.omega = 0.0;
+                ex.tgt.phi0 = 0.0;
+                if (tgt_snap.valid) {
+                    ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
+                    ex.tgt.R = cfg.circle_R;
+                    ex.tgt.omega = cfg.circle_omega;
+                    ex.tgt.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
+                }
                 ex.t_abs = t_abs;
                 return std::any(ex); 
             },
@@ -227,7 +272,15 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             TrackingCircleTargetOCP::MASS,
             OCPDescriptor::WarmStart::Shift,
             true, // needs_target_trajectory
-            nullptr, // transform_state
+            [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
+                if (t.valid) {
+                    Eigen::VectorXd xr = x;
+                    xr.segment(0, 3) -= t.position;
+                    xr.segment(3, 3) -= t.velocity;
+                    return xr;
+                }
+                return x;
+            },
             nullptr, // validate_target
             [](SolverResult& r, const TargetSnapshot& /*t*/) {
                 if (r.extra.has_value()) {
@@ -243,16 +296,17 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             },
             [](const PlannerRuntimeConfig& cfg, double t_abs, const TargetSnapshot& tgt_snap) {
                 TrackingCircleTargetOCP::TrackingCircleTargetExtra ex;
-                ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
-                ex.tgt.R = cfg.circle_R;
-                ex.tgt.omega = cfg.circle_omega;
-                
+                ex.tgt.center.setZero();
+                ex.tgt.R = 0.0;
+                ex.tgt.omega = 0.0;
+                ex.tgt.phi0 = 0.0;
                 if (tgt_snap.valid) {
+                    ex.tgt.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
+                    ex.tgt.R = cfg.circle_R;
+                    ex.tgt.omega = cfg.circle_omega;
                     double ph = std::atan2(tgt_snap.position.y() - ex.tgt.center.y(), 
                                            tgt_snap.position.x() - ex.tgt.center.x());
                     ex.tgt.phi0 = ph - ex.tgt.omega * t_abs;
-                } else {
-                    ex.tgt.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
                 }
                 ex.t_abs = t_abs;
                 

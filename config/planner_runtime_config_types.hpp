@@ -26,6 +26,12 @@ struct PlannerRuntimeConfig {
 
     int n_replay = 0;
 
+    // If true, current_state is already relative and registry must not subtract target.
+    bool drone_state_is_relative = false;
+    // Optional override topic carrying full drone odometry (pose+twist) for planner state input.
+    // Example for direct relative-state testing: /drone/relative_odometry
+    std::string drone_odom_topic = "";
+
     std::string target_odom_topic = "/target/odom";
     std::string target_accel_topic = "/target/accel";
 

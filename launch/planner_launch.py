@@ -21,6 +21,9 @@ def generate_launch_description():
         DeclareLaunchArgument('solver', default_value='alipddp'),
         DeclareLaunchArgument('enable_logging', default_value='true'),
 
+        DeclareLaunchArgument('drone_state_is_relative', default_value='false'),
+        DeclareLaunchArgument('drone_odom_topic', default_value=''),
+
         DeclareLaunchArgument('target_odom_topic', default_value='/target/odom'),
         DeclareLaunchArgument('target_accel_topic', default_value='/target/accel'),
 
@@ -41,6 +44,9 @@ def generate_launch_description():
             'platform': LaunchConfiguration('platform'),
             'solver': LaunchConfiguration('solver'),
             'enable_logging': LaunchConfiguration('enable_logging'),
+
+            'drone_state_is_relative': LaunchConfiguration('drone_state_is_relative'),
+            'drone_odom_topic': LaunchConfiguration('drone_odom_topic'),
 
             'target_odom_topic': LaunchConfiguration('target_odom_topic'),
             'target_accel_topic': LaunchConfiguration('target_accel_topic'),

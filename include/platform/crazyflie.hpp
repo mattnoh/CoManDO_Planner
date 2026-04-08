@@ -105,6 +105,7 @@ inline void setup(
     rclcpp::Node* node,
     rclcpp::CallbackGroup::SharedPtr callback_group,
     const std::string& drone_name,
+    const std::string& odom_topic_override,
     State& state,
     std::mutex& state_mutex,
     Handles& handles)
@@ -116,41 +117,71 @@ inline void setup(
     rclcpp::SubscriptionOptions opts;
     opts.callback_group = callback_group;
 
-    // Pose callback - updates position and quaternion
-    handles.pose_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
-        "/" + drone_name + "/pose", 10,
-        [&](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
-            std::lock_guard<std::mutex> lk(state_mutex);
-            state.current(0) = msg->pose.position.x;
-            state.current(1) = msg->pose.position.y;
-            state.current(2) = msg->pose.position.z;
-            state.current(6) = msg->pose.orientation.w;
-            state.current(7) = msg->pose.orientation.x;
-            state.current(8) = msg->pose.orientation.y;
-            state.current(9) = msg->pose.orientation.z;
-            state.pose_received = true;
-        },
-        opts);
+    if (!odom_topic_override.empty()) {
+        // External full-state odometry source (e.g., already-relative odometry).
+        handles.odom_sub = node->create_subscription<nav_msgs::msg::Odometry>(
+            odom_topic_override, 10,
+            [&](const nav_msgs::msg::Odometry::SharedPtr msg) {
+                std::lock_guard<std::mutex> lk(state_mutex);
+                state.current(0) = msg->pose.pose.position.x;
+                state.current(1) = msg->pose.pose.position.y;
+                state.current(2) = msg->pose.pose.position.z;
+                state.current(3) = msg->twist.twist.linear.x;
+                state.current(4) = msg->twist.twist.linear.y;
+                state.current(5) = msg->twist.twist.linear.z;
+                state.current(6) = msg->pose.pose.orientation.w;
+                state.current(7) = msg->pose.pose.orientation.x;
+                state.current(8) = msg->pose.pose.orientation.y;
+                state.current(9) = msg->pose.pose.orientation.z;
+                // Keep legacy conversion for compatibility with existing pipelines.
+                state.current(10) = msg->twist.twist.angular.x * DEG2RAD;
+                state.current(11) = msg->twist.twist.angular.y * DEG2RAD;
+                state.current(12) = msg->twist.twist.angular.z * DEG2RAD;
+                state.pose_received = true;
+                state.odom_received = true;
+            },
+            opts);
 
-    // Odometry callback - updates linear/angular velocity
-    // NOTE: crazyswarm2 publishes angular velocity in deg/s, convert to rad/s
-    handles.odom_sub = node->create_subscription<nav_msgs::msg::Odometry>(
-        "/" + drone_name + "/odom", 10,
-        [&](const nav_msgs::msg::Odometry::SharedPtr msg) {
-            std::lock_guard<std::mutex> lk(state_mutex);
-            state.current(3) = msg->twist.twist.linear.x;
-            state.current(4) = msg->twist.twist.linear.y;
-            state.current(5) = msg->twist.twist.linear.z;
-            state.current(10) = msg->twist.twist.angular.x * DEG2RAD;
-            state.current(11) = msg->twist.twist.angular.y * DEG2RAD;
-            state.current(12) = msg->twist.twist.angular.z * DEG2RAD;
-            state.odom_received = true;
-        },
-        opts);
+        RCLCPP_INFO(node->get_logger(),
+            "[Crazyflie] Subscribed state: %s | Publishing: /%s/cmd_full_state",
+            odom_topic_override.c_str(), drone_name.c_str());
+    } else {
+        // Pose callback - updates position and quaternion
+        handles.pose_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/" + drone_name + "/pose", 10,
+            [&](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+                std::lock_guard<std::mutex> lk(state_mutex);
+                state.current(0) = msg->pose.position.x;
+                state.current(1) = msg->pose.position.y;
+                state.current(2) = msg->pose.position.z;
+                state.current(6) = msg->pose.orientation.w;
+                state.current(7) = msg->pose.orientation.x;
+                state.current(8) = msg->pose.orientation.y;
+                state.current(9) = msg->pose.orientation.z;
+                state.pose_received = true;
+            },
+            opts);
 
-    RCLCPP_INFO(node->get_logger(),
-        "[Crazyflie] Subscribed: /%s/pose, /%s/odom | Publishing: /%s/cmd_full_state",
-        drone_name.c_str(), drone_name.c_str(), drone_name.c_str());
+        // Odometry callback - updates linear/angular velocity
+        // NOTE: crazyswarm2 publishes angular velocity in deg/s, convert to rad/s
+        handles.odom_sub = node->create_subscription<nav_msgs::msg::Odometry>(
+            "/" + drone_name + "/odom", 10,
+            [&](const nav_msgs::msg::Odometry::SharedPtr msg) {
+                std::lock_guard<std::mutex> lk(state_mutex);
+                state.current(3) = msg->twist.twist.linear.x;
+                state.current(4) = msg->twist.twist.linear.y;
+                state.current(5) = msg->twist.twist.linear.z;
+                state.current(10) = msg->twist.twist.angular.x * DEG2RAD;
+                state.current(11) = msg->twist.twist.angular.y * DEG2RAD;
+                state.current(12) = msg->twist.twist.angular.z * DEG2RAD;
+                state.odom_received = true;
+            },
+            opts);
+
+        RCLCPP_INFO(node->get_logger(),
+            "[Crazyflie] Subscribed: /%s/pose, /%s/odom | Publishing: /%s/cmd_full_state",
+            drone_name.c_str(), drone_name.c_str(), drone_name.c_str());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

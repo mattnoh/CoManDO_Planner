@@ -51,11 +51,6 @@ public:
     /// @brief Get live target snapshot if the OCP requires it.
     TargetSnapshot getTargetSnapshot(bool needs_target, const rclcpp::Time& now) const {
         TargetSnapshot s;
-        if (!needs_target) {
-            s.valid = true;
-            return s;
-        }
-
         std::lock_guard<std::mutex> lk(target_mutex_);
         s.position = target_state_.position;
         s.velocity = target_state_.velocity;
@@ -63,6 +58,11 @@ public:
         s.odom_timestamp = target_state_.odom_timestamp;
         s.accel_timestamp = target_state_.accel_timestamp;
         s.valid = target_state_.isFresh(now, target_state_max_age_sec_);
+
+        if (!needs_target) {
+            // Optional target: expose best-effort snapshot, but do not gate planner loop.
+            return s;
+        }
         return s;
     }
 

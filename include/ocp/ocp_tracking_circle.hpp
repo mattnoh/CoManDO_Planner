@@ -386,7 +386,7 @@ inline Param getSolverParams() {
 
 // ── Factory function ──────────────────────────────────────────────────────────
 inline std::shared_ptr<OptimalControlProblem<double>> create(
-    const Eigen::VectorXd& x0_abs,
+    const Eigen::VectorXd& x0_rel,
     const target_models::CircularTarget& circ,
     double t0_abs,
     double th_init = TH_INIT,
@@ -425,11 +425,6 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     }
     problem->setTerminalCost(tcost);
     problem->addTerminalConstraint(cterm);
-
-    Eigen::VectorXd x0_rel(NX);
-    x0_rel.head(3) = x0_abs.head(3) - circ.pos(t0_abs);
-    x0_rel.segment(3,3) = x0_abs.segment(3,3) - circ.vel(t0_abs);
-    x0_rel.segment(6,7) = x0_abs.segment(6,7);
 
     Eigen::VectorXd x0ss(NX_SS);
     x0ss.segment(0,NX) = x0_rel;
