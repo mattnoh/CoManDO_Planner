@@ -1,9 +1,9 @@
 /// @file target_publisher.cpp
-/// @brief Standalone ROS2 node that publishes the target 
+/// @brief Standalone ROS2 benchmark target publisher.
 ///
 /// Publishes on:
 ///   /target/odom   (nav_msgs/msg/Odometry)   — position + velocity
-///   /target/accel  (geometry_msgs/msg/AccelStamped) — centripetal acceleration
+///   /target/accel  (geometry_msgs/msg/AccelStamped) — live target acceleration
 ///   /target/predicted_accel (trajectory_msgs/msg/MultiDOFJointTrajectory)
 ///       — future acceleration samples used by tracking_circle_target.
 ///
@@ -14,9 +14,11 @@
 ///   command publishing and logging.
 ///
 /// Parameters (all declare_parameter with defaults):
-///   center_x, center_y, center_z  — orbit center [m]   default: 0, 0, 1.5
-///   radius                         — orbit radius [m]   default: 2.0
-///   omega                          — angular speed [rad/s]  default: 0.4
+///   target_mode                    — target motion type: circle | figure8
+///   center_x, center_y, center_z   — motion center [m]
+///   radius                         — circle radius [m] (circle mode)
+///   amp_x, amp_y                   — Gerono figure-8 amplitudes [m] (figure8)
+///   omega                          — angular speed [rad/s]
 ///   phi0                           — initial phase [rad]    default: 0.0
 ///   publish_hz                     — publish rate [Hz]      default: 100.0
 ///   frame_id                       — header frame           default: "world"
@@ -25,9 +27,8 @@
 ///   enable_relative_odom           — publish relative odom  default: true
 ///
 /// Usage:
-///   ros2 run comando_planner circular_target_publisher
-///   ros2 run comando_planner circular_target_publisher --ros-args
-///       -p radius:=3.0 -p omega:=0.5
+///   ros2 run comando_planner target_publisher --ros-args -p target_mode:=circle
+///   ros2 run comando_planner target_publisher --ros-args -p target_mode:=figure8 -p amp_x:=1.2 -p amp_y:=0.8
 ///
 /// Quick check:
 ///   ros2 topic echo /target/odom --once
@@ -42,21 +43,25 @@
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 
 #include "target/circular_target.hpp"
+#include "target/figure8_target.hpp"
 
 #include <cmath>
 #include <chrono>
 #include <mutex>
 
-class CircularTargetPublisher : public rclcpp::Node
+class BenchmarkTargetPublisher : public rclcpp::Node
 {
 public:
-    CircularTargetPublisher() : Node("circular_target_publisher")
+    BenchmarkTargetPublisher() : Node("circular_target_publisher")
     {
         // ── Parameters ──────────────────────────────────────────────────────
+        target_mode_ = declare_parameter<std::string>("target_mode", "circle");
         center_x_   = declare_parameter<double>("center_x",   0.0);
         center_y_   = declare_parameter<double>("center_y",   0.0);
         center_z_   = declare_parameter<double>("center_z",   0.2);
         radius_     = declare_parameter<double>("radius",     1.0);
+        amp_x_      = declare_parameter<double>("amp_x",      1.0);
+        amp_y_      = declare_parameter<double>("amp_y",      1.0);
         omega_      = declare_parameter<double>("omega",      0.4);
         phi0_       = declare_parameter<double>("phi0",       0.0);
         publish_hz_ = declare_parameter<double>("publish_hz", 100.0);
@@ -65,7 +70,13 @@ public:
         relative_odom_topic_ = declare_parameter<std::string>("relative_odom_topic", "/drone/relative_odometry");
         enable_relative_odom_ = declare_parameter<bool>("enable_relative_odom", true);
 
-        // Record wall-clock start so visual phase matches requested phi0 at node startup
+        if (target_mode_ != "circle" && target_mode_ != "figure8") {
+            RCLCPP_WARN(get_logger(),
+                "Unknown target_mode='%s'; falling back to 'circle'", target_mode_.c_str());
+            target_mode_ = "circle";
+        }
+
+        // Record wall-clock start so visual phase matches requested phi0 at node startup.
         phi0_ = phi0_ - omega_ * now().seconds();
 
         // ── Publishers ───────────────────────────────────────────────────────
@@ -91,43 +102,71 @@ public:
         const auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::duration<double>(1.0 / publish_hz_));
         timer_ = create_wall_timer(period_ns,
-            std::bind(&CircularTargetPublisher::timerCallback, this));
+            std::bind(&BenchmarkTargetPublisher::timerCallback, this));
 
         RCLCPP_INFO(get_logger(),
-            "[CircularTarget] center=(%.2f,%.2f,%.2f)  R=%.2f  ω=%.2f rad/s  "
-            "%.0f Hz",
-            center_x_, center_y_, center_z_, radius_, omega_, publish_hz_);
+            "[TargetPublisher] mode=%s center=(%.2f,%.2f,%.2f) R=%.2f Ax=%.2f Ay=%.2f omega=%.2f rad/s %.0f Hz",
+            target_mode_.c_str(),
+            center_x_, center_y_, center_z_, radius_, amp_x_, amp_y_, omega_, publish_hz_);
         if (enable_relative_odom_) {
             RCLCPP_INFO(get_logger(),
-                "[CircularTarget] Relative odom enabled: in=%s out=%s",
+                "[TargetPublisher] Relative odom enabled: in=%s out=%s",
                 drone_odom_topic_.c_str(), relative_odom_topic_.c_str());
         }
     }
 
 private:
+    struct TargetKinematics {
+        Eigen::Vector3d p = Eigen::Vector3d::Zero();
+        Eigen::Vector3d v = Eigen::Vector3d::Zero();
+        Eigen::Vector3d a = Eigen::Vector3d::Zero();
+    };
+
+    TargetKinematics sampleTarget(double t) const {
+        TargetKinematics out;
+
+        if (target_mode_ == "figure8") {
+            target_models::Figure8Target tgt;
+            tgt.center = {center_x_, center_y_, center_z_};
+            tgt.amp_x = amp_x_;
+            tgt.amp_y = amp_y_;
+            tgt.omega = omega_;
+            tgt.phi0 = phi0_;
+            out.p = tgt.pos(t);
+            out.v = tgt.vel(t);
+            out.a = tgt.accel(t);
+            return out;
+        }
+
+        target_models::CircularTarget tgt;
+        tgt.center = {center_x_, center_y_, center_z_};
+        tgt.R = radius_;
+        tgt.omega = omega_;
+        tgt.phi0 = phi0_;
+        out.p = tgt.pos(t);
+        out.v = tgt.vel(t);
+        out.a = tgt.accel(t);
+        return out;
+    }
+
     void timerCallback()
     {
         const rclcpp::Time stamp = now();
         const double t = stamp.seconds();
 
         // ── Kinematics ───────────────────────────────────────────────────────
-        target_models::CircularTarget tgt;
-        tgt.center = {center_x_, center_y_, center_z_};
-        tgt.R = radius_;
-        tgt.omega = omega_;
-        tgt.phi0 = phi0_;
+        const TargetKinematics k = sampleTarget(t);
+        const auto px = k.p.x();
+        const auto py = k.p.y();
+        const auto pz = k.p.z();
 
-        const auto px = tgt.pos(t).x();
-        const auto py = tgt.pos(t).y();
-        const auto pz = tgt.pos(t).z();
+        const auto vx = k.v.x();
+        const auto vy = k.v.y();
+        const auto vz = k.v.z();
 
-        const auto vx = tgt.vel(t).x();
-        const auto vy = tgt.vel(t).y();
-        const auto vz = tgt.vel(t).z();
-
-        const auto ax = tgt.accel(t).x();
-        const auto ay = tgt.accel(t).y();
-        const auto az = tgt.accel(t).z();
+        const auto ax = k.a.x();
+        const auto ay = k.a.y();
+        const auto az = k.a.z();
 
         // ── Odometry message ─────────────────────────────────────────────────
         nav_msgs::msg::Odometry odom;
@@ -158,7 +197,7 @@ private:
         accel.accel.linear.x = ax;
         accel.accel.linear.y = ay;
         accel.accel.linear.z = az;
-        // Angular acceleration is zero for a flat circular orbit
+        // Angular acceleration is unused for this planar benchmark target.
         accel.accel.angular.x = 0.0;
         accel.accel.angular.y = 0.0;
         accel.accel.angular.z = 0.0;
@@ -181,8 +220,9 @@ private:
                 : stamp;
             const double td = dstamp.seconds();
 
-            const auto p_tgt = tgt.pos(td);
-            const auto v_tgt = tgt.vel(td);
+            const TargetKinematics kd = sampleTarget(td);
+            const auto p_tgt = kd.p;
+            const auto v_tgt = kd.v;
 
             nav_msgs::msg::Odometry rel = drone_odom_copy;
             rel.header.stamp = dstamp;
@@ -218,14 +258,12 @@ maybe_publish_traj:
                 pt.time_from_start = rclcpp::Duration::from_seconds(i * dt);
 
                 double point_t = t + i * dt;
-                auto p = tgt.pos(point_t);
-                auto v = tgt.vel(point_t);
-                auto a = tgt.accel(point_t);
+                TargetKinematics kp = sampleTarget(point_t);
 
                 geometry_msgs::msg::Transform trans;
-                trans.translation.x = p.x();
-                trans.translation.y = p.y();
-                trans.translation.z = p.z();
+                trans.translation.x = kp.p.x();
+                trans.translation.y = kp.p.y();
+                trans.translation.z = kp.p.z();
                 trans.rotation.w = 1.0;
                 trans.rotation.x = 0.0;
                 trans.rotation.y = 0.0;
@@ -233,15 +271,15 @@ maybe_publish_traj:
                 pt.transforms.push_back(trans);
 
                 geometry_msgs::msg::Twist vel;
-                vel.linear.x = v.x();
-                vel.linear.y = v.y();
-                vel.linear.z = v.z();
+                vel.linear.x = kp.v.x();
+                vel.linear.y = kp.v.y();
+                vel.linear.z = kp.v.z();
                 pt.velocities.push_back(vel);
 
                 geometry_msgs::msg::Twist acc;
-                acc.linear.x = a.x();
-                acc.linear.y = a.y();
-                acc.linear.z = a.z();
+                acc.linear.x = kp.a.x();
+                acc.linear.y = kp.a.y();
+                acc.linear.z = kp.a.z();
                 pt.accelerations.push_back(acc);
 
                 traj.points.push_back(pt);
@@ -254,15 +292,16 @@ maybe_publish_traj:
         if (t - last_diag >= 5.0) {
             last_diag = t;
             RCLCPP_DEBUG(get_logger(),
-                "[CircularTarget] t=%.2f  pos=(%.3f,%.3f,%.3f)  "
+                "[TargetPublisher] mode=%s t=%.2f pos=(%.3f,%.3f,%.3f) "
                 "vel=(%.3f,%.3f)  accel=(%.3f,%.3f)",
-                t, px, py, pz, vx, vy, ax, ay);
+                target_mode_.c_str(), t, px, py, pz, vx, vy, ax, ay);
         }
     }
 
     // ── Parameters ─────────────────────────────────────────────────────────
+    std::string target_mode_;
     double center_x_, center_y_, center_z_;
-    double radius_, omega_, phi0_, publish_hz_;
+    double radius_, amp_x_, amp_y_, omega_, phi0_, publish_hz_;
     std::string frame_id_;
     std::string drone_odom_topic_;
     std::string relative_odom_topic_;
@@ -284,7 +323,7 @@ maybe_publish_traj:
 int main(int argc, char* argv[])
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<CircularTargetPublisher>());
+    rclcpp::spin(std::make_shared<BenchmarkTargetPublisher>());
     rclcpp::shutdown();
     return 0;
 }
