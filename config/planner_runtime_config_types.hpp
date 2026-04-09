@@ -7,7 +7,7 @@
 
 struct PlannerRuntimeConfig {
     std::string ocp_type = "";
-    std::string drone_name = "cf_1";
+    std::string drone_name = "gogogo";
     bool enable_logging = true;
     std::string platform = "crazyflie";
     std::string solver = "alipddp";

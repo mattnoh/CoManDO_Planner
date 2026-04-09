@@ -22,6 +22,7 @@ find_package(Eigen3 REQUIRED)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../ALIPDDP-main ${CMAKE_CURRENT_BINARY_DIR}/alipddp)
 
 # ── Optional: PX4 messages ────────────────────────────────────────────────────
+find_package(mocap4r2_msgs REQUIRED)
 find_package(px4_msgs QUIET)
 if(px4_msgs_FOUND)
   message(STATUS "px4_msgs FOUND — PX4 platform support enabled")
@@ -77,7 +78,7 @@ configure_target(comando_planner)
 # ── Executable 3: target_publisher
 add_executable(target_publisher src/target_publisher.cpp)
 configure_target(target_publisher)
-ament_target_dependencies(target_publisher rclcpp nav_msgs geometry_msgs trajectory_msgs)
+ament_target_dependencies(target_publisher rclcpp nav_msgs geometry_msgs trajectory_msgs mocap4r2_msgs)
 
 
 

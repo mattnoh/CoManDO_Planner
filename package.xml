@@ -16,6 +16,8 @@
   <depend>tf2_ros</depend>
   <!-- Crazyflie interface messages -->
   <depend>crazyflie_interfaces</depend>
+  <!-- mocap4ros2 rigid body messages -->
+  <depend>mocap4r2_msgs</depend>
   <!-- PX4 interface messages (optional — build proceeds without it) -->
   <exec_depend>px4_msgs</exec_depend>
   <!-- Eigen for linear algebra -->
