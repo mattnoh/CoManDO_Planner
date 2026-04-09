@@ -16,7 +16,7 @@ def generate_launch_description():
     """
 
     args = [
-        DeclareLaunchArgument('drone_name', default_value='cf_1'),
+        DeclareLaunchArgument('drone_name', default_value='gogogo'),
         DeclareLaunchArgument('platform', default_value='crazyflie'),
         DeclareLaunchArgument('solver', default_value='alipddp'),
         DeclareLaunchArgument('enable_logging', default_value='true'),
