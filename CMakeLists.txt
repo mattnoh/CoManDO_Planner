@@ -93,12 +93,26 @@ configure_target(comando_planner)
 add_executable(target_publisher src/target_publisher.cpp)
 configure_target(target_publisher)
 
+# ── Standalone ROS-free validation target ────────────────────────────────────
+add_executable(test_poly_ocp
+  test/test_poly_ocp_standalone.cpp
+)
+target_include_directories(test_poly_ocp PRIVATE
+  ${EIGEN3_INCLUDE_DIR}
+  include
+  config
+)
+target_link_libraries(test_poly_ocp
+  alipddp_library
+)
+
 
 
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner
     target_publisher
+    test_poly_ocp
   DESTINATION lib/${PROJECT_NAME}
 )
 

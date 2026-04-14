@@ -1,5 +1,5 @@
-#include "quadrotor_mpc.hpp"
-#include "ocp_registry.hpp"
+#include "core/quadrotor_mpc.hpp"
+#include "core/ocp_registry.hpp"
 
 #include <algorithm>
 #include <iostream>

@@ -6,12 +6,12 @@
 #include <nav_msgs/msg/path.hpp>
 #include <Eigen/Dense>
 
-#include "quadrotor_mpc.hpp"
-#include "ocp_registry.hpp"
+#include "core/quadrotor_mpc.hpp"
+#include "core/ocp_registry.hpp"
 #include "platform/crazyflie.hpp"
 #include "platform/px4.hpp"
 #include "platform/target_tracker.hpp"
-#include "state_monitor.hpp"
+#include "core/state_monitor.hpp"
 #include "trajectory_replayer.hpp"
 #include "planner_runtime_config.hpp"
 #include "planner_logging.hpp"
@@ -140,8 +140,9 @@ private:
         if (!desc.validate_target) {
             return true;
         }
+        const double now_sec = this->now().seconds();
         TargetSnapshot snapshot = state_monitor_.getTargetSnapshot(true, this->now());
-        return desc.validate_target(snapshot, this->now(), 0.2);
+        return desc.validate_target(snapshot, now_sec, 0.2);
     }
 
     TargetSnapshot getTargetSnapshot() const {
@@ -153,7 +154,7 @@ private:
     bool isTargetValidForDescriptor(const OCPDescriptor& desc,
                                     const TargetSnapshot& snapshot) const {
         if (desc.validate_target) {
-            return desc.validate_target(snapshot, this->now(), 0.2);
+            return desc.validate_target(snapshot, this->now().seconds(), 0.2);
         }
         return snapshot.valid;
     }
@@ -821,7 +822,7 @@ private:
                 // Make the latest buffer available to OCP-specific prepare_extra
                 // callbacks; they decide whether to use it or fall back.
                 runtime_cfg_.target_accel_buffer = state_monitor_.getTargetAccelBuffer();
-                extra = desc.prepare_extra(runtime_cfg_, t_abs, target_snapshot);
+                extra = desc.prepare_extra(toPlannerConfig(runtime_cfg_), t_abs, target_snapshot);
             }
 
             const Eigen::Vector3d target_accel =
