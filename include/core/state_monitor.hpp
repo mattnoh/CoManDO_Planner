@@ -17,6 +17,14 @@
 
 class StateMonitor {
 public:
+    struct StateDebugSnapshot {
+        bool has_state = false;
+        bool cf_pose_received = false;
+        bool cf_odom_received = false;
+        bool px4_pose_received = false;
+        bool px4_odom_received = false;
+    };
+
     explicit StateMonitor(double target_state_max_age_sec = 0.2)
         : target_state_max_age_sec_(target_state_max_age_sec) {
         fallback_state_ = Eigen::VectorXd::Zero(13);
@@ -37,6 +45,22 @@ public:
             return px4_state_.hasFullState();
         }
         return false;
+    }
+
+    StateDebugSnapshot getStateDebugSnapshot(const std::string& platform) const {
+        std::lock_guard<std::mutex> lk(state_mutex_);
+        StateDebugSnapshot snap;
+        snap.cf_pose_received = cf_state_.pose_received;
+        snap.cf_odom_received = cf_state_.odom_received;
+        snap.px4_pose_received = px4_state_.hasFullState();
+        snap.px4_odom_received = px4_state_.hasFullState();
+
+        if (platform == "crazyflie") {
+            snap.has_state = cf_state_.hasFullState();
+        } else if (platform == "px4") {
+            snap.has_state = px4_state_.hasFullState();
+        }
+        return snap;
     }
 
     /// @brief Check if target state is fresh if the OCP requires it.

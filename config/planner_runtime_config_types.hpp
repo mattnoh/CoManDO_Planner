@@ -49,6 +49,11 @@ struct PlannerRuntimeConfig {
 
     double ocp_dt = 0.0;
     double mass_kg = 0.0;
+    double hover_thrust_u16 = 45916.0; // CrazySim: F=(pwm/65535)*0.3949N, hover=0.0282*9.81N → pwm≈45916
+    std::string legacy_thrust_model = "linear";
+    double legacy_thrust_calib_a0 = 0.0;
+    double legacy_thrust_calib_a1 = 0.0;
+    double legacy_thrust_calib_a2 = 0.0;
 
     double t_start_abs = 0.0;
     std::optional<target_models::TargetAccelBuffer> target_accel_buffer;
@@ -91,6 +96,11 @@ inline PlannerConfig toPlannerConfig(const PlannerRuntimeConfig& cfg) {
     out.ocp_dt = cfg.ocp_dt;
     out.dt = cfg.ocp_dt;
     out.mass_kg = cfg.mass_kg;
+    out.hover_thrust_u16 = cfg.hover_thrust_u16;
+    out.legacy_thrust_model = cfg.legacy_thrust_model;
+    out.legacy_thrust_calib_a0 = cfg.legacy_thrust_calib_a0;
+    out.legacy_thrust_calib_a1 = cfg.legacy_thrust_calib_a1;
+    out.legacy_thrust_calib_a2 = cfg.legacy_thrust_calib_a2;
     out.t_start_abs = cfg.t_start_abs;
     out.target_accel_buffer = cfg.target_accel_buffer;
     return out;

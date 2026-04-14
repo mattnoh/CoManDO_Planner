@@ -43,6 +43,12 @@ public:
         mode_ = runtime_cfg.mode;
         n_replay_ = runtime_cfg.n_replay;
         mass_kg_ = runtime_cfg.mass_kg;
+        hover_thrust_u16_ = runtime_cfg.hover_thrust_u16;
+        legacy_thrust_model_name_ = runtime_cfg.legacy_thrust_model;
+        legacy_thrust_cfg_.calibrated_a0 = runtime_cfg.legacy_thrust_calib_a0;
+        legacy_thrust_cfg_.calibrated_a1 = runtime_cfg.legacy_thrust_calib_a1;
+        legacy_thrust_cfg_.calibrated_a2 = runtime_cfg.legacy_thrust_calib_a2;
+        applyLegacyThrustModel(legacy_thrust_model_name_);
         target_odom_topic_ = runtime_cfg.target_odom_topic;
         target_accel_topic_ = runtime_cfg.target_accel_topic;
         target_predicted_accel_topic_ = runtime_cfg.target_predicted_accel_topic;
@@ -62,6 +68,7 @@ public:
 
         if (runtime_cfg.isConfigured()) {
             ocp_dt_ = runtime_cfg.ocp_dt;
+            command_mode_ = OCPRegistry::getDescriptor(ocp_type_).command_mode;
             setTerminalTarget(hover_target_);
             rebuildMpcSolver();
             is_configured_ = true;
@@ -112,9 +119,15 @@ public:
                 "Ready mode=%s platform=%s solver=%s ocp=%s ocp_dt=%.3fs n_replay=%d paused=%s",
                 mode_.c_str(), platform_.c_str(), solver_type_.c_str(),
                 ocp_type_.c_str(), ocp_dt_, n_replay_, command_paused_.load() ? "true" : "false");
+            if (hover_thrust_u16_ <= 0.0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "hover_thrust_u16<=0; cmd_vel_legacy thrust mapping will clamp to zero until calibrated.");
+            }
             RCLCPP_INFO(this->get_logger(),
-                "Command profile target: [%.3f, %.3f, %.3f] mass=%.4f",
-                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_);
+                "Command profile target: [%.3f, %.3f, %.3f] mass=%.4f hover_thrust_u16=%.1f mode=%s thrust_model=%s",
+                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_, hover_thrust_u16_,
+                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" : "cmd_full_state",
+                platform::crazyflie::legacyThrustModelName(legacy_thrust_cfg_.model));
         } else {
             RCLCPP_WARN(this->get_logger(),
                 "Planner started UNCONFIGURED. Use ocp_launch.py to set ocp_type and mode.");
@@ -125,6 +138,21 @@ public:
             "Input state mode: %s (drone_odom_topic='%s')",
             drone_state_is_relative_ ? "relative-pass-through" : "absolute-minus-target",
             drone_odom_topic_.c_str());
+    }
+
+    void applyLegacyThrustModel(const std::string& model_name) {
+        legacy_thrust_model_name_ = model_name;
+        if (model_name == "linear") {
+            legacy_thrust_cfg_.model = platform::crazyflie::LegacyThrustModel::LinearRatio;
+        } else if (model_name == "calibrated") {
+            legacy_thrust_cfg_.model = platform::crazyflie::LegacyThrustModel::Calibrated;
+        } else {
+            legacy_thrust_cfg_.model = platform::crazyflie::LegacyThrustModel::LinearRatio;
+            legacy_thrust_model_name_ = "linear";
+            RCLCPP_WARN(this->get_logger(),
+                "Invalid legacy_thrust_model='%s'. Falling back to 'linear'.",
+                model_name.c_str());
+        }
     }
 
 private:
@@ -489,6 +517,21 @@ private:
                     return result;
                 }
                 profile_changed = true;
+            } else if (p.get_name() == "hover_thrust_u16") {
+                hover_thrust_u16_ = p.as_double();
+                profile_changed = true;
+            } else if (p.get_name() == "legacy_thrust_model") {
+                applyLegacyThrustModel(p.as_string());
+                profile_changed = true;
+            } else if (p.get_name() == "legacy_thrust_calib_a0") {
+                legacy_thrust_cfg_.calibrated_a0 = p.as_double();
+                profile_changed = true;
+            } else if (p.get_name() == "legacy_thrust_calib_a1") {
+                legacy_thrust_cfg_.calibrated_a1 = p.as_double();
+                profile_changed = true;
+            } else if (p.get_name() == "legacy_thrust_calib_a2") {
+                legacy_thrust_cfg_.calibrated_a2 = p.as_double();
+                profile_changed = true;
             } else if (p.get_name() == "hover_target_x") {
                 new_target.x() = p.as_double();
                 profile_changed = true;
@@ -517,6 +560,7 @@ private:
             if (ocp_type_changed || !is_configured_) {
                 ocp_dt_ = OCPRegistry::getDT(ocp_type_);
                 mass_kg_ = OCPRegistry::getDefaultMassKg(ocp_type_);
+                command_mode_ = OCPRegistry::getDescriptor(ocp_type_).command_mode;
                 if (n_replay_ == 0) {
                     n_replay_ = OCPRegistry::getDefaultNReplay(ocp_type_);
                 }
@@ -537,9 +581,18 @@ private:
             last_command_seq_ = 0;  // Reset so command_seq:=1 always works
 
             RCLCPP_INFO(this->get_logger(),
-                "Updated command profile: ocp=%s mode=%s n_replay=%d target=[%.3f,%.3f,%.3f] mass=%.4f",
+                "Updated command profile: ocp=%s mode=%s n_replay=%d target=[%.3f,%.3f,%.3f] mass=%.4f hover_thrust_u16=%.1f cmd_mode=%s thrust_model=%s calib=[%.3f,%.3f,%.3f]",
                 ocp_type_.c_str(), mode_.c_str(), n_replay_,
-                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_);
+                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_, hover_thrust_u16_,
+                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" : "cmd_full_state",
+                platform::crazyflie::legacyThrustModelName(legacy_thrust_cfg_.model),
+                legacy_thrust_cfg_.calibrated_a0,
+                legacy_thrust_cfg_.calibrated_a1,
+                legacy_thrust_cfg_.calibrated_a2);
+            if (hover_thrust_u16_ <= 0.0) {
+                RCLCPP_WARN(this->get_logger(),
+                    "hover_thrust_u16<=0; cmd_vel_legacy thrust mapping will clamp to zero until calibrated.");
+            }
             RCLCPP_INFO(this->get_logger(),
                 "Profile applied. Set command_seq to start this command.");
         }
@@ -584,8 +637,17 @@ private:
         }
 
         if (!hasState()) {
+            const auto dbg = state_monitor_.getStateDebugSnapshot(platform_);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "Waiting for state...");
+                "Waiting for state... platform=%s has_state=%s cf_pose=%s cf_odom=%s px4_pose=%s px4_odom=%s relative_mode=%s odom_topic='%s'",
+                platform_.c_str(),
+                dbg.has_state ? "true" : "false",
+                dbg.cf_pose_received ? "true" : "false",
+                dbg.cf_odom_received ? "true" : "false",
+                dbg.px4_pose_received ? "true" : "false",
+                dbg.px4_odom_received ? "true" : "false",
+                drone_state_is_relative_ ? "true" : "false",
+                drone_odom_topic_.c_str());
             return;
         }
 
@@ -849,7 +911,15 @@ private:
 
     void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
         if (platform_ == "crazyflie") {
-            platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
+            if (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) {
+                const auto dbg = platform::crazyflie::publishLegacyCommand(
+                    cf_handles_, s, u, mass_kg_, hover_thrust_u16_, legacy_thrust_cfg_);
+                if (logging_enabled_ && logging_initialized_) {
+                    logger_.logLegacyCommand(dbg, hover_thrust_u16_, mass_kg_);
+                }
+            } else {
+                platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
+            }
         } else if (platform_ == "px4") {
             platform::px4::publishCommand(this, px4_handles_, s);
         }
@@ -883,8 +953,17 @@ private:
             return;
         }
         if (!hasState()) {
+            const auto dbg = state_monitor_.getStateDebugSnapshot(platform_);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "[OpenLoop] Waiting for state...");
+                "[OpenLoop] Waiting for state... platform=%s has_state=%s cf_pose=%s cf_odom=%s px4_pose=%s px4_odom=%s relative_mode=%s odom_topic='%s'",
+                platform_.c_str(),
+                dbg.has_state ? "true" : "false",
+                dbg.cf_pose_received ? "true" : "false",
+                dbg.cf_odom_received ? "true" : "false",
+                dbg.px4_pose_received ? "true" : "false",
+                dbg.px4_odom_received ? "true" : "false",
+                drone_state_is_relative_ ? "true" : "false",
+                drone_odom_topic_.c_str());
             return;
         }
 
@@ -1041,8 +1120,12 @@ private:
     double ocp_dt_ = 0.05;
     PlannerRuntimeConfig runtime_cfg_;
     double mass_kg_ = 0.027;
+    double hover_thrust_u16_ = 38000.0;
+    std::string legacy_thrust_model_name_ = "linear";
+    platform::crazyflie::LegacyThrustConfig legacy_thrust_cfg_;
     int n_replay_ = 4;
     double max_constraint_error_ = 1.0;
+    OCPDescriptor::CommandMode command_mode_ = OCPDescriptor::CommandMode::CmdFullState;
 
     Eigen::Vector3d hover_target_ = Eigen::Vector3d::Zero();
     Eigen::VectorXd terminal_state_ = Eigen::VectorXd::Zero(13);

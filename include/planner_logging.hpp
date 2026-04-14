@@ -95,9 +95,16 @@ public:
                 << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz\n";
         }
 
+        legacy_command_log_.open(folder + "/legacy_command.csv");
+        if (legacy_command_log_.is_open()) {
+            legacy_command_log_
+                << "timestamp,fz_cmd_n,thrust_u16,thrust_over_hover,unlock_packet_only,real_command_published,thrust_model,hover_thrust_u16,mass_kg\n";
+        }
+
         initialized_ = all_solves_log_.is_open() &&
                        commanded_state_log_.is_open() &&
-                       actual_state_log_.is_open();
+                       actual_state_log_.is_open() &&
+                       legacy_command_log_.is_open();
         RCLCPP_INFO(ros_logger, "Logging to: %s", folder.c_str());
         return initialized_;
     }
@@ -292,6 +299,28 @@ public:
         commanded_state_log_.flush();
     }
 
+    void logLegacyCommand(const platform::crazyflie::LegacyCommandDebug& debug,
+                          double hover_thrust_u16,
+                          double mass_kg) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!initialized_ || !legacy_command_log_.is_open()) {
+            return;
+        }
+
+        legacy_command_log_ << std::fixed << std::setprecision(6)
+                            << wallTimeSec() << ","
+                            << debug.fz_cmd_newton << ","
+                            << static_cast<double>(debug.thrust_u16) << ","
+                            << debug.thrust_ratio_hover << ","
+                            << (debug.unlock_packet_only ? 1 : 0) << ","
+                            << (debug.real_command_published ? 1 : 0) << ","
+                            << platform::crazyflie::legacyThrustModelName(debug.thrust_model) << ","
+                            << hover_thrust_u16 << ","
+                            << mass_kg
+                            << "\n";
+        legacy_command_log_.flush();
+    }
+
 private:
     static double wallTimeSec() {
         using SteadyClock = std::chrono::steady_clock;
@@ -300,11 +329,12 @@ private:
 
     mutable std::mutex mutex_;
     bool initialized_ = false;
-    double mass_kg_ = 0.027;
+    double mass_kg_ = 0.0282;
     std::string log_folder_;
     std::ofstream all_solves_log_;
     std::ofstream commanded_state_log_;
     std::ofstream actual_state_log_;
+    std::ofstream legacy_command_log_;
 };
 
 }  // namespace planner_logging

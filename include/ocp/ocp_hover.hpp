@@ -12,7 +12,7 @@ namespace HoverOCP {
 // ── Fixed parameters ─────────────────────────────────────────────
 const int HORIZON = 100;
 const double DT = 0.05;
-const double MASS = 0.027;
+const double MASS = 0.0282;
 const int DEFAULT_N_REPLAY = 4;
 const double DEFAULT_MASS_KG = MASS;
 
@@ -246,7 +246,8 @@ public:
 // ─────────────────────────────────────────────────────────────────
 inline std::shared_ptr<OptimalControlProblem<double>> create(
  const Eigen::VectorXd& current_state,
- const Eigen::VectorXd& terminal_state)
+ const Eigen::VectorXd& terminal_state,
+ double fmax = FMAX)
 {
  auto prob = std::make_shared<OptimalControlProblem<double>>(HORIZON);
 
@@ -266,7 +267,7 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
 
  prob->setTerminalCost(std::make_shared<TerminalCost<double>>(terminal_state));
 
- auto mt = std::make_shared<MaxThrustConstraint<double>>(FMAX);
+ auto mt = std::make_shared<MaxThrustConstraint<double>>(fmax);
  for (int i = 0; i < HORIZON; ++i)
  prob->addStageConstraint(i, mt);
 

@@ -7,6 +7,7 @@
 #pragma once
 
 #include "ocp/ocp_hover.hpp"
+#include "ocp/ocp_hover_body.hpp"
 #include "ocp/ocp_landing.hpp"
 #include "ocp/ocp_stateswitch.hpp"
 #include "ocp/ocp_tracking_circle.hpp"
@@ -72,11 +73,17 @@ struct OCPCreateArgs {
 };
 
 struct OCPDescriptor {
+    enum class CommandMode {
+        CmdFullState,
+        CmdVelLegacy,
+    };
+
     std::string name;
     double dt;
     int default_n_replay;
     double default_mass_kg;
     enum class WarmStart { Shift, Feedback } warm_start;
+    CommandMode command_mode = CommandMode::CmdFullState;
     bool needs_target_trajectory = false;
 
     // Callbacks — nullptr = not needed
@@ -109,6 +116,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             HoverOCP::DEFAULT_N_REPLAY,
             HoverOCP::DEFAULT_MASS_KG,
             OCPDescriptor::WarmStart::Shift,
+            OCPDescriptor::CommandMode::CmdFullState,
             false, // needs_target_trajectory
             nullptr, // transform_state
             nullptr, // validate_target
@@ -120,12 +128,31 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                 return HoverOCP::create(a.current_state, a.terminal_state);
             }
         }},
+        {"hover_body", {
+            "hover_body",
+            HoverBodyOCP::DT,
+            HoverBodyOCP::DEFAULT_N_REPLAY,
+            HoverBodyOCP::DEFAULT_MASS_KG,
+            OCPDescriptor::WarmStart::Shift,
+            OCPDescriptor::CommandMode::CmdVelLegacy,
+            false, // needs_target_trajectory
+            nullptr, // transform_state
+            nullptr, // validate_target
+            nullptr, // post_process_result
+            nullptr, // prepare_extra
+            nullptr, // prepare_log_meta
+            HoverBodyOCP::getSolverParams,
+            [](const OCPCreateArgs& a) {
+                return HoverBodyOCP::create(a.current_state, a.terminal_state);
+            }
+        }},
         {"landing", {
             "landing",
             LandingOCP::DT,
             LandingOCP::DEFAULT_N_REPLAY,
             LandingOCP::DEFAULT_MASS_KG,
             OCPDescriptor::WarmStart::Shift,
+            OCPDescriptor::CommandMode::CmdFullState,
             false, // needs_target_trajectory
             nullptr, // transform_state
             nullptr, // validate_target
@@ -143,6 +170,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             StateswitchOCP::DEFAULT_N_REPLAY,
             StateswitchOCP::DEFAULT_MASS_KG,
             OCPDescriptor::WarmStart::Feedback,
+            OCPDescriptor::CommandMode::CmdFullState,
             false, // needs_target_trajectory
             [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
                 if (t.valid) {
@@ -205,6 +233,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             TrackingCircleOCP::DEFAULT_N_REPLAY,
             TrackingCircleOCP::MASS,
             OCPDescriptor::WarmStart::Shift,
+            OCPDescriptor::CommandMode::CmdFullState,
             false, // needs_target_trajectory
             [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
                 if (t.valid) {
@@ -272,6 +301,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             TrackingCircleTargetOCP::DEFAULT_N_REPLAY,
             TrackingCircleTargetOCP::MASS,
             OCPDescriptor::WarmStart::Shift,
+            OCPDescriptor::CommandMode::CmdFullState,
             true, // needs_target_trajectory
             [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
                 Eigen::VectorXd xr = x;
