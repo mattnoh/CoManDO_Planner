@@ -76,6 +76,7 @@ struct OCPDescriptor {
     enum class CommandMode {
         CmdFullState,
         CmdVelLegacy,
+        CmdHover,
     };
 
     std::string name;
@@ -134,7 +135,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             HoverBodyOCP::DEFAULT_N_REPLAY,
             HoverBodyOCP::DEFAULT_MASS_KG,
             OCPDescriptor::WarmStart::Shift,
-            OCPDescriptor::CommandMode::CmdVelLegacy,
+            OCPDescriptor::CommandMode::CmdHover,
             false, // needs_target_trajectory
             nullptr, // transform_state
             nullptr, // validate_target

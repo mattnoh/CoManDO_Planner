@@ -120,7 +120,8 @@ public:
             RCLCPP_INFO(this->get_logger(),
                 "Command profile target: [%.3f, %.3f, %.3f] mass=%.4f mode=%s thrust=crazysim-sysid",
                 hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_,
-                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" : "cmd_full_state");
+                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" :
+                (command_mode_ == OCPDescriptor::CommandMode::CmdHover) ? "cmd_hover" : "cmd_full_state");
         } else {
             RCLCPP_WARN(this->get_logger(),
                 "Planner started UNCONFIGURED. Use ocp_launch.py to set ocp_type and mode.");
@@ -636,7 +637,8 @@ private:
                 "Updated command profile: ocp=%s mode=%s n_replay=%d target=[%.3f,%.3f,%.3f] mass=%.4f cmd_mode=%s thrust=crazysim-sysid",
                 ocp_type_.c_str(), mode_.c_str(), n_replay_,
                 hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_,
-                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" : "cmd_full_state");
+                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" :
+                (command_mode_ == OCPDescriptor::CommandMode::CmdHover) ? "cmd_hover" : "cmd_full_state");
             RCLCPP_INFO(this->get_logger(),
                 "Profile applied. Set command_seq to start this command.");
         }
@@ -965,6 +967,8 @@ private:
                     }
                     logger_.logLegacyCommand(dbg, phase);
                 }
+            } else if (command_mode_ == OCPDescriptor::CommandMode::CmdHover) {
+                platform::crazyflie::publishHoverCommand(cf_handles_, s);
             } else {
                 platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
             }

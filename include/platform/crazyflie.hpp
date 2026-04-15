@@ -24,6 +24,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <crazyflie_interfaces/msg/full_state.hpp>
+#include <crazyflie_interfaces/msg/hover.hpp>
 #include <Eigen/Dense>
 #include <algorithm>
 #include <mutex>
@@ -84,6 +85,7 @@ struct Handles {
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub;
     rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr cmd_pub;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_legacy_pub;
+    rclcpp::Publisher<crazyflie_interfaces::msg::Hover>::SharedPtr cmd_hover_pub;
     bool legacy_thrust_unlocked = false; // firmware thrustLocked starts true; must send thrust=0 first
 
     void reset() {
@@ -91,6 +93,7 @@ struct Handles {
         odom_sub.reset();
         cmd_pub.reset();
         cmd_vel_legacy_pub.reset();
+        cmd_hover_pub.reset();
         legacy_thrust_unlocked = false;
     }
 };
@@ -205,6 +208,8 @@ inline void setup(
         "/" + drone_name + "/cmd_full_state", 10);
     handles.cmd_vel_legacy_pub = node->create_publisher<geometry_msgs::msg::Twist>(
         "/" + drone_name + "/cmd_vel_legacy", 10);
+    handles.cmd_hover_pub = node->create_publisher<crazyflie_interfaces::msg::Hover>(
+        "/" + drone_name + "/cmd_hover", 10);
 
     rclcpp::SubscriptionOptions opts;
     opts.callback_group = callback_group;
@@ -235,8 +240,8 @@ inline void setup(
             opts);
 
         RCLCPP_INFO(node->get_logger(),
-            "[Crazyflie] Subscribed state: %s | Publishing: /%s/cmd_full_state, /%s/cmd_vel_legacy",
-            odom_topic_override.c_str(), drone_name.c_str(), drone_name.c_str());
+            "[Crazyflie] Subscribed state: %s | Publishing: /%s/cmd_full_state, /%s/cmd_vel_legacy, /%s/cmd_hover",
+            odom_topic_override.c_str(), drone_name.c_str(), drone_name.c_str(), drone_name.c_str());
     } else {
         // Pose callback - updates position and quaternion
         handles.pose_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -271,8 +276,8 @@ inline void setup(
             opts);
 
         RCLCPP_INFO(node->get_logger(),
-            "[Crazyflie] Subscribed: /%s/pose, /%s/odom | Publishing: /%s/cmd_full_state, /%s/cmd_vel_legacy",
-            drone_name.c_str(), drone_name.c_str(), drone_name.c_str(), drone_name.c_str());
+            "[Crazyflie] Subscribed: /%s/pose, /%s/odom | Publishing: /%s/cmd_full_state, /%s/cmd_vel_legacy, /%s/cmd_hover",
+            drone_name.c_str(), drone_name.c_str(), drone_name.c_str(), drone_name.c_str(), drone_name.c_str());
     }
 }
 
@@ -365,6 +370,23 @@ inline LegacyCommandDebug publishLegacyCommand(
     handles.cmd_vel_legacy_pub->publish(msg);
     dbg.real_command_published = true;
     return dbg;
+}
+
+inline void publishHoverCommand(
+    Handles& handles,
+    const Eigen::VectorXd& state)
+{
+    if (!handles.cmd_hover_pub || state.size() < 13) {
+        return;
+    }
+
+    crazyflie_interfaces::msg::Hover msg;
+    msg.vx = static_cast<float>(state(3));
+    msg.vy = static_cast<float>(state(4));
+    msg.z_distance = static_cast<float>(state(2));
+    msg.yaw_rate = static_cast<float>(state(12));
+
+    handles.cmd_hover_pub->publish(msg);
 }
 
 } // namespace crazyflie
