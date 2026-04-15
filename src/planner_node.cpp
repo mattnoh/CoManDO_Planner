@@ -24,6 +24,7 @@
 #include <atomic>
 #include <vector>
 #include <algorithm>
+#include <sstream>
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
@@ -43,12 +44,9 @@ public:
         mode_ = runtime_cfg.mode;
         n_replay_ = runtime_cfg.n_replay;
         mass_kg_ = runtime_cfg.mass_kg;
-        hover_thrust_u16_ = runtime_cfg.hover_thrust_u16;
-        legacy_thrust_model_name_ = runtime_cfg.legacy_thrust_model;
-        legacy_thrust_cfg_.calibrated_a0 = runtime_cfg.legacy_thrust_calib_a0;
-        legacy_thrust_cfg_.calibrated_a1 = runtime_cfg.legacy_thrust_calib_a1;
-        legacy_thrust_cfg_.calibrated_a2 = runtime_cfg.legacy_thrust_calib_a2;
-        applyLegacyThrustModel(legacy_thrust_model_name_);
+        open_loop_abort_on_divergence_ = runtime_cfg.open_loop_abort_on_divergence;
+        open_loop_abort_max_z_error_m_ = runtime_cfg.open_loop_abort_max_z_error_m;
+        open_loop_abort_max_vz_error_mps_ = runtime_cfg.open_loop_abort_max_vz_error_mps;
         target_odom_topic_ = runtime_cfg.target_odom_topic;
         target_accel_topic_ = runtime_cfg.target_accel_topic;
         target_predicted_accel_topic_ = runtime_cfg.target_predicted_accel_topic;
@@ -119,15 +117,10 @@ public:
                 "Ready mode=%s platform=%s solver=%s ocp=%s ocp_dt=%.3fs n_replay=%d paused=%s",
                 mode_.c_str(), platform_.c_str(), solver_type_.c_str(),
                 ocp_type_.c_str(), ocp_dt_, n_replay_, command_paused_.load() ? "true" : "false");
-            if (hover_thrust_u16_ <= 0.0) {
-                RCLCPP_WARN(this->get_logger(),
-                    "hover_thrust_u16<=0; cmd_vel_legacy thrust mapping will clamp to zero until calibrated.");
-            }
             RCLCPP_INFO(this->get_logger(),
-                "Command profile target: [%.3f, %.3f, %.3f] mass=%.4f hover_thrust_u16=%.1f mode=%s thrust_model=%s",
-                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_, hover_thrust_u16_,
-                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" : "cmd_full_state",
-                platform::crazyflie::legacyThrustModelName(legacy_thrust_cfg_.model));
+                "Command profile target: [%.3f, %.3f, %.3f] mass=%.4f mode=%s thrust=crazysim-sysid",
+                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_,
+                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" : "cmd_full_state");
         } else {
             RCLCPP_WARN(this->get_logger(),
                 "Planner started UNCONFIGURED. Use ocp_launch.py to set ocp_type and mode.");
@@ -140,22 +133,84 @@ public:
             drone_odom_topic_.c_str());
     }
 
-    void applyLegacyThrustModel(const std::string& model_name) {
-        legacy_thrust_model_name_ = model_name;
-        if (model_name == "linear") {
-            legacy_thrust_cfg_.model = platform::crazyflie::LegacyThrustModel::LinearRatio;
-        } else if (model_name == "calibrated") {
-            legacy_thrust_cfg_.model = platform::crazyflie::LegacyThrustModel::Calibrated;
-        } else {
-            legacy_thrust_cfg_.model = platform::crazyflie::LegacyThrustModel::LinearRatio;
-            legacy_thrust_model_name_ = "linear";
-            RCLCPP_WARN(this->get_logger(),
-                "Invalid legacy_thrust_model='%s'. Falling back to 'linear'.",
-                model_name.c_str());
+private:
+    enum class OpenLoopPhase {
+        Idle,
+        Replay,
+        Hold,
+    };
+
+    static const char* openLoopPhaseName(OpenLoopPhase phase) {
+        switch (phase) {
+            case OpenLoopPhase::Replay: return "replay";
+            case OpenLoopPhase::Hold: return "hold";
+            case OpenLoopPhase::Idle:
+            default:
+                return "idle";
         }
     }
 
-private:
+    void stopReplayTimer() {
+        if (replay_timer_) {
+            replay_timer_->cancel();
+            replay_timer_.reset();
+        }
+    }
+
+    void stopOpenLoopHoldTimer() {
+        if (open_loop_hold_timer_) {
+            open_loop_hold_timer_->cancel();
+            open_loop_hold_timer_.reset();
+        }
+    }
+
+    void setOpenLoopPhase(OpenLoopPhase phase) {
+        open_loop_phase_ = phase;
+    }
+
+    void startOpenLoopHoldTimer() {
+        if (open_loop_hold_timer_) {
+            return;
+        }
+        const int hold_ms = static_cast<int>(std::round(std::max(ocp_dt_, 0.02) * 1000.0));
+        open_loop_hold_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(hold_ms),
+            std::bind(&PlannerNode::openLoopHoldTick, this),
+            replay_cb_group_);
+    }
+
+    std::string currentLegacyCommandPhase() const {
+        if (mode_ == "open_loop") {
+            return std::string(openLoopPhaseName(open_loop_phase_));
+        }
+        return command_paused_.load() ? "hold" : "active";
+    }
+
+    void transitionOpenLoopToHold(const std::string& reason) {
+        stopReplayTimer();
+        command_paused_.store(true);
+        maintain_hover_hold_ = true;
+        setOpenLoopPhase(OpenLoopPhase::Hold);
+        startOpenLoopHoldTimer();
+        RCLCPP_INFO(this->get_logger(),
+            "[OpenLoop] Replay complete (%s). Transitioning to hold phase.",
+            reason.c_str());
+        openLoopHoldTick();
+    }
+
+    void abortOpenLoopReplay(const std::string& reason) {
+        stopReplayTimer();
+        setOpenLoopPhase(OpenLoopPhase::Idle);
+        command_paused_.store(true);
+        maintain_hover_hold_ = false;
+
+        resetForNewCommand();
+        ocp_active_.store(false);
+        RCLCPP_WARN(this->get_logger(),
+            "[OpenLoop] Replay aborted: %s. Replay stopped with no hover fallback command.",
+            reason.c_str());
+    }
+
     bool hasState() const {
         return state_monitor_.hasState(platform_);
     }
@@ -419,6 +474,9 @@ private:
     }
 
     void resetForNewCommand() {
+        stopReplayTimer();
+        stopOpenLoopHoldTimer();
+        setOpenLoopPhase(OpenLoopPhase::Idle);
         trajectory_replayer_.clear();
         is_primed_.store(false);
         terminal_freeze_.store(false);
@@ -517,20 +575,14 @@ private:
                     return result;
                 }
                 profile_changed = true;
-            } else if (p.get_name() == "hover_thrust_u16") {
-                hover_thrust_u16_ = p.as_double();
+            } else if (p.get_name() == "open_loop_abort_on_divergence") {
+                open_loop_abort_on_divergence_ = p.as_bool();
                 profile_changed = true;
-            } else if (p.get_name() == "legacy_thrust_model") {
-                applyLegacyThrustModel(p.as_string());
+            } else if (p.get_name() == "open_loop_abort_max_z_error_m") {
+                open_loop_abort_max_z_error_m_ = p.as_double();
                 profile_changed = true;
-            } else if (p.get_name() == "legacy_thrust_calib_a0") {
-                legacy_thrust_cfg_.calibrated_a0 = p.as_double();
-                profile_changed = true;
-            } else if (p.get_name() == "legacy_thrust_calib_a1") {
-                legacy_thrust_cfg_.calibrated_a1 = p.as_double();
-                profile_changed = true;
-            } else if (p.get_name() == "legacy_thrust_calib_a2") {
-                legacy_thrust_cfg_.calibrated_a2 = p.as_double();
+            } else if (p.get_name() == "open_loop_abort_max_vz_error_mps") {
+                open_loop_abort_max_vz_error_mps_ = p.as_double();
                 profile_changed = true;
             } else if (p.get_name() == "hover_target_x") {
                 new_target.x() = p.as_double();
@@ -581,18 +633,10 @@ private:
             last_command_seq_ = 0;  // Reset so command_seq:=1 always works
 
             RCLCPP_INFO(this->get_logger(),
-                "Updated command profile: ocp=%s mode=%s n_replay=%d target=[%.3f,%.3f,%.3f] mass=%.4f hover_thrust_u16=%.1f cmd_mode=%s thrust_model=%s calib=[%.3f,%.3f,%.3f]",
+                "Updated command profile: ocp=%s mode=%s n_replay=%d target=[%.3f,%.3f,%.3f] mass=%.4f cmd_mode=%s thrust=crazysim-sysid",
                 ocp_type_.c_str(), mode_.c_str(), n_replay_,
-                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_, hover_thrust_u16_,
-                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" : "cmd_full_state",
-                platform::crazyflie::legacyThrustModelName(legacy_thrust_cfg_.model),
-                legacy_thrust_cfg_.calibrated_a0,
-                legacy_thrust_cfg_.calibrated_a1,
-                legacy_thrust_cfg_.calibrated_a2);
-            if (hover_thrust_u16_ <= 0.0) {
-                RCLCPP_WARN(this->get_logger(),
-                    "hover_thrust_u16<=0; cmd_vel_legacy thrust mapping will clamp to zero until calibrated.");
-            }
+                hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_,
+                (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) ? "cmd_vel_legacy" : "cmd_full_state");
             RCLCPP_INFO(this->get_logger(),
                 "Profile applied. Set command_seq to start this command.");
         }
@@ -913,9 +957,13 @@ private:
         if (platform_ == "crazyflie") {
             if (command_mode_ == OCPDescriptor::CommandMode::CmdVelLegacy) {
                 const auto dbg = platform::crazyflie::publishLegacyCommand(
-                    cf_handles_, s, u, mass_kg_, hover_thrust_u16_, legacy_thrust_cfg_);
+                    cf_handles_, s, u);
                 if (logging_enabled_ && logging_initialized_) {
-                    logger_.logLegacyCommand(dbg, hover_thrust_u16_, mass_kg_);
+                    std::string phase = currentLegacyCommandPhase();
+                    if (dbg.unlock_packet_only) {
+                        phase = "unlock";
+                    }
+                    logger_.logLegacyCommand(dbg, phase);
                 }
             } else {
                 platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
@@ -949,7 +997,9 @@ private:
 
     void openLoopStartupCheck() {
         if (command_paused_.load()) {
-            publishPausedHoverHoldTick();
+            if (open_loop_phase_ == OpenLoopPhase::Hold) {
+                publishPausedHoverHoldTick();
+            }
             return;
         }
         if (!hasState()) {
@@ -1064,6 +1114,9 @@ private:
 
         ol_replay_step_ = 0;
         ol_replay_start_time_ = Clock::now();
+        setOpenLoopPhase(OpenLoopPhase::Replay);
+        stopOpenLoopHoldTimer();
+        stopReplayTimer();
         const int period_ms = static_cast<int>(std::round(ocp_dt_ * 1000.0));
         replay_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(period_ms),
@@ -1074,15 +1127,17 @@ private:
     }
 
     void openLoopReplayTick() {
+        if (open_loop_phase_ != OpenLoopPhase::Replay) {
+            return;
+        }
         if (command_paused_.load()) {
-            publishPausedHoverHoldTick();
             return;
         }
 
         const int N = static_cast<int>(ol_ref_X_.size()) - 1;
 
         if (ol_replay_step_ >= N) {
-            holdHoverAndPause("[OpenLoop] Trajectory complete");
+            transitionOpenLoopToHold("nominal horizon end");
             return;
         }
 
@@ -1090,6 +1145,23 @@ private:
         const Eigen::VectorXd& x_cmd = ol_ref_X_[step];
         const Eigen::VectorXd u_cmd = (step < static_cast<int>(ol_ref_U_.size()))
             ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4);
+
+        if (open_loop_abort_on_divergence_ && x_cmd.size() >= 6 && hasState()) {
+            const Eigen::VectorXd x_act = convertStateToAbsoluteFrame(getCurrentState());
+            if (x_act.size() >= 6) {
+                const double z_err = std::abs(x_act(2) - x_cmd(2));
+                const double vz_err = std::abs(x_act(5) - x_cmd(5));
+                if (z_err > open_loop_abort_max_z_error_m_ ||
+                    vz_err > open_loop_abort_max_vz_error_mps_) {
+                    std::ostringstream ss;
+                    ss << "divergence at step=" << step
+                       << " z_err=" << z_err << " (thr=" << open_loop_abort_max_z_error_m_ << ")"
+                       << " vz_err=" << vz_err << " (thr=" << open_loop_abort_max_vz_error_mps_ << ")";
+                    abortOpenLoopReplay(ss.str());
+                    return;
+                }
+            }
+        }
 
         publishCommand(x_cmd, u_cmd);
 
@@ -1101,6 +1173,13 @@ private:
         }
 
         ++ol_replay_step_;
+    }
+
+    void openLoopHoldTick() {
+        if (mode_ != "open_loop" || open_loop_phase_ != OpenLoopPhase::Hold) {
+            return;
+        }
+        publishPausedHoverHoldTick();
     }
 
     std::string ocp_type_, platform_, solver_type_, mode_, drone_name_;
@@ -1120,9 +1199,9 @@ private:
     double ocp_dt_ = 0.05;
     PlannerRuntimeConfig runtime_cfg_;
     double mass_kg_ = 0.027;
-    double hover_thrust_u16_ = 38000.0;
-    std::string legacy_thrust_model_name_ = "linear";
-    platform::crazyflie::LegacyThrustConfig legacy_thrust_cfg_;
+    bool open_loop_abort_on_divergence_ = false;
+    double open_loop_abort_max_z_error_m_ = 0.50;
+    double open_loop_abort_max_vz_error_mps_ = 1.00;
     int n_replay_ = 4;
     double max_constraint_error_ = 1.0;
     OCPDescriptor::CommandMode command_mode_ = OCPDescriptor::CommandMode::CmdFullState;
@@ -1140,6 +1219,7 @@ private:
     rclcpp::TimerBase::SharedPtr mpc_replay_timer_;
     rclcpp::TimerBase::SharedPtr startup_timer_;
     rclcpp::TimerBase::SharedPtr replay_timer_;
+    rclcpp::TimerBase::SharedPtr open_loop_hold_timer_;
 
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
 
@@ -1161,6 +1241,7 @@ private:
     int ol_replay_step_ = 0;
     bool ol_done_logged_ = false;
     Clock::time_point ol_replay_start_time_;
+    OpenLoopPhase open_loop_phase_ = OpenLoopPhase::Idle;
 
     bool logging_initialized_ = false;
     planner_logging::CsvLogger logger_;

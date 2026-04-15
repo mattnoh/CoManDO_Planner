@@ -40,13 +40,11 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     node->declare_parameter("circle_omega", cfg.circle_omega);
     node->declare_parameter("circle_phi0", cfg.circle_phi0);
 
-    // Decides how many NEX setpoints we send each RH. Does not get called for Open Loop
+    // n_replay: how many re-planned setpoints we send per RH step (not used for open-loop).
     node->declare_parameter("n_replay", cfg.n_replay);
-    node->declare_parameter("hover_thrust_u16", cfg.hover_thrust_u16);
-    node->declare_parameter("legacy_thrust_model", cfg.legacy_thrust_model);
-    node->declare_parameter("legacy_thrust_calib_a0", cfg.legacy_thrust_calib_a0);
-    node->declare_parameter("legacy_thrust_calib_a1", cfg.legacy_thrust_calib_a1);
-    node->declare_parameter("legacy_thrust_calib_a2", cfg.legacy_thrust_calib_a2);
+    node->declare_parameter("open_loop_abort_on_divergence", cfg.open_loop_abort_on_divergence);
+    node->declare_parameter("open_loop_abort_max_z_error_m", cfg.open_loop_abort_max_z_error_m);
+    node->declare_parameter("open_loop_abort_max_vz_error_mps", cfg.open_loop_abort_max_vz_error_mps);
 
     node->declare_parameter("drone_state_is_relative", cfg.drone_state_is_relative);
     node->declare_parameter("drone_odom_topic", cfg.drone_odom_topic);
@@ -83,11 +81,9 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     cfg.circle_phi0 = node->get_parameter("circle_phi0").as_double();
 
     cfg.n_replay = node->get_parameter("n_replay").as_int();
-    cfg.hover_thrust_u16 = node->get_parameter("hover_thrust_u16").as_double();
-    cfg.legacy_thrust_model = node->get_parameter("legacy_thrust_model").as_string();
-    cfg.legacy_thrust_calib_a0 = node->get_parameter("legacy_thrust_calib_a0").as_double();
-    cfg.legacy_thrust_calib_a1 = node->get_parameter("legacy_thrust_calib_a1").as_double();
-    cfg.legacy_thrust_calib_a2 = node->get_parameter("legacy_thrust_calib_a2").as_double();
+    cfg.open_loop_abort_on_divergence = node->get_parameter("open_loop_abort_on_divergence").as_bool();
+    cfg.open_loop_abort_max_z_error_m = node->get_parameter("open_loop_abort_max_z_error_m").as_double();
+    cfg.open_loop_abort_max_vz_error_mps = node->get_parameter("open_loop_abort_max_vz_error_mps").as_double();
 
     cfg.drone_state_is_relative = node->get_parameter("drone_state_is_relative").as_bool();
     cfg.drone_odom_topic = node->get_parameter("drone_odom_topic").as_string();

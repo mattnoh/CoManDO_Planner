@@ -98,7 +98,7 @@ public:
         legacy_command_log_.open(folder + "/legacy_command.csv");
         if (legacy_command_log_.is_open()) {
             legacy_command_log_
-                << "timestamp,fz_cmd_n,thrust_u16,thrust_over_hover,unlock_packet_only,real_command_published,thrust_model,hover_thrust_u16,mass_kg\n";
+                << "timestamp,phase,fz_cmd_n,thrust_u16,unlock_packet_only,real_command_published\n";
         }
 
         initialized_ = all_solves_log_.is_open() &&
@@ -300,8 +300,7 @@ public:
     }
 
     void logLegacyCommand(const platform::crazyflie::LegacyCommandDebug& debug,
-                          double hover_thrust_u16,
-                          double mass_kg) {
+                          const std::string& phase) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!initialized_ || !legacy_command_log_.is_open()) {
             return;
@@ -309,14 +308,11 @@ public:
 
         legacy_command_log_ << std::fixed << std::setprecision(6)
                             << wallTimeSec() << ","
+                            << phase << ","
                             << debug.fz_cmd_newton << ","
                             << static_cast<double>(debug.thrust_u16) << ","
-                            << debug.thrust_ratio_hover << ","
                             << (debug.unlock_packet_only ? 1 : 0) << ","
-                            << (debug.real_command_published ? 1 : 0) << ","
-                            << platform::crazyflie::legacyThrustModelName(debug.thrust_model) << ","
-                            << hover_thrust_u16 << ","
-                            << mass_kg
+                            << (debug.real_command_published ? 1 : 0)
                             << "\n";
         legacy_command_log_.flush();
     }

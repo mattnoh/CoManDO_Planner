@@ -33,6 +33,9 @@ def generate_launch_description():
         DeclareLaunchArgument('hover_target_x', default_value='0.0'),
         DeclareLaunchArgument('hover_target_y', default_value='0.0'),
         DeclareLaunchArgument('hover_target_z', default_value='0.0'),
+        DeclareLaunchArgument('open_loop_abort_on_divergence', default_value='false'),
+        DeclareLaunchArgument('open_loop_abort_max_z_error_m', default_value='0.50'),
+        DeclareLaunchArgument('open_loop_abort_max_vz_error_mps', default_value='1.00'),
         DeclareLaunchArgument('command_seq', default_value='1'),
     ]
 
@@ -45,6 +48,9 @@ def generate_launch_description():
         _set_param(node_name, 'hover_target_x', LaunchConfiguration('hover_target_x')),
         _set_param(node_name, 'hover_target_y', LaunchConfiguration('hover_target_y')),
         _set_param(node_name, 'hover_target_z', LaunchConfiguration('hover_target_z')),
+        _set_param(node_name, 'open_loop_abort_on_divergence', LaunchConfiguration('open_loop_abort_on_divergence')),
+        _set_param(node_name, 'open_loop_abort_max_z_error_m', LaunchConfiguration('open_loop_abort_max_z_error_m')),
+        _set_param(node_name, 'open_loop_abort_max_vz_error_mps', LaunchConfiguration('open_loop_abort_max_vz_error_mps')),
     ]
 
     trigger = _set_param(node_name, 'command_seq', LaunchConfiguration('command_seq'))

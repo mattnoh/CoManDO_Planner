@@ -20,6 +20,9 @@ def generate_launch_description():
         DeclareLaunchArgument('platform', default_value='crazyflie'),
         DeclareLaunchArgument('solver', default_value='alipddp'),
         DeclareLaunchArgument('enable_logging', default_value='true'),
+        DeclareLaunchArgument('open_loop_abort_on_divergence', default_value='false'),
+        DeclareLaunchArgument('open_loop_abort_max_z_error_m', default_value='0.50'),
+        DeclareLaunchArgument('open_loop_abort_max_vz_error_mps', default_value='1.00'),
 
         DeclareLaunchArgument('drone_state_is_relative', default_value='false'),
         DeclareLaunchArgument('drone_odom_topic', default_value=''),
@@ -45,6 +48,9 @@ def generate_launch_description():
             'platform': LaunchConfiguration('platform'),
             'solver': LaunchConfiguration('solver'),
             'enable_logging': LaunchConfiguration('enable_logging'),
+            'open_loop_abort_on_divergence': LaunchConfiguration('open_loop_abort_on_divergence'),
+            'open_loop_abort_max_z_error_m': LaunchConfiguration('open_loop_abort_max_z_error_m'),
+            'open_loop_abort_max_vz_error_mps': LaunchConfiguration('open_loop_abort_max_vz_error_mps'),
 
             'drone_state_is_relative': LaunchConfiguration('drone_state_is_relative'),
             'drone_odom_topic': LaunchConfiguration('drone_odom_topic'),

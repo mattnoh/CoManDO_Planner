@@ -15,9 +15,10 @@ const double MASS = HoverOCP::MASS;
 const int DEFAULT_N_REPLAY = HoverOCP::DEFAULT_N_REPLAY;
 const double DEFAULT_MASS_KG = HoverOCP::DEFAULT_MASS_KG;
 
-// cmd_vel_legacy hardware cap: max u16=60000, hover_thrust_u16=45916, OCP mass=0.027 kg
-// fz_max = (60000/45916) * 0.027 * 9.81 = 0.346 N — any higher and firmware clamps.
-const double FMAX = 0.34;
+// cmd_vel_legacy thrust uses the system-id empirical polynomial (crazyflie-system-id).
+// OCP mass = 0.0282 kg. Hover fz = 0.0282*9.81 ≈ 0.277 N → pwm ≈ 32560 u16.
+// Limit FMAX to 0.40 N for headroom (pwm ≈ 42800 u16 < 60000 cap).
+const double FMAX = 0.40;
 
 inline Param getSolverParams() {
     return HoverOCP::getSolverParams();

@@ -95,32 +95,13 @@ struct Handles {
     }
 };
 
-enum class LegacyThrustModel {
-    LinearRatio,
-    Calibrated
-};
-
-struct LegacyThrustConfig {
-    LegacyThrustModel model = LegacyThrustModel::LinearRatio;
-    // Calibrated inverse map: thrust_u16 = a0 + a1 * fz + a2 * fz^2.
-    double calibrated_a0 = 0.0;
-    double calibrated_a1 = 0.0;
-    double calibrated_a2 = 0.0;
-};
-
+// Debug info returned from publishLegacyCommand, used for logging.
 struct LegacyCommandDebug {
     double fz_cmd_newton = 0.0;
     uint16_t thrust_u16 = 0;
-    double thrust_ratio_hover = 0.0;
     bool unlock_packet_only = false;
     bool real_command_published = false;
-    LegacyThrustModel thrust_model = LegacyThrustModel::LinearRatio;
 };
-
-inline const char* legacyThrustModelName(LegacyThrustModel model)
-{
-    return (model == LegacyThrustModel::Calibrated) ? "calibrated" : "linear";
-}
 
 inline Eigen::Vector3d quaternionToRollPitchYaw(const Eigen::Vector4d& q_wxyz)
 {
@@ -160,24 +141,40 @@ inline double bodyRatesToYawRate(const Eigen::Vector3d& omega_body,
     return (q * std::sin(roll) + r * std::cos(roll)) / denom;
 }
 
-inline uint16_t mapThrustNToLegacyU16(double fz_newton,
-                                      double hover_thrust_u16,
-                                      double mass_kg,
-                                      const LegacyThrustConfig& thrust_cfg)
+// Convert body-frame thrust (Newton) to a uint16 PWM value for cmd_vel_legacy.
+//
+// Uses the exact inverse of the CrazySim SITL Gazebo motor chain.
+//
+// The Gazebo forward chain per motor (from CrtpUtils.h + model.sdf):
+//   thrust_desired = (pwm / 65535) * 0.18          [N]
+//   omega          = sqrt(thrust_desired / 2.3375e-8) [rad/s]
+//   force          = 1.28192e-8 * omega^2             [N]
+//
+// Simplifying the chain:
+//   force_per_motor = (1.28192e-8 / 2.3375e-8) * (pwm / 65535) * 0.18
+//                   = kGzK * pwm
+// where kGzK = motorConstant * pwmScale / (pwmCoeff * 65535)
+//
+// Inverting:
+//   pwm = fz_total / (4 * kGzK)
+//
+// Verified hover point: fz_total = 0.0282*9.81 ≈ 0.2766 N → u16 ≈ 45914
+
+// CrazySim SITL Gazebo motor constants (from CrtpUtils.h and model.sdf)
+static constexpr double kGzMotorConstant = 1.28192e-8;  // [N / (rad/s)²]
+static constexpr double kGzPwm2OmegaCoeff = 2.3375e-8;  // [N] (divisor in PWM2OMEGA)
+static constexpr double kGzPwm2OmegaScale = 0.18;       // [N] at pwm=65535 per motor
+static constexpr double kGzPwm2OmegaDead  = 7000.0;     // deadzone below which force=0
+// Composite linear gain: force_per_motor = kGzK * pwm
+static constexpr double kGzK = kGzMotorConstant * kGzPwm2OmegaScale
+                                / (kGzPwm2OmegaCoeff * 65535.0);
+
+inline uint16_t mapThrustNToLegacyU16(double fz_newton)
 {
-    double u16 = 0.0;
-    if (thrust_cfg.model == LegacyThrustModel::Calibrated) {
-        u16 = thrust_cfg.calibrated_a0 +
-              thrust_cfg.calibrated_a1 * fz_newton +
-              thrust_cfg.calibrated_a2 * fz_newton * fz_newton;
-    } else {
-        if (mass_kg <= 1e-6 || hover_thrust_u16 <= 0.0) {
-            return 0;
-        }
-        const double fz_hover = mass_kg * 9.81;
-        u16 = hover_thrust_u16 * (fz_newton / fz_hover);
-    }
-    const double clamped = std::clamp(u16, 0.0, 60000.0);
+    if (fz_newton <= 0.0) return 0;
+    // Invert: pwm = fz_total / (4 * kGzK)
+    const double pwm = fz_newton / (4.0 * kGzK);
+    const double clamped = std::clamp(pwm, 0.0, 60000.0);
     return static_cast<uint16_t>(std::lround(clamped));
 }
 
@@ -327,20 +324,11 @@ inline void publishCommand(
 inline LegacyCommandDebug publishLegacyCommand(
     Handles& handles,
     const Eigen::VectorXd& state,
-    const Eigen::VectorXd& control,
-    double mass,
-    double hover_thrust_u16,
-    const LegacyThrustConfig& thrust_cfg)
+    const Eigen::VectorXd& control)
 {
     LegacyCommandDebug dbg;
-    dbg.thrust_model = thrust_cfg.model;
     dbg.fz_cmd_newton = (control.size() >= 1) ? control(0) : 0.0;
-    dbg.thrust_u16 = mapThrustNToLegacyU16(dbg.fz_cmd_newton, hover_thrust_u16, mass, thrust_cfg);
-    if (hover_thrust_u16 > 0.0) {
-        dbg.thrust_ratio_hover = static_cast<double>(dbg.thrust_u16) / hover_thrust_u16;
-    } else {
-        dbg.thrust_ratio_hover = 0.0;
-    }
+    dbg.thrust_u16 = mapThrustNToLegacyU16(dbg.fz_cmd_newton);
 
     if (!handles.cmd_vel_legacy_pub || state.size() < 13) {
         return dbg;

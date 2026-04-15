@@ -45,11 +45,9 @@ struct PlannerConfig {
     double ocp_dt = 0.0;
     double dt = 0.0;
     double mass_kg = 0.0;
-    double hover_thrust_u16 = 38000.0;
-    std::string legacy_thrust_model = "linear";
-    double legacy_thrust_calib_a0 = 0.0;
-    double legacy_thrust_calib_a1 = 0.0;
-    double legacy_thrust_calib_a2 = 0.0;
+    bool open_loop_abort_on_divergence = false;
+    double open_loop_abort_max_z_error_m = 0.50;
+    double open_loop_abort_max_vz_error_mps = 1.00;
 
     double t_start_abs = 0.0;
     std::optional<target_models::TargetAccelBuffer> target_accel_buffer;
