@@ -411,35 +411,24 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     sim14.segment(0, NX) = x0_body;
     sim14(IDX_DT) = 0.0;
 
-    bool use_feedback = (!prev_U.empty() && !prev_X.empty() && !prev_K.empty()
-        && static_cast<int>(prev_U.size()) >= HORIZON
-        && static_cast<int>(prev_X.size()) > HORIZON
-        && static_cast<int>(prev_K.size()) >= HORIZON);
-
-    if (use_feedback) {
-        for (int k = 0; k < HORIZON; ++k) {
-            if (!valid_control(prev_U[k]) || !valid_state(prev_X[k]) ||
-                !valid_state(prev_X[k + 1]) || !valid_gain(prev_K[k])) {
-                use_feedback = false;
-                break;
-            }
-        }
-    }
+    // K-feedback is intentionally not used: state is body-frame-relative, which
+    // rotates between solves. K*(sim14 - prev_X[k]) subtracts across different
+    // body frames and produces garbage corrections causing wildly different solves.
+    // Use a simple shift warmstart with clamping instead.
+    const bool has_prev_u = (!prev_U.empty()
+        && static_cast<int>(prev_U.size()) >= HORIZON);
 
     for (int k = 0; k < HORIZON; ++k) {
         Eigen::VectorXd u0(NU_SS);
         u0.setZero();
 
-        if (use_feedback) {
-            const Eigen::VectorXd delta = sim14 - prev_X[k];
-            u0 = prev_U[k] + prev_K[k] * delta;
+        if (has_prev_u && valid_control(prev_U[k])) {
+            u0 = prev_U[k];
             u0(0) = std::clamp(u0(0), FMIN, FMAX);
             for (int i = 1; i < 4; ++i) {
                 u0(i) = std::clamp(u0(i), -TAU_MAX, TAU_MAX);
             }
             u0(IDX_THETA) = std::clamp(u0(IDX_THETA), th_min, th_max);
-        } else if (!prev_U.empty() && k < static_cast<int>(prev_U.size()) && valid_control(prev_U[k])) {
-            u0 = prev_U[k];
         } else {
             const Eigen::Vector4d q_ws = sim14.segment(IDX_Q, 4);
             const Eigen::Matrix3d C_ws = Quad6DOFVarTime<double>::calcC(q_ws);

@@ -789,6 +789,13 @@ private:
             return;
         }
 
+        // Gate: only solve after n_replay_ replay ticks have run since the last solve.
+        // Without this gate, back-to-back solves shift the warmstart by n_replay steps
+        // but the drone has barely moved, making the warmstart point to the wrong region.
+        if (is_primed_.load() && replay_ticks_since_solve_.load() < n_replay_) {
+            return;
+        }
+
         if (!hasState()) {
             const auto dbg = state_monitor_.getStateDebugSnapshot(platform_);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -899,6 +906,7 @@ private:
         }
 
         stale_warning_count_ = 0;
+        replay_ticks_since_solve_.store(0);
 
         RCLCPP_INFO(this->get_logger(),
             "[RH %d] %.1fms iters=%d x0=[%.3f,%.3f,%.3f]",
@@ -976,6 +984,8 @@ private:
         if (!replay.has_plan) {
             return;
         }
+
+        replay_ticks_since_solve_.fetch_add(1);
 
         const int active_solve_num = replay.active_solve_num;
         const bool plan_is_relative = replay.plan_is_relative;
@@ -1442,6 +1452,7 @@ private:
 
     bool is_flying_ = false;
     int solve_count_ = 0;
+    std::atomic<int>  replay_ticks_since_solve_{0};
     std::atomic<bool> is_primed_{false};
     std::atomic<bool> terminal_freeze_{false};
     Eigen::Vector3d terminal_position_abs_ = Eigen::Vector3d::Zero();
