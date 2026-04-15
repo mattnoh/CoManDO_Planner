@@ -28,15 +28,12 @@ struct PlannerRuntimeConfig {
 
     int n_replay = 0;
 
-    // If true, current_state is already relative and registry must not subtract target.
-    bool drone_state_is_relative = false;
-    // Optional override topic carrying full drone odometry (pose+twist) for planner state input.
-    // Example for direct relative-state testing: /drone/relative_odometry
-    std::string drone_odom_topic = "";
+    std::string body_relative_odom_topic = "/drone/body_relative_odom";
 
     std::string target_odom_topic = "/target/odom";
     std::string target_accel_topic = "/target/accel";
     std::string target_predicted_accel_topic = "/target/predicted_accel";
+    bool debug_body_relative_trace = false;
 
     bool enable_terminal_freeze = true;
     double terminal_freeze_enter_pos = 0.20;
@@ -79,11 +76,11 @@ inline PlannerConfig toPlannerConfig(const PlannerRuntimeConfig& cfg) {
     out.circle_omega = cfg.circle_omega;
     out.circle_phi0 = cfg.circle_phi0;
     out.n_replay = cfg.n_replay;
-    out.drone_state_is_relative = cfg.drone_state_is_relative;
-    out.drone_odom_topic = cfg.drone_odom_topic;
+    out.body_relative_odom_topic = cfg.body_relative_odom_topic;
     out.target_odom_topic = cfg.target_odom_topic;
     out.target_accel_topic = cfg.target_accel_topic;
     out.target_predicted_accel_topic = cfg.target_predicted_accel_topic;
+    out.debug_body_relative_trace = cfg.debug_body_relative_trace;
     out.enable_terminal_freeze = cfg.enable_terminal_freeze;
     out.terminal_freeze_enter_pos = cfg.terminal_freeze_enter_pos;
     out.terminal_freeze_enter_vel = cfg.terminal_freeze_enter_vel;

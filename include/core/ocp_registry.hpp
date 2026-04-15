@@ -10,6 +10,7 @@
 #include "ocp/ocp_hover_body.hpp"
 #include "ocp/ocp_landing.hpp"
 #include "ocp/ocp_stateswitch.hpp"
+#include "ocp/ocp_tracking_cmdhover.hpp"
 #include "ocp/ocp_tracking_circle.hpp"
 #include "ocp/ocp_tracking_circle_target.hpp"
 
@@ -22,6 +23,7 @@
 #include <map>
 #include <functional>
 #include <any>
+#include <array>
 
 #include "core/planner_config.hpp"
 #include "optimal_control_problem.h"
@@ -75,8 +77,13 @@ struct OCPCreateArgs {
 struct OCPDescriptor {
     enum class CommandMode {
         CmdFullState,
-        CmdVelLegacy,
         CmdHover,
+    };
+
+    enum class DroneOdomMode {
+        AbsoluteWorld,
+        AbsoluteMinusTarget,
+        BodyRelative,
     };
 
     std::string name;
@@ -105,6 +112,14 @@ struct OCPDescriptor {
     std::function<Param()>                   getSolverParams;
     std::function<std::shared_ptr<OptimalControlProblem<double>>(
         const OCPCreateArgs&)>               create;
+
+    DroneOdomMode drone_odom_mode = DroneOdomMode::AbsoluteWorld;
+    bool skip_altitude_validation = false;
+    // extract_hover_cmd: converts OCP body-frame state to cmd_hover fields.
+    // target_z: runtime absolute altitude of the target (e.g. hover_target_.z()).
+    //   Used to compute z_distance = target_z - p_T_body_z = absolute drone altitude.
+    //   Must NOT be a hardcoded constant — the target altitude is runtime-configured.
+    std::function<std::array<float, 4>(const Eigen::VectorXd& x, double target_z)> extract_hover_cmd;
 };
 
 namespace OCPRegistry {
@@ -127,7 +142,10 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             HoverOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return HoverOCP::create(a.current_state, a.terminal_state);
-            }
+            },
+            OCPDescriptor::DroneOdomMode::AbsoluteWorld,
+            false,
+            nullptr
         }},
         {"hover_body", {
             "hover_body",
@@ -145,7 +163,10 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             HoverBodyOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return HoverBodyOCP::create(a.current_state, a.terminal_state);
-            }
+            },
+            OCPDescriptor::DroneOdomMode::AbsoluteWorld,
+            false,
+            nullptr
         }},
         {"landing", {
             "landing",
@@ -163,7 +184,10 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
             LandingOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 return LandingOCP::create(a.current_state, a.terminal_state, a.prev_U, a.prev_X);
-            }
+            },
+            OCPDescriptor::DroneOdomMode::AbsoluteWorld,
+            false,
+            nullptr
         }},
         {"stateswitch", {
             "stateswitch",
@@ -226,7 +250,10 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                 return StateswitchOCP::create(a.current_state, a.terminal_state,
                                               a.prev_U, a.prev_X, a.target_accel, a.prev_K,
                                               ex.buf, ex.t0_abs);
-            }
+            },
+            OCPDescriptor::DroneOdomMode::AbsoluteMinusTarget,
+            false,
+            nullptr
         }},
         {"tracking_circle", {
             "tracking_circle",
@@ -275,16 +302,7 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                 ex.t_abs = t_abs;
                 return std::any(ex); 
             },
-            [](planner_logging::SolveLogMeta& meta, const std::any& extra_params, const std::any& /*runtime_cfg*/) {
-                try {
-                    auto ex = std::any_cast<TrackingCircleOCP::TrackingCircleExtra>(extra_params);
-                    meta.circle_center = ex.tgt.center;
-                    meta.circle_radius = ex.tgt.R;
-                    meta.circle_omega = ex.tgt.omega;
-                    meta.circle_phi0 = ex.tgt.phi0;
-                    meta.circle_t_abs = ex.t_abs;
-                } catch (const std::bad_any_cast&) {}
-            },
+            nullptr, // prepare_log_meta — circle fields removed from SolveLogMeta
             TrackingCircleOCP::getSolverParams,
             [](const OCPCreateArgs& a) {
                 if (a.extra.has_value()) {
@@ -294,7 +312,10 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                    } catch (const std::bad_any_cast&) {}
                 }
                 return TrackingCircleOCP::create(a.current_state, target_models::getDefaultCircularTarget(), a.t_abs);
-            }
+            },
+            OCPDescriptor::DroneOdomMode::AbsoluteMinusTarget,
+            false,
+            nullptr
         }},
         {"tracking_circle_target", {
             "tracking_circle_target",
@@ -354,6 +375,69 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
                     a.current_state,
                     target_models::TargetAccelBuffer{},
                     a.t_abs);
+            },
+            OCPDescriptor::DroneOdomMode::AbsoluteMinusTarget,
+            false,
+            nullptr
+        }},
+        {"tracking_cmdhover", {
+            "tracking_cmdhover",
+            TrackingCmdHoverOCP::TH_INIT,
+            TrackingCmdHoverOCP::DEFAULT_N_REPLAY,
+            TrackingCmdHoverOCP::DEFAULT_MASS_KG,
+            OCPDescriptor::WarmStart::Feedback,
+            OCPDescriptor::CommandMode::CmdHover,
+            false,
+            nullptr,
+            [](const TargetSnapshot& t, double /*now_sec*/, double /*max_age*/) {
+                return t.valid;
+            },
+            nullptr,
+            [](const PlannerConfig& cfg, double t_abs, const TargetSnapshot& tgt_snap) {
+                TrackingCmdHoverOCP::TrackingCmdHoverExtra ex;
+                ex.t_abs = t_abs;
+                ex.target_velocity0 = tgt_snap.valid ? tgt_snap.velocity : Eigen::Vector3d::Zero();
+                if (cfg.target_accel_buffer.has_value()) {
+                    ex.accel_buf = cfg.target_accel_buffer.value();
+                }
+                return std::any(ex);
+            },
+            nullptr,
+            TrackingCmdHoverOCP::getSolverParams,
+            [](const OCPCreateArgs& a) {
+                if (a.extra.has_value()) {
+                    try {
+                        auto ex = std::any_cast<TrackingCmdHoverOCP::TrackingCmdHoverExtra>(a.extra);
+                        return TrackingCmdHoverOCP::create(a.current_state, ex, a.prev_U, a.prev_X, a.prev_K);
+                    } catch (const std::bad_any_cast&) {}
+                }
+                TrackingCmdHoverOCP::TrackingCmdHoverExtra ex;
+                ex.t_abs = a.t_abs;
+                ex.target_velocity0 = Eigen::Vector3d::Zero();
+                return TrackingCmdHoverOCP::create(a.current_state, ex, a.prev_U, a.prev_X, a.prev_K);
+            },
+            OCPDescriptor::DroneOdomMode::BodyRelative,
+            true,
+            [](const Eigen::VectorXd& x, double target_z) -> std::array<float, 4> {
+                if (x.size() < 13) {
+                    return {0.0f, 0.0f, 0.0f, 0.0f};
+                }
+
+                auto clampf = [](float v, float lo, float hi) {
+                    return std::max(lo, std::min(hi, v));
+                };
+
+                const float vx = static_cast<float>(x(TrackingCmdHoverOCP::IDX_VD + 0));
+                const float vy = static_cast<float>(x(TrackingCmdHoverOCP::IDX_VD + 1));
+                const float z_distance = static_cast<float>(target_z - x(TrackingCmdHoverOCP::IDX_P + 2));
+                const float yaw_rate = static_cast<float>(x(TrackingCmdHoverOCP::IDX_OM + 2));
+
+                return {
+                    clampf(vx, -1.0f, 1.0f),
+                    clampf(vy, -1.0f, 1.0f),
+                    clampf(z_distance, 0.1f, 3.0f),
+                    clampf(yaw_rate, -1.0f, 1.0f)
+                };
             }
         }}
     };

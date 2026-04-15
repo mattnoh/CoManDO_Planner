@@ -24,8 +24,7 @@ def generate_launch_description():
         DeclareLaunchArgument('open_loop_abort_max_z_error_m', default_value='0.50'),
         DeclareLaunchArgument('open_loop_abort_max_vz_error_mps', default_value='1.00'),
 
-        DeclareLaunchArgument('drone_state_is_relative', default_value='false'),
-        DeclareLaunchArgument('drone_odom_topic', default_value=''),
+        DeclareLaunchArgument('body_relative_odom_topic', default_value='/drone/body_relative_odom'),
 
         DeclareLaunchArgument('target_odom_topic', default_value='/target/odom'),
         DeclareLaunchArgument('target_accel_topic', default_value='/target/accel'),
@@ -52,8 +51,7 @@ def generate_launch_description():
             'open_loop_abort_max_z_error_m': LaunchConfiguration('open_loop_abort_max_z_error_m'),
             'open_loop_abort_max_vz_error_mps': LaunchConfiguration('open_loop_abort_max_vz_error_mps'),
 
-            'drone_state_is_relative': LaunchConfiguration('drone_state_is_relative'),
-            'drone_odom_topic': LaunchConfiguration('drone_odom_topic'),
+            'body_relative_odom_topic': LaunchConfiguration('body_relative_odom_topic'),
 
             'target_odom_topic': LaunchConfiguration('target_odom_topic'),
             'target_accel_topic': LaunchConfiguration('target_accel_topic'),

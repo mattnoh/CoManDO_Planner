@@ -29,7 +29,7 @@ def generate_launch_description():
         DeclareLaunchArgument('node_name', default_value='/comando_planner'),
         DeclareLaunchArgument('ocp_type', default_value='landing'),
         DeclareLaunchArgument('mode', default_value='mpc'),
-        DeclareLaunchArgument('n_replay', default_value='4'),
+        DeclareLaunchArgument('n_replay', default_value='5'),
         DeclareLaunchArgument('hover_target_x', default_value='0.0'),
         DeclareLaunchArgument('hover_target_y', default_value='0.0'),
         DeclareLaunchArgument('hover_target_z', default_value='0.0'),

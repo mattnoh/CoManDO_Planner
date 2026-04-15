@@ -28,10 +28,12 @@ struct PlannerConfig {
 
     bool drone_state_is_relative = false;
     std::string drone_odom_topic = "";
+    std::string body_relative_odom_topic = "/drone/body_relative_odom";
 
     std::string target_odom_topic = "/target/odom";
     std::string target_accel_topic = "/target/accel";
     std::string target_predicted_accel_topic = "/target/predicted_accel";
+    bool debug_body_relative_trace = false;
 
     bool enable_terminal_freeze = true;
     double terminal_freeze_enter_pos = 0.20;

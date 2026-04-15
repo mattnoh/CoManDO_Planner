@@ -24,21 +24,18 @@ struct SolveLogMeta {
     int solve_iters = 0;
     bool is_relative_plan = false;
     double ocp_dt = 0.05;
-        Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
-        Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
-        Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
+    /// Coordinate frame of the solved trajectory.
+    /// "absolute"          — world-frame absolute coordinates (hover, landing, …)
+    /// "absolute_relative" — world-frame relative to target (stateswitch, tracking_circle*)
+    /// "body_relative"     — body-frame relative to target  (tracking_cmdhover)
+    std::string coord_mode = "absolute";
+    Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
+    Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
+    Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
 
     // Optional node-wise reconstructed target trajectory (world frame).
     std::vector<Eigen::Vector3d> target_world_pos_trajectory;
     std::vector<Eigen::Vector3d> target_world_vel_trajectory;
-    std::string target_motion_source = "snapshot";
-
-    // Tracking circle legacy parameters (kept for compatibility).
-    Eigen::Vector3d circle_center = Eigen::Vector3d::Zero();
-    double circle_radius = 0.0;
-    double circle_omega = 0.0;
-    double circle_phi0 = 0.0;
-    double circle_t_abs = 0.0;
 };
 
 class CsvLogger {
@@ -65,15 +62,14 @@ public:
         std::filesystem::create_directories(folder);
         log_folder_ = folder;
 
-                        all_solves_log_.open(folder + "/all_solves.csv");
-                        if (all_solves_log_.is_open()) {
-        all_solves_log_
-            << "solve_num,solve_time_ms,solve_iters,coord_mode,target_motion_source,node,t,theta,"
-            << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz,"
-            << "circle_center_x,circle_center_y,circle_center_z,circle_radius,circle_omega,circle_phi0,circle_t_abs,"
-            << "abs_x,abs_y,abs_z,abs_vx,abs_vy,abs_vz,abs_qw,abs_qx,abs_qy,abs_qz,abs_wx,abs_wy,abs_wz,"
-            << "fz,mx,my,mz,"
-            << "rel_x,rel_y,rel_z,rel_vx,rel_vy,rel_vz,rel_qw,rel_qx,rel_qy,rel_qz,rel_wx,rel_wy,rel_wz\n";
+        all_solves_log_.open(folder + "/all_solves.csv");
+        if (all_solves_log_.is_open()) {
+            all_solves_log_
+                << "solve_num,solve_time_ms,solve_iters,coord_mode,node,t,theta,"
+                << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz,"
+                << "abs_x,abs_y,abs_z,abs_vx,abs_vy,abs_vz,abs_qw,abs_qx,abs_qy,abs_qz,abs_wx,abs_wy,abs_wz,"
+                << "fz,mx,my,mz,"
+                << "rel_x,rel_y,rel_z,rel_vx,rel_vy,rel_vz,rel_qw,rel_qx,rel_qy,rel_qz,rel_wx,rel_wy,rel_wz\n";
         }
 
         commanded_state_log_.open(folder + "/commanded_state.csv");
@@ -83,6 +79,12 @@ public:
                 << "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
                 << "fz,mx,my,mz,"
                 << "acc_x,acc_y,acc_z\n";
+        }
+
+        commanded_hover_log_.open(folder + "/commanded_hover_state.csv");
+        if (commanded_hover_log_.is_open()) {
+            commanded_hover_log_
+                << "timestamp,solve_num,vx,vy,z_distance,yaw_rate\n";
         }
 
         actual_state_log_.open(folder + "/actual_state.csv");
@@ -95,16 +97,10 @@ public:
                 << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz\n";
         }
 
-        legacy_command_log_.open(folder + "/legacy_command.csv");
-        if (legacy_command_log_.is_open()) {
-            legacy_command_log_
-                << "timestamp,phase,fz_cmd_n,thrust_u16,unlock_packet_only,real_command_published\n";
-        }
-
         initialized_ = all_solves_log_.is_open() &&
                        commanded_state_log_.is_open() &&
-                       actual_state_log_.is_open() &&
-                       legacy_command_log_.is_open();
+                       commanded_hover_log_.is_open() &&
+                       actual_state_log_.is_open();
         RCLCPP_INFO(ros_logger, "Logging to: %s", folder.c_str());
         return initialized_;
     }
@@ -144,25 +140,12 @@ public:
             if (has_reconstructed_target) {
                 tgt_p = meta.target_world_pos_trajectory[i];
                 tgt_v = meta.target_world_vel_trajectory[i];
-            } else if (meta.circle_radius > 1e-6) {
-                double tabs = meta.circle_t_abs + t_node;
-                double phi = meta.circle_omega * tabs + meta.circle_phi0;
-                tgt_p = meta.circle_center + Eigen::Vector3d(
-                    meta.circle_radius * std::cos(phi),
-                    meta.circle_radius * std::sin(phi),
-                    0.0
-                );
-                tgt_v = Eigen::Vector3d(
-                    -meta.circle_radius * meta.circle_omega * std::sin(phi),
-                    meta.circle_radius * meta.circle_omega * std::cos(phi),
-                    0.0
-                );
             } else if (meta.is_relative_plan) {
                 // Propagate target using constant-acceleration assumption matching Quad6DOFVarTimeRelative
-                tgt_p = meta.target_snapshot_pos + 
-                        meta.target_snapshot_vel * t_node + 
+                tgt_p = meta.target_snapshot_pos +
+                        meta.target_snapshot_vel * t_node +
                         0.5 * meta.target_snapshot_acc * t_node * t_node;
-                tgt_v = meta.target_snapshot_vel + 
+                tgt_v = meta.target_snapshot_vel +
                         meta.target_snapshot_acc * t_node;
             }
 
@@ -190,22 +173,14 @@ public:
                             << meta.solve_num << ","
                             << meta.solve_time_ms << ","
                             << meta.solve_iters << ","
-                            << (meta.is_relative_plan ? "relative" : "absolute") << ","
-                            << meta.target_motion_source << ","
+                            << meta.coord_mode << ","
                             << i << "," << t_node << "," << theta << ","
                             << tgt_p.x() << ","
                             << tgt_p.y() << ","
                             << tgt_p.z() << ","
                             << tgt_v.x() << ","
                             << tgt_v.y() << ","
-                            << tgt_v.z() << ","
-                            << meta.circle_center.x() << ","
-                            << meta.circle_center.y() << ","
-                            << meta.circle_center.z() << ","
-                            << meta.circle_radius << ","
-                            << meta.circle_omega << ","
-                            << meta.circle_phi0 << ","
-                            << meta.circle_t_abs;
+                            << tgt_v.z();
 
         for (int j = 0; j < 13; ++j) {
             all_solves_log_ << "," << x_abs(j);
@@ -272,6 +247,19 @@ public:
         actual_state_log_.flush();
     }
 
+    /// Log the hover command fields actually sent to hardware (CmdHover mode only).
+    void logCommandedHoverState(const std::array<float, 4>& cmd, int solve_num) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!initialized_ || !commanded_hover_log_.is_open()) {
+            return;
+        }
+        commanded_hover_log_ << std::fixed << std::setprecision(6)
+                             << wallTimeSec() << "," << solve_num << ","
+                             << cmd[0] << "," << cmd[1] << ","
+                             << cmd[2] << "," << cmd[3] << "\n";
+        commanded_hover_log_.flush();
+    }
+
     void logCommandedState(const Eigen::VectorXd& state, const Eigen::VectorXd& control, int solve_num) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!initialized_ || !commanded_state_log_.is_open() || state.size() < 13) {
@@ -299,24 +287,6 @@ public:
         commanded_state_log_.flush();
     }
 
-    void logLegacyCommand(const platform::crazyflie::LegacyCommandDebug& debug,
-                          const std::string& phase) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (!initialized_ || !legacy_command_log_.is_open()) {
-            return;
-        }
-
-        legacy_command_log_ << std::fixed << std::setprecision(6)
-                            << wallTimeSec() << ","
-                            << phase << ","
-                            << debug.fz_cmd_newton << ","
-                            << static_cast<double>(debug.thrust_u16) << ","
-                            << (debug.unlock_packet_only ? 1 : 0) << ","
-                            << (debug.real_command_published ? 1 : 0)
-                            << "\n";
-        legacy_command_log_.flush();
-    }
-
 private:
     static double wallTimeSec() {
         using SteadyClock = std::chrono::steady_clock;
@@ -329,8 +299,8 @@ private:
     std::string log_folder_;
     std::ofstream all_solves_log_;
     std::ofstream commanded_state_log_;
+    std::ofstream commanded_hover_log_;
     std::ofstream actual_state_log_;
-    std::ofstream legacy_command_log_;
 };
 
 }  // namespace planner_logging

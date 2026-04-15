@@ -5,7 +5,7 @@
 
 #include <string>
 
-#include "ocp_registry.hpp"
+#include "core/ocp_registry.hpp"
 
 #include "planner_runtime_config_types.hpp"
 
@@ -46,13 +46,13 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     node->declare_parameter("open_loop_abort_max_z_error_m", cfg.open_loop_abort_max_z_error_m);
     node->declare_parameter("open_loop_abort_max_vz_error_mps", cfg.open_loop_abort_max_vz_error_mps);
 
-    node->declare_parameter("drone_state_is_relative", cfg.drone_state_is_relative);
-    node->declare_parameter("drone_odom_topic", cfg.drone_odom_topic);
+    node->declare_parameter("body_relative_odom_topic", cfg.body_relative_odom_topic);
 
     // Topics for external target tracking.
     node->declare_parameter("target_odom_topic", cfg.target_odom_topic);
     node->declare_parameter("target_accel_topic", cfg.target_accel_topic);
     node->declare_parameter("target_predicted_accel_topic", cfg.target_predicted_accel_topic);
+    node->declare_parameter("debug_body_relative_trace", cfg.debug_body_relative_trace);
 
     node->declare_parameter("enable_terminal_freeze", cfg.enable_terminal_freeze);
     node->declare_parameter("terminal_freeze_enter_pos", cfg.terminal_freeze_enter_pos);
@@ -85,12 +85,12 @@ inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
     cfg.open_loop_abort_max_z_error_m = node->get_parameter("open_loop_abort_max_z_error_m").as_double();
     cfg.open_loop_abort_max_vz_error_mps = node->get_parameter("open_loop_abort_max_vz_error_mps").as_double();
 
-    cfg.drone_state_is_relative = node->get_parameter("drone_state_is_relative").as_bool();
-    cfg.drone_odom_topic = node->get_parameter("drone_odom_topic").as_string();
+    cfg.body_relative_odom_topic = node->get_parameter("body_relative_odom_topic").as_string();
 
     cfg.target_odom_topic = node->get_parameter("target_odom_topic").as_string();
     cfg.target_accel_topic = node->get_parameter("target_accel_topic").as_string();
     cfg.target_predicted_accel_topic = node->get_parameter("target_predicted_accel_topic").as_string();
+    cfg.debug_body_relative_trace = node->get_parameter("debug_body_relative_trace").as_bool();
 
     cfg.enable_terminal_freeze = node->get_parameter("enable_terminal_freeze").as_bool();
     cfg.terminal_freeze_enter_pos = node->get_parameter("terminal_freeze_enter_pos").as_double();
