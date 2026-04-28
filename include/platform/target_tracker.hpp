@@ -49,6 +49,8 @@ struct TargetState {
     Eigen::Vector3d position     = Eigen::Vector3d::Zero();
     Eigen::Vector3d velocity     = Eigen::Vector3d::Zero();
     Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
+    Eigen::Vector3d angular_velocity = Eigen::Vector3d::Zero();  // Ω_N in world frame
+    Eigen::Vector4d orientation  = Eigen::Vector4d(1,0,0,0);     // target quat [qw,qx,qy,qz]
 
     // Separate timestamps per topic so each can be checked independently.
     rclcpp::Time odom_timestamp {0, 0, RCL_ROS_TIME};
@@ -152,6 +154,13 @@ inline void setup(
             target_state.velocity << msg->twist.twist.linear.x,
                                      msg->twist.twist.linear.y,
                                      msg->twist.twist.linear.z;
+            target_state.angular_velocity << msg->twist.twist.angular.x,
+                                             msg->twist.twist.angular.y,
+                                             msg->twist.twist.angular.z;
+            target_state.orientation << msg->pose.pose.orientation.w,
+                                        msg->pose.pose.orientation.x,
+                                        msg->pose.pose.orientation.y,
+                                        msg->pose.pose.orientation.z;
             target_state.odom_received = true;
 
             // Update ONLY the odom timestamp; accel timestamp is unaffected.

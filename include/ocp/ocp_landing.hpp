@@ -7,6 +7,7 @@
 #include <memory>
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
+#include "core/ocp_descriptor.hpp"
 
 namespace LandingOCP {
 
@@ -448,6 +449,29 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
  }
 
  return prob;
+}
+
+inline OCPDescriptor descriptor() {
+    OCPDescriptor d;
+    d.name = "landing";
+    d.dt = DT;
+    d.default_n_replay = DEFAULT_N_REPLAY;
+    d.default_mass_kg = DEFAULT_MASS_KG;
+    d.warm_start = OCPDescriptor::WarmStart::Shift;
+    d.command_mode = OCPDescriptor::CommandMode::CmdFullState;
+    d.drone_odom_mode = OCPDescriptor::DroneOdomMode::Absolute;
+    d.state_dim = 13;
+    d.control_dim = 4;
+    d.log_state_headers = OCPLoggerDefaults::getStateHeaders13D();
+    d.state_names = OCPLoggerDefaults::getStateNames13D();
+    d.control_names = OCPLoggerDefaults::getControlNames4D();
+    d.extract_actual_state_row = OCPLoggerDefaults::getActualStateRow13D;
+    d.make_hover_state = OCPLoggerDefaults::makeHoverState13D;
+    d.getSolverParams = getSolverParams;
+    d.create = [](const OCPCreateArgs& a) {
+        return create(a.current_state, a.terminal_state, a.prev_U, a.prev_X);
+    };
+    return d;
 }
 
 } // namespace LandingOCP

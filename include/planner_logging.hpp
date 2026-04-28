@@ -3,6 +3,8 @@
 #include <Eigen/Dense>
 #include <rclcpp/rclcpp.hpp>
 
+#include "core/target_snapshot.hpp"
+#include "core/ocp_descriptor.hpp"
 #include "platform/crazyflie.hpp"
 
 #include <chrono>
@@ -40,18 +42,33 @@ struct SolveLogMeta {
 
 class CsvLogger {
 public:
+    /// Initialize logger.
+    /// @param state_names     Column names for raw OCP state vector (from descriptor().state_names)
+    /// @param control_names   Column names for raw OCP control vector (from descriptor().control_names)
+    /// @param command_mode    Active command mode — determines which commanded log gets written
     bool initialize(const std::string& drone_name,
                     const std::string& ocp_type,
                     const std::string& mode,
                     const std::string& solver_type,
                     const rclcpp::Logger& ros_logger,
-                    double mass_kg) {
+                    double mass_kg,
+                    int state_dim,
+                    const std::vector<std::string>& state_names,
+                    const std::vector<std::string>& control_names,
+                    const std::vector<std::string>& log_state_headers,
+                    OCPDescriptor::CommandMode command_mode,
+                    std::function<std::vector<double>(const Eigen::VectorXd&, const TargetSnapshot&, const std::string&)> extract_actual_state) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (initialized_) {
             return true;
         }
 
-        mass_kg_ = mass_kg;
+        mass_kg_      = mass_kg;
+        state_dim_    = state_dim;
+        state_names_  = state_names;
+        control_names_ = control_names;
+        command_mode_ = command_mode;
+        extract_actual_state_row_ = extract_actual_state;
 
         auto now = std::chrono::system_clock::now();
         auto t = std::chrono::system_clock::to_time_t(now);
@@ -62,39 +79,63 @@ public:
         std::filesystem::create_directories(folder);
         log_folder_ = folder;
 
+        // ── all_solves.csv ───────────────────────────────────────────────────
         all_solves_log_.open(folder + "/all_solves.csv");
         if (all_solves_log_.is_open()) {
-            all_solves_log_
-                << "solve_num,solve_time_ms,solve_iters,coord_mode,node,t,theta,"
-                << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz,"
-                << "abs_x,abs_y,abs_z,abs_vx,abs_vy,abs_vz,abs_qw,abs_qx,abs_qy,abs_qz,abs_wx,abs_wy,abs_wz,"
-                << "fz,mx,my,mz,"
-                << "rel_x,rel_y,rel_z,rel_vx,rel_vy,rel_vz,rel_qw,rel_qx,rel_qy,rel_qz,rel_wx,rel_wy,rel_wz\n";
+            // Common prefix
+            all_solves_log_ << "solve_num,solve_time_ms,solve_iters,coord_mode,node,t,theta";
+
+            // Raw OCP state columns (named from dynamics)
+            for (size_t i = 0; i < state_names_.size(); ++i) {
+                all_solves_log_ << "," << state_names_[i];
+            }
+            // Extra state elements beyond named list (e.g. DT appended by variable-dt dynamics)
+            // These get auto-named x{N}, x{N+1}, ...
+            // We don't know the actual solver vector size at header time, so we write extras
+            // dynamically per-row. Header is therefore open-ended — we'll handle header
+            // for those via the first row. Actually: we pre-extend the header with
+            // a placeholder for DT used by variable-dt OCPs (x[state_dim] = DT).
+            // For simplicity: always emit exactly state_names_.size() state cols +
+            // one extra "DT" col for variable-dt OCPs (detected if solver vec > state_dim).
+
+            // Raw OCP control columns
+            for (size_t i = 0; i < control_names_.size(); ++i) {
+                all_solves_log_ << "," << control_names_[i];
+            }
+            // Extra control (e.g. theta timestep for variable-dt: u[4])
+            // Always emit "theta" col in the prefix already; extra u elements would be u4+ only.
+
+            // Target at the end
+            all_solves_log_ << ",tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz\n";
         }
 
+        // ── commanded_state.csv (CmdFullState only) ──────────────────────────
         commanded_state_log_.open(folder + "/commanded_state.csv");
         if (commanded_state_log_.is_open()) {
-            commanded_state_log_
-                << "timestamp,solve_num,"
-                << "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
-                << "fz,mx,my,mz,"
-                << "acc_x,acc_y,acc_z\n";
+            commanded_state_log_ << "timestamp,solve_num";
+            if (!log_state_headers.empty() && log_state_headers.size() >= static_cast<size_t>(state_dim_)) {
+                for (int i = 0; i < state_dim_; ++i) commanded_state_log_ << "," << log_state_headers[i];
+            } else {
+                for (int i = 0; i < state_dim_; ++i) commanded_state_log_ << ",x" << i;
+            }
+            commanded_state_log_ << ",fz,mx,my,mz,acc_x,acc_y,acc_z\n";
         }
 
+        // ── commanded_hover_state.csv (CmdHover only) ────────────────────────
         commanded_hover_log_.open(folder + "/commanded_hover_state.csv");
         if (commanded_hover_log_.is_open()) {
             commanded_hover_log_
                 << "timestamp,solve_num,vx,vy,z_distance,yaw_rate\n";
         }
 
+        // ── actual_state.csv ─────────────────────────────────────────────────
         actual_state_log_.open(folder + "/actual_state.csv");
         if (actual_state_log_.is_open()) {
-            actual_state_log_
-                << "timestamp,solve_num,coord_mode,"
-                << "x,y,z,vx,vy,vz,qw,qx,qy,qz,wx,wy,wz,"
-                << "abs_x,abs_y,abs_z,abs_vx,abs_vy,abs_vz,abs_qw,abs_qx,abs_qy,abs_qz,abs_wx,abs_wy,abs_wz,"
-                << "rel_x,rel_y,rel_z,rel_vx,rel_vy,rel_vz,rel_qw,rel_qx,rel_qy,rel_qz,rel_wx,rel_wy,rel_wz,"
-                << "tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz\n";
+            actual_state_log_ << "timestamp,solve_num,coord_mode";
+            for (const auto& h : log_state_headers) {
+                actual_state_log_ << "," << h;
+            }
+            actual_state_log_ << "\n";
         }
 
         initialized_ = all_solves_log_.is_open() &&
@@ -110,6 +151,8 @@ public:
         return initialized_;
     }
 
+    /// Log raw OCP solve trajectory to all_solves.csv.
+    /// Each node row: common prefix | raw x[i] | raw u[i] | tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz
     void logSolveTrajectory(const std::vector<Eigen::VectorXd>& traj,
                             const std::vector<Eigen::VectorXd>& ctrls,
                             const SolveLogMeta& meta) {
@@ -118,22 +161,33 @@ public:
             return;
         }
 
-        const double nan = std::numeric_limits<double>::quiet_NaN();
         const bool has_reconstructed_target =
             (meta.target_world_pos_trajectory.size() == traj.size()) &&
             (meta.target_world_vel_trajectory.size() == traj.size());
 
         for (int i = 0; i < static_cast<int>(traj.size()); ++i) {
             const auto& s = traj[i];
-            if (s.size() < 13) {
-                continue;
-            }
+            if (s.size() == 0) continue;
 
+            // t: cumulative node time
             double t_node = i * meta.ocp_dt;
-            if (s.size() > 13) {
-                t_node = s(13);
+            if (s.size() > static_cast<Eigen::Index>(state_dim_)) {
+                // Variable-dt: DT stored at s[state_dim]
+                t_node = s(state_dim_);
             }
 
+            // theta: timestep (stored in u[control_names_.size()] for variable-dt)
+            double theta = meta.ocp_dt;
+            Eigen::VectorXd control = Eigen::VectorXd::Zero(control_names_.size());
+            if (i < static_cast<int>(ctrls.size())) {
+                control = ctrls[i];
+                if (control.size() > static_cast<Eigen::Index>(control_names_.size())) {
+                    // Variable-dt: theta stored at u[control_names_.size()]
+                    theta = control(static_cast<int>(control_names_.size()));
+                }
+            }
+
+            // Target position/velocity at this node
             Eigen::Vector3d tgt_p = meta.target_snapshot_pos;
             Eigen::Vector3d tgt_v = meta.target_snapshot_vel;
 
@@ -141,7 +195,6 @@ public:
                 tgt_p = meta.target_world_pos_trajectory[i];
                 tgt_v = meta.target_world_vel_trajectory[i];
             } else if (meta.is_relative_plan) {
-                // Propagate target using constant-acceleration assumption matching Quad6DOFVarTimeRelative
                 tgt_p = meta.target_snapshot_pos +
                         meta.target_snapshot_vel * t_node +
                         0.5 * meta.target_snapshot_acc * t_node * t_node;
@@ -149,57 +202,38 @@ public:
                         meta.target_snapshot_acc * t_node;
             }
 
-            Eigen::VectorXd x_abs = Eigen::VectorXd::Zero(13);
-            Eigen::VectorXd x_rel = Eigen::VectorXd::Constant(13, nan);
-
-            if (meta.is_relative_plan) {
-                x_rel = s.head(13);
-                x_abs.segment(0, 3) = tgt_p + x_rel.segment(0, 3);
-                x_abs.segment(3, 3) = tgt_v + x_rel.segment(3, 3);
-                x_abs.segment(6, 7) = x_rel.segment(6, 7);
-            } else {
-                x_abs = s.head(13);
-                x_rel.segment(0, 3) = x_abs.segment(0, 3) - tgt_p;
-                x_rel.segment(3, 3) = x_abs.segment(3, 3) - tgt_v;
-                x_rel.segment(6, 7) = x_abs.segment(6, 7);
-            }
-
-            double theta = meta.ocp_dt;
-            if (i < static_cast<int>(ctrls.size()) && ctrls[i].size() > 4) {
-                theta = ctrls[i](4);
-            }
-
             all_solves_log_ << std::fixed << std::setprecision(6)
                             << meta.solve_num << ","
                             << meta.solve_time_ms << ","
                             << meta.solve_iters << ","
                             << meta.coord_mode << ","
-                            << i << "," << t_node << "," << theta << ","
-                            << tgt_p.x() << ","
-                            << tgt_p.y() << ","
-                            << tgt_p.z() << ","
-                            << tgt_v.x() << ","
-                            << tgt_v.y() << ","
-                            << tgt_v.z();
+                            << i << "," << t_node << "," << theta;
 
-        for (int j = 0; j < 13; ++j) {
-            all_solves_log_ << "," << x_abs(j);
-        }
+            // Raw OCP state x[i] — write exactly as many elements as named
+            const int nx = static_cast<int>(state_names_.size());
+            for (int j = 0; j < nx; ++j) {
+                if (j < s.size()) {
+                    all_solves_log_ << "," << s(j);
+                } else {
+                    all_solves_log_ << ",0";
+                }
+            }
 
-        if (i < static_cast<int>(ctrls.size()) && ctrls[i].size() >= 4) {
+            // Raw OCP control u[i] — write exactly as many elements as named
+            const int nu = static_cast<int>(control_names_.size());
+            for (int j = 0; j < nu; ++j) {
+                if (j < control.size()) {
+                    all_solves_log_ << "," << control(j);
+                } else {
+                    all_solves_log_ << ",0";
+                }
+            }
+
+            // Target columns at end
             all_solves_log_ << ","
-            << ctrls[i](0) << ","
-            << ctrls[i](1) << ","
-            << ctrls[i](2) << ","
-            << ctrls[i](3);
-        } else {
-            all_solves_log_ << ",0,0,0,0";
-        }
-
-        for (int j = 0; j < 13; ++j) {
-            all_solves_log_ << "," << x_rel(j);
-        }
-        all_solves_log_ << "\n";
+                            << tgt_p.x() << "," << tgt_p.y() << "," << tgt_p.z() << ","
+                            << tgt_v.x() << "," << tgt_v.y() << "," << tgt_v.z()
+                            << "\n";
         }
         all_solves_log_.flush();
     }
@@ -210,49 +244,33 @@ public:
                         const Eigen::Vector3d& target_vel = Eigen::Vector3d::Zero(),
                         const std::string& coord_mode = "absolute") {
         std::lock_guard<std::mutex> lk(mutex_);
-        if (!initialized_ || !actual_state_log_.is_open() || state.size() < 13) {
+        if (!initialized_ || !actual_state_log_.is_open()) {
             return;
-        }
-
-        Eigen::VectorXd x_abs = state;
-        Eigen::VectorXd x_rel = state;
-        if (coord_mode == "relative") {
-            x_abs.segment(0, 3) = state.segment(0, 3) + target_pos;
-            x_abs.segment(3, 3) = state.segment(3, 3) + target_vel;
-            x_rel = state;
-        } else {
-            x_rel.segment(0, 3) = state.segment(0, 3) - target_pos;
-            x_rel.segment(3, 3) = state.segment(3, 3) - target_vel;
         }
 
         actual_state_log_ << std::fixed << std::setprecision(6)
                           << wallTimeSec() << "," << solve_num << "," << coord_mode;
-        for (int i = 0; i < 13; ++i) {
-            actual_state_log_ << "," << x_abs(i);
+
+        if (extract_actual_state_row_) {
+            TargetSnapshot ts;
+            ts.position = target_pos;
+            ts.velocity = target_vel;
+            auto row = extract_actual_state_row_(state, ts, coord_mode);
+            for (double v : row) {
+                actual_state_log_ << "," << v;
+            }
         }
-        for (int i = 0; i < 13; ++i) {
-            actual_state_log_ << "," << x_abs(i);
-        }
-        for (int i = 0; i < 13; ++i) {
-            actual_state_log_ << "," << x_rel(i);
-        }
-        actual_state_log_ << ","
-                          << target_pos.x() << ","
-                          << target_pos.y() << ","
-                          << target_pos.z() << ","
-                          << target_vel.x() << ","
-                          << target_vel.y() << ","
-                          << target_vel.z();
         actual_state_log_ << "\n";
         actual_state_log_.flush();
     }
 
-    /// Log the hover command fields actually sent to hardware (CmdHover mode only).
+    /// Log hover command (CmdHover mode only — skipped if CmdFullState).
     void logCommandedHoverState(const std::array<float, 4>& cmd, int solve_num) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!initialized_ || !commanded_hover_log_.is_open()) {
             return;
         }
+        return;  // CmdHover removed — this function is never used
         commanded_hover_log_ << std::fixed << std::setprecision(6)
                              << wallTimeSec() << "," << solve_num << ","
                              << cmd[0] << "," << cmd[1] << ","
@@ -260,10 +278,14 @@ public:
         commanded_hover_log_.flush();
     }
 
+    /// Log full commanded state (CmdFullState mode only — skipped if CmdHover).
     void logCommandedState(const Eigen::VectorXd& state, const Eigen::VectorXd& control, int solve_num) {
         std::lock_guard<std::mutex> lk(mutex_);
-        if (!initialized_ || !commanded_state_log_.is_open() || state.size() < 13) {
+        if (!initialized_ || !commanded_state_log_.is_open()) {
             return;
+        }
+        if (command_mode_ != OCPDescriptor::CommandMode::CmdFullState) {
+            return;  // self-filter: only write for CmdFullState OCPs
         }
 
         const double fz = (control.size() >= 1) ? control(0) : 0.0;
@@ -271,7 +293,7 @@ public:
 
         commanded_state_log_ << std::fixed << std::setprecision(6)
                              << wallTimeSec() << "," << solve_num;
-        for (int i = 0; i < 13; ++i) {
+        for (int i = 0; i < state_dim_; ++i) {
             commanded_state_log_ << "," << state(i);
         }
         if (control.size() >= 4) {
@@ -296,6 +318,11 @@ private:
     mutable std::mutex mutex_;
     bool initialized_ = false;
     double mass_kg_ = 0.0282;
+    int state_dim_ = 13;
+    std::vector<std::string> state_names_;
+    std::vector<std::string> control_names_;
+    OCPDescriptor::CommandMode command_mode_ = OCPDescriptor::CommandMode::CmdFullState;
+    std::function<std::vector<double>(const Eigen::VectorXd&, const TargetSnapshot&, const std::string&)> extract_actual_state_row_;
     std::string log_folder_;
     std::ofstream all_solves_log_;
     std::ofstream commanded_state_log_;

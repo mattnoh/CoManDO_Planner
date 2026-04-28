@@ -40,6 +40,7 @@
 #pragma once
 
 #include "target/target_accel_buffer.hpp"
+#include "core/ocp_descriptor.hpp"
 
 #include "optimal_control_problem.h"
 #include "dynamics/discrete_dynamics_base.h"
@@ -506,5 +507,66 @@ struct TrackingCircleTargetExtra {
     target_models::TargetAccelBuffer buf;
     double t_abs = 0.0;
 };
+
+inline OCPDescriptor descriptor() {
+    OCPDescriptor d;
+    d.name = "tracking_circle_target";
+    d.dt = TH_INIT;
+    d.default_n_replay = DEFAULT_N_REPLAY;
+    d.default_mass_kg = MASS;
+    d.warm_start = OCPDescriptor::WarmStart::Shift;
+    d.command_mode = OCPDescriptor::CommandMode::CmdFullState;
+    d.drone_odom_mode = OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget;
+    d.needs_target_trajectory = true;
+    d.state_dim = 13;
+    d.control_dim = 4;
+    d.log_state_headers = OCPLoggerDefaults::getStateHeaders13D();
+    d.state_names = OCPLoggerDefaults::getStateNames13D();
+    d.control_names = OCPLoggerDefaults::getControlNames4D();
+    d.extract_actual_state_row = OCPLoggerDefaults::getActualStateRow13D;
+    d.make_hover_state = OCPLoggerDefaults::makeHoverState13D;
+    d.transform_state = [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
+        Eigen::VectorXd xr = x;
+        xr.segment(0, 3) -= t.position;
+        xr.segment(3, 3) -= t.velocity;
+        return xr;
+    };
+    d.validate_target = [](const TargetSnapshot& t, double now_sec, double max_age) {
+        if (t.odom_stamp_sec <= 0.0) return false;
+        const double age = now_sec - t.odom_stamp_sec;
+        const double kClockTol = 0.001;
+        return !(age < -kClockTol || age >= max_age);
+    };
+    d.post_process_result = [](SolverResult& r, const TargetSnapshot& t) {
+        r.is_relative_plan = true;
+        if (t.odom_stamp_sec > 0.0) {
+            r.target_snapshot_pos = t.position;
+            r.target_snapshot_vel = t.velocity;
+        } else {
+            r.target_snapshot_pos.setZero();
+            r.target_snapshot_vel.setZero();
+        }
+        r.target_snapshot_acc = t.acceleration;
+    };
+    d.prepare_extra = [](const PlannerConfig& cfg, double t_abs, const TargetSnapshot&) {
+        TrackingCircleTargetExtra ex;
+        ex.t_abs = t_abs;
+        if (cfg.target_accel_buffer.has_value()) {
+            ex.buf = cfg.target_accel_buffer.value();
+        }
+        return std::any(ex);
+    };
+    d.getSolverParams = getSolverParams;
+    d.create = [](const OCPCreateArgs& a) {
+        if (a.extra.has_value()) {
+            try {
+                auto ex = std::any_cast<TrackingCircleTargetExtra>(a.extra);
+                return create(a.current_state, ex.buf, ex.t_abs);
+            } catch (const std::bad_any_cast&) {}
+        }
+        return create(a.current_state, target_models::TargetAccelBuffer{}, a.t_abs);
+    };
+    return d;
+}
 
 } // namespace TrackingCircleTargetOCP

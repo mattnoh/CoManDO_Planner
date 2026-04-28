@@ -7,22 +7,15 @@
 namespace hover_controller {
 
 // Construct safe hover state from current state
-inline Eigen::VectorXd makeHoverState(const Eigen::VectorXd& current_state) {
-    Eigen::VectorXd x_hover = (current_state.size() >= 13) 
-        ? current_state 
-        : Eigen::VectorXd::Zero(13);
-    
-    // Zero velocity
-    x_hover.segment(3, 3).setZero();
-    
-    // Flat attitude (identity quaternion)
-    x_hover(6) = 1.0;
-    x_hover.segment(7, 3).setZero();
-    
-    // Zero angular velocity
-    x_hover.segment(10, 3).setZero();
-    
-    return x_hover;
+inline Eigen::VectorXd makeHoverState(
+    const Eigen::VectorXd& current_state,
+    int state_dim,
+    std::function<Eigen::VectorXd(const Eigen::VectorXd&)> custom_make_hover_state) 
+{
+    if (custom_make_hover_state) {
+        return custom_make_hover_state(current_state);
+    }
+    return Eigen::VectorXd::Zero(state_dim);
 }
 
 // Construct hover control (thrust = mg, moments = 0)
@@ -38,6 +31,8 @@ template<typename PublishFunc>
 inline bool doHoverHoldTick(
     bool is_configured,
     double mass_kg,
+    int state_dim,
+    std::function<Eigen::VectorXd(const Eigen::VectorXd&)> custom_make_hover_state,
     bool maintain_hover_hold,
     bool has_state,
     const Eigen::VectorXd& current_state,
@@ -48,11 +43,11 @@ inline bool doHoverHoldTick(
     if (!maintain_hover_hold) return false;
     if (!has_state) return false;
     
-    Eigen::VectorXd x_hold = (paused_hover_state.size() >= 13)
+    Eigen::VectorXd x_hold = (paused_hover_state.size() >= state_dim)
         ? paused_hover_state
-        : makeHoverState(current_state);
+        : makeHoverState(current_state, state_dim, custom_make_hover_state);
     
-    if (x_hold.size() < 13) return false;
+    if (x_hold.size() < state_dim) return false;
     
     Eigen::VectorXd u_hover = makeHoverControl(mass_kg);
     publish_cmd(x_hold, u_hover);
@@ -65,6 +60,8 @@ inline void enterHoverHold(
     const std::string& reason,
     bool is_configured,
     double mass_kg,
+    int state_dim,
+    std::function<Eigen::VectorXd(const Eigen::VectorXd&)> custom_make_hover_state,
     bool has_state,
     const Eigen::VectorXd& current_state,
     std::atomic<bool>& command_paused,
@@ -77,8 +74,8 @@ inline void enterHoverHold(
     if (!is_configured || mass_kg <= 0.0) return;
     
     Eigen::VectorXd x_hover = has_state 
-        ? makeHoverState(current_state) 
-        : makeHoverState(Eigen::VectorXd::Zero(13));
+        ? makeHoverState(current_state, state_dim, custom_make_hover_state) 
+        : makeHoverState(Eigen::VectorXd::Zero(state_dim), state_dim, custom_make_hover_state);
     
     Eigen::VectorXd u_hover = makeHoverControl(mass_kg);
     publish_cmd(x_hover, u_hover);

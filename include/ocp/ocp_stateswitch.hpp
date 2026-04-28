@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cmath>
 #include "target/target_accel_buffer.hpp"
+#include "target/circular_target.hpp"
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
+#include "core/ocp_descriptor.hpp"
 
 namespace StateswitchOCP {
 
@@ -456,6 +458,74 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
  }
 
  return problem;
+}
+
+inline OCPDescriptor descriptor() {
+    OCPDescriptor d;
+    d.name = "stateswitch";
+    d.dt = TH_INIT;
+    d.default_n_replay = DEFAULT_N_REPLAY;
+    d.default_mass_kg = DEFAULT_MASS_KG;
+    d.warm_start = OCPDescriptor::WarmStart::Feedback;
+    d.command_mode = OCPDescriptor::CommandMode::CmdFullState;
+    d.drone_odom_mode = OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget;
+    d.variable_dt = true;
+    d.state_dim = 13;
+    d.control_dim = 4;
+    d.log_state_headers = OCPLoggerDefaults::getStateHeaders13D();
+    d.state_names = OCPLoggerDefaults::getStateNames13D();
+    d.control_names = OCPLoggerDefaults::getControlNames4D();
+    d.extract_actual_state_row = OCPLoggerDefaults::getActualStateRow13D;
+    d.make_hover_state = OCPLoggerDefaults::makeHoverState13D;
+    d.transform_state = [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
+        if (t.valid) {
+            Eigen::VectorXd xr = x;
+            xr.segment(0, 3) -= t.position;
+            xr.segment(3, 3) -= t.velocity;
+            return xr;
+        }
+        return x;
+    };
+    d.post_process_result = [](SolverResult& r, const TargetSnapshot& t) {
+        r.is_relative_plan = t.valid;
+        if (t.valid) {
+            r.target_snapshot_pos = t.position;
+            r.target_snapshot_vel = t.velocity;
+            r.target_snapshot_acc = t.acceleration;
+        } else {
+            r.target_snapshot_pos.setZero();
+            r.target_snapshot_vel.setZero();
+            r.target_snapshot_acc.setZero();
+        }
+    };
+    d.prepare_extra = [](const PlannerConfig& cfg, double t_abs, const TargetSnapshot&) {
+        StateswitchExtra ex;
+        ex.t0_abs = t_abs;
+        if (cfg.target_accel_buffer.has_value() && !cfg.target_accel_buffer->accels.empty()) {
+            ex.buf = cfg.target_accel_buffer.value();
+        } else {
+            target_models::CircularTarget circ;
+            circ.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
+            circ.R = cfg.circle_R;
+            circ.omega = cfg.circle_omega;
+            circ.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
+            const double buf_dur = HORIZON * THH + 1.0;
+            ex.buf.populateFromModel(circ, t_abs, buf_dur, 0.05);
+        }
+        return std::any(ex);
+    };
+    d.getSolverParams = getSolverParams;
+    d.create = [](const OCPCreateArgs& a) {
+        StateswitchExtra ex;
+        if (a.extra.has_value()) {
+            try { ex = std::any_cast<StateswitchExtra>(a.extra); }
+            catch (const std::bad_any_cast&) {}
+        }
+        return create(a.current_state, a.terminal_state,
+                      a.prev_U, a.prev_X, a.target_accel, a.prev_K,
+                      ex.buf, ex.t0_abs);
+    };
+    return d;
 }
 
 } // namespace StateswitchOCP

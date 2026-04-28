@@ -120,4 +120,9 @@ install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
 )
 
+install(PROGRAMS
+    scripts/test_bodyrate_cmd.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

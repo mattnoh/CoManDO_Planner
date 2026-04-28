@@ -4,6 +4,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <Eigen/Dense>
 
 #include "core/quadrotor_mpc.hpp"
@@ -67,7 +68,13 @@ public:
 
         if (runtime_cfg.isConfigured()) {
             ocp_dt_ = runtime_cfg.ocp_dt;
-            command_mode_ = OCPRegistry::getDescriptor(ocp_type_).command_mode;
+            {
+                const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+                command_mode_ = desc.command_mode;
+                state_dim_ = desc.state_dim;
+                control_dim_ = desc.control_dim;
+                custom_make_hover_state_ = desc.make_hover_state;
+            }
             applyOcpDroneOdomMode(false);
             setTerminalTarget(hover_target_);
             rebuildMpcSolver();
@@ -108,6 +115,8 @@ public:
 
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
+        bodyrate_cmd_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(
+            "/" + drone_name_ + "/cmd_bodyrate", 10);
 
         if (is_configured_) {
             createModeTimers();
@@ -185,8 +194,8 @@ private:
 
     static const char* commandModeName(OCPDescriptor::CommandMode mode) {
         switch (mode) {
-            case OCPDescriptor::CommandMode::CmdHover:
-                return "cmd_hover";
+            case OCPDescriptor::CommandMode::CmdBodyRate:
+                return "cmd_bodyrate";
             case OCPDescriptor::CommandMode::CmdFullState:
             default:
                 return "cmd_full_state";
@@ -195,13 +204,15 @@ private:
 
     static const char* droneOdomModeName(OCPDescriptor::DroneOdomMode mode) {
         switch (mode) {
-            case OCPDescriptor::DroneOdomMode::BodyRelative:
-                return "body-relative";
-            case OCPDescriptor::DroneOdomMode::AbsoluteMinusTarget:
-                return "absolute-minus-target";
-            case OCPDescriptor::DroneOdomMode::AbsoluteWorld:
+            case OCPDescriptor::DroneOdomMode::BodyFrameRelative:
+                return "body-frame-relative";
+            case OCPDescriptor::DroneOdomMode::TargetFrameRelative:
+                return "target-frame-relative";
+            case OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget:
+                return "absolute-shifted-target";
+            case OCPDescriptor::DroneOdomMode::Absolute:
             default:
-                return "absolute-world";
+                return "absolute";
         }
     }
 
@@ -211,14 +222,22 @@ private:
         }
 
         const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
-        const bool needs_body_relative =
-            (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyRelative);
-        const std::string desired_odom_topic = needs_body_relative ? body_relative_odom_topic_ : "";
+        const bool needs_relative =
+            (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyFrameRelative) ||
+            (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::TargetFrameRelative);
 
-        const bool mode_changed = (needs_body_relative != drone_state_is_relative_);
+        std::string desired_odom_topic;
+        if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyFrameRelative)
+            desired_odom_topic = body_relative_odom_topic_;
+        else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::TargetFrameRelative)
+            desired_odom_topic = target_frame_odom_topic_;
+        else
+            desired_odom_topic = "";
+
+        const bool mode_changed = (needs_relative != drone_state_is_relative_);
         const bool topic_changed = (desired_odom_topic != drone_odom_topic_);
 
-        drone_state_is_relative_ = needs_body_relative;
+        drone_state_is_relative_ = needs_relative;
         drone_odom_topic_ = desired_odom_topic;
 
         if (!rebuild_subscriptions || platform_ != "crazyflie" || (!mode_changed && !topic_changed)) {
@@ -313,10 +332,19 @@ private:
     }
 
     double stateNodeTime(const Eigen::VectorXd& s, int index) const {
-        if (s.size() > 13) {
-            return s(13);
+        if (s.size() > state_dim_) {
+            return s(state_dim_);
         }
         return index * ocp_dt_;
+    }
+
+    double replayAdvanceTime(const std::vector<Eigen::VectorXd>& traj) const {
+        if (traj.size() < 2) {
+            return std::max(ocp_dt_, 1e-3);
+        }
+        const int idx = std::min(n_replay_, static_cast<int>(traj.size()) - 1);
+        const double t_adv = stateNodeTime(traj[idx], idx);
+        return std::max(t_adv, std::max(ocp_dt_, 1e-3));
     }
 
     void integrateTargetSegment(Eigen::Vector3d& pos,
@@ -373,7 +401,7 @@ private:
 
         for (int i = 0; i < static_cast<int>(rel_traj.size()); ++i) {
             const Eigen::VectorXd& x_rel = rel_traj[i];
-            if (x_rel.size() < 13) {
+            if (x_rel.size() < state_dim_) {
                 if (target_pos_nodes) {
                     target_pos_nodes->push_back(tgt_pos);
                 }
@@ -418,7 +446,7 @@ private:
     // and store a relative plan that is later re-combined with live target position in
     // mpcReplayTick.  For BodyRelative mode the state is passed through unchanged.
     Eigen::VectorXd convertStateToAbsoluteFrame(const Eigen::VectorXd& state) const {
-        if (drone_state_is_relative_ || state.size() < 13) {
+        if (drone_state_is_relative_ || state.size() < state_dim_) {
             // BodyRelative: return as-is — caller must label the frame correctly.
             return state;
         }
@@ -436,10 +464,34 @@ private:
     }
 
     std::vector<Eigen::VectorXd> makeTrajectoryForPublishing(const SolverResult& result) const {
-        // BodyRelative mode: trajectory is in body frame — planner has no world-frame data.
-        // Return as-is; the path topic will contain body-relative coordinates.
+        // BodyRelative mode: reconstruct the drone world trajectory if we have
+        // the target world trajectory for each node. Otherwise fall back to the
+        // raw body-relative state for diagnostics.
         if (drone_state_is_relative_) {
-            return result.state_trajectory;
+            if (!result.is_relative_plan ||
+                result.target_world_pos_trajectory.size() != result.state_trajectory.size() ||
+                result.target_world_vel_trajectory.size() != result.state_trajectory.size()) {
+                return result.state_trajectory;
+            }
+
+            std::vector<Eigen::VectorXd> traj_abs = result.state_trajectory;
+            for (int i = 0; i < static_cast<int>(traj_abs.size()); ++i) {
+                auto& s = traj_abs[i];
+                if (s.size() < state_dim_) {
+                    continue;
+                }
+
+                const Eigen::Vector3d tgt_p = result.target_world_pos_trajectory[i];
+                const Eigen::Vector3d tgt_v = result.target_world_vel_trajectory[i];
+                const Eigen::Vector4d q_NB = s.segment(6, 4);
+                const Eigen::Matrix3d R_WB = Quad6DOFVarTime<double>::calcC(q_NB);
+                const Eigen::Vector3d p_T_B = s.segment(0, 3);
+                const Eigen::Vector3d v_rel_B = s.segment(3, 3);
+
+                s.segment(0, 3) = tgt_p - R_WB * p_T_B;
+                s.segment(3, 3) = tgt_v + R_WB * v_rel_B;
+            }
+            return traj_abs;
         }
 
         if (!result.is_relative_plan) {
@@ -451,7 +503,7 @@ private:
             std::vector<Eigen::VectorXd> traj_abs = result.state_trajectory;
             for (int i = 0; i < static_cast<int>(traj_abs.size()); ++i) {
                 auto& s = traj_abs[i];
-                if (s.size() < 13) {
+                if (s.size() < state_dim_) {
                     continue;
                 }
                 s.segment(0, 3) += result.target_world_pos_trajectory[i];
@@ -475,7 +527,7 @@ private:
         std::vector<Eigen::VectorXd> traj_abs = result.state_trajectory;
         for (int i = 0; i < static_cast<int>(traj_abs.size()); ++i) {
             auto& s = traj_abs[i];
-            if (s.size() < 13) {
+            if (s.size() < state_dim_) {
                 continue;
             }
 
@@ -498,11 +550,13 @@ private:
         hover_target_ = xyz;
         terminal_position_abs_ = xyz;
 
-        Eigen::VectorXd terminal = Eigen::VectorXd::Zero(13);
-        terminal(0) = xyz.x();
-        terminal(1) = xyz.y();
-        terminal(2) = xyz.z();
-        terminal(6) = 1.0;
+        Eigen::VectorXd terminal = Eigen::VectorXd::Zero(state_dim_);
+        if (state_dim_ >= 7) {
+            terminal(0) = xyz.x();
+            terminal(1) = xyz.y();
+            terminal(2) = xyz.z();
+            terminal(6) = 1.0;
+        }
         terminal_state_ = terminal;
 
         if (alipddp_mpc_) {
@@ -554,31 +608,20 @@ private:
         is_primed_.store(false);
         terminal_freeze_.store(false);
         stale_warning_count_ = 0;
-    }
-
-    // In body-relative mode the planner has no world-frame z directly.
-    // Recover current drone altitude from: drone_z = target_z - (R * p_T_body).z()
-    // where R = quaternion rotation matrix (body→world), p_T_body = state[0:3].
-    float bodyRelativeHoldZ() const {
-        const Eigen::VectorXd cs = getCurrentState();
-        const Eigen::Quaterniond q(cs(6), cs(7), cs(8), cs(9));
-        const Eigen::Matrix3d R = q.normalized().toRotationMatrix();
-        const Eigen::Vector3d p_t_body = cs.segment(0, 3);
-        const auto [tgt_pos, tgt_vel] = state_monitor_.getTargetPositionVelocity();
-        return static_cast<float>(tgt_pos.z() - (R * p_t_body).z());
-    }
-
-    void publishBodyRelativeHoverHold() {
-        if (platform_ != "crazyflie" || !hasState()) return;
-        const std::array<float, 4> cmd{0.0f, 0.0f, bodyRelativeHoldZ(), 0.0f};
-        platform::crazyflie::publishHoverCommandDirect(cf_handles_, cmd);
+        replay_ticks_since_solve_.store(0);
+        last_accepted_solve_timestamp_ = Clock::time_point{};
+        last_replan_delay_sec_ = 0.0;
     }
 
     void publishPausedHoverHoldTick() {
+        if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
+            geometry_msgs::msg::TwistStamped msg;
+            msg.header.stamp   = this->now();
+            msg.twist.linear.z = 9.81;
+            bodyrate_cmd_pub_->publish(msg);
+            return;
+        }
         if (drone_state_is_relative_) {
-            if (command_mode_ == OCPDescriptor::CommandMode::CmdHover) {
-                publishBodyRelativeHoverHold();
-            }
             return;
         }
 
@@ -586,6 +629,8 @@ private:
         hover_controller::doHoverHoldTick(
             is_configured_,
             mass_kg_,
+            state_dim_,
+            custom_make_hover_state_,
             maintain_hover_hold_,
             hasState(),
             x_now_abs,
@@ -594,9 +639,9 @@ private:
         );
         if (ocp_active_.load()) {
             const Eigen::VectorXd x_now = x_now_abs;
-            Eigen::VectorXd x_hold = (paused_hover_state_.size() >= 13)
+            Eigen::VectorXd x_hold = (paused_hover_state_.size() >= state_dim_)
                 ? paused_hover_state_
-                : hover_controller::makeHoverState(x_now);
+                : hover_controller::makeHoverState(x_now, state_dim_, custom_make_hover_state_);
             Eigen::VectorXd u_hover = hover_controller::makeHoverControl(mass_kg_);
             const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
             logger_.logActualState(x_now, -1, tgt_pos_now, tgt_vel_now, "absolute");
@@ -621,6 +666,8 @@ private:
             reason,
             is_configured_,
             mass_kg_,
+            state_dim_,
+            custom_make_hover_state_,
             hasState(),
             convertStateToAbsoluteFrame(getCurrentState()),
             command_paused_,
@@ -718,12 +765,16 @@ private:
             n_replay_ = new_n_replay;
 
             if (ocp_type_changed || !is_configured_) {
-                ocp_dt_ = OCPRegistry::getDT(ocp_type_);
-                mass_kg_ = OCPRegistry::getDefaultMassKg(ocp_type_);
-                command_mode_ = OCPRegistry::getDescriptor(ocp_type_).command_mode;
+                const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+                ocp_dt_ = desc.dt;
+                mass_kg_ = desc.default_mass_kg;
+                command_mode_ = desc.command_mode;
+                state_dim_ = desc.state_dim;
+                control_dim_ = desc.control_dim;
+                custom_make_hover_state_ = desc.make_hover_state;
                 applyOcpDroneOdomMode(true);
                 if (n_replay_ == 0) {
-                    n_replay_ = OCPRegistry::getDefaultNReplay(ocp_type_);
+                    n_replay_ = desc.default_n_replay;
                 }
             }
 
@@ -789,11 +840,15 @@ private:
             return;
         }
 
-        // Gate: only solve after n_replay_ replay ticks have run since the last solve.
-        // Without this gate, back-to-back solves shift the warmstart by n_replay steps
-        // but the drone has barely moved, making the warmstart point to the wrong region.
-        if (is_primed_.load() && replay_ticks_since_solve_.load() < n_replay_) {
-            return;
+        // Gate: re-solve only after the active plan has advanced by the same amount
+        // of optimizer time the warm-start shift assumes. For variable-DT plans this
+        // must use X[n_replay].DT rather than n_replay * ocp_dt_.
+        if (is_primed_.load()) {
+            const double elapsed_since_solve = std::chrono::duration<double>(
+                Clock::now() - last_accepted_solve_timestamp_).count();
+            if (elapsed_since_solve + 1e-6 < last_replan_delay_sec_) {
+                return;
+            }
         }
 
         if (!hasState()) {
@@ -820,7 +875,7 @@ private:
         Eigen::VectorXd x0_abs = getCurrentState();
         TargetSnapshot target_snapshot = getTargetSnapshot();
 
-        if (debug_body_relative_trace_ && drone_state_is_relative_ && x0_abs.size() >= 13) {
+        if (debug_body_relative_trace_ && drone_state_is_relative_ && x0_abs.size() >= state_dim_ && state_dim_ >= 13) {
             const Eigen::Vector4d q = x0_abs.segment<4>(6);
             const double qn = q.norm();
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
@@ -833,9 +888,21 @@ private:
 
         Eigen::VectorXd x0 = x0_abs;
         auto desc = OCPRegistry::getDescriptor(ocp_type_);
-        const bool apply_registry_transform = (desc.transform_state != nullptr) && !drone_state_is_relative_;
+        const bool apply_registry_transform = (desc.transform_state != nullptr);
         if (apply_registry_transform) {
             x0 = desc.transform_state(x0_abs, target_snapshot);
+        }
+
+        // Carry forward solver-propagated augmented states (e.g. Ω_N, a_T^B, β_N).
+        // transform_state always initialises augmented states from the current snapshot
+        // which kills look-ahead: the OCP always sees the target "as of now" instead
+        // of where it will be. merge_prev_augmented replaces those indices with the
+        // values the solver's own dynamics propagated to the n_replay_-th node.
+        // On the cold-start (no previous trajectory) this is skipped, so transform_state
+        // provides the bootstrap augmented values from the snapshot — correct behaviour.
+        if (desc.merge_prev_augmented
+                && alipddp_mpc_ && alipddp_mpc_->hasPreviousTrajectory()) {
+            desc.merge_prev_augmented(x0, alipddp_mpc_->getPrevX(), n_replay_);
         }
 
         const double pos_err = apply_registry_transform
@@ -872,8 +939,11 @@ private:
                 platform::px4::arm(this, px4_handles_);
             }
             if (logging_enabled_ && !logging_initialized_) {
+                auto dec = OCPRegistry::getDescriptor(ocp_type_);
                 logging_initialized_ = logger_.initialize(
-                    drone_name_, ocp_type_, mode_, solver_type_, this->get_logger(), mass_kg_);
+                    drone_name_, ocp_type_, mode_, solver_type_, this->get_logger(), mass_kg_,
+                    state_dim_, dec.state_names, dec.control_names, dec.log_state_headers,
+                    command_mode_, dec.extract_actual_state_row);
             }
         RCLCPP_INFO(this->get_logger(),
             "x0=[%.3f,%.3f,%.3f | %.3f,%.3f,%.3f]",
@@ -907,11 +977,13 @@ private:
 
         stale_warning_count_ = 0;
         replay_ticks_since_solve_.store(0);
+        last_accepted_solve_timestamp_ = result.solve_timestamp;
+        last_replan_delay_sec_ = replayAdvanceTime(result.state_trajectory);
 
         RCLCPP_INFO(this->get_logger(),
-            "[RH %d] %.1fms iters=%d x0=[%.3f,%.3f,%.3f]",
+            "[RH %d] %.1fms iters=%d x0=[%.3f,%.3f,%.3f] replan_delay=%.3fs",
             solve_count_, result.solve_time_ms, result.solve_iters,
-            x0(0), x0(1), x0(2));
+            x0(0), x0(1), x0(2), last_replan_delay_sec_);
 
         trajectory_replayer_.updatePlan(
             result.state_trajectory,
@@ -921,7 +993,9 @@ private:
             result.is_relative_plan,
             result.solve_timestamp,
             ocp_dt_,
-            n_replay_);
+            n_replay_,
+            OCPRegistry::getDescriptor(ocp_type_).variable_dt,
+            state_dim_);
 
         is_primed_.store(true);
 
@@ -941,9 +1015,11 @@ private:
             meta.target_world_vel_trajectory = result.target_world_vel_trajectory;
 
             auto desc = OCPRegistry::getDescriptor(ocp_type_);
-            if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyRelative) {
+            if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyFrameRelative) {
                 meta.coord_mode = "body_relative";
-            } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::AbsoluteMinusTarget) {
+            } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::TargetFrameRelative) {
+                meta.coord_mode = "target_frame_relative";
+            } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget) {
                 meta.coord_mode = "absolute_relative";
             } else {
                 meta.coord_mode = "absolute";
@@ -967,16 +1043,6 @@ private:
             return;
         }
         if (!is_primed_.load()) {
-            // Before first solve: send safe hold so drone doesn't fall.
-            if (drone_state_is_relative_ && command_mode_ == OCPDescriptor::CommandMode::CmdHover
-                && platform_ == "crazyflie" && hasState()) {
-                const auto desc = OCPRegistry::getDescriptor(ocp_type_);
-                if (desc.extract_hover_cmd) {
-                    const auto [live_tgt_pos, live_tgt_vel_] = state_monitor_.getTargetPositionVelocity();
-                    platform::crazyflie::publishHoverCommandDirect(
-                        cf_handles_, desc.extract_hover_cmd(getCurrentState(), live_tgt_pos.z()));
-                }
-            }
             return;
         }
 
@@ -993,9 +1059,6 @@ private:
         const double horizon_end = replay.horizon_end;
 
         Eigen::VectorXd x_cmd = replay.x_cmd;
-        Eigen::VectorXd x_hover_cmd = replay.x_cmd_lookahead.size() >= 13
-            ? replay.x_cmd_lookahead
-            : replay.x_cmd;
         Eigen::VectorXd u_cmd = replay.u_cmd;
         const Eigen::VectorXd x_rel_k = replay.x_rel_k;
 
@@ -1022,55 +1085,27 @@ private:
 
         if (plan_is_relative) {
             const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
-        if (x_rel_k.size() >= 13) {
+        if (x_rel_k.size() >= state_dim_) {
                 x_cmd.segment(0, 3) = x_rel_k.segment(0, 3) + tgt_pos_now;
                 x_cmd.segment(3, 3) = x_rel_k.segment(3, 3) + tgt_vel_now;
-                x_cmd.segment(6, 7) = x_rel_k.segment(6, 7);
+                if (state_dim_ >= 13) x_cmd.segment(6, 7) = x_rel_k.segment(6, 7);
             }
         }
 
-        if (command_mode_ == OCPDescriptor::CommandMode::CmdHover) {
-            if (debug_body_relative_trace_ && x_hover_cmd.size() >= 13 && replay.x_cmd.size() >= 13) {
-                const auto desc = OCPRegistry::getDescriptor(ocp_type_);
-                const auto target_pos_vel = state_monitor_.getTargetPositionVelocity();
-                const Eigen::Vector3d& live_tgt_pos = target_pos_vel.first;
-                std::array<float, 4> cmd_now{0.f, 0.f, 0.f, 0.f};
-                std::array<float, 4> cmd_lookahead{0.f, 0.f, 0.f, 0.f};
-                if (desc.extract_hover_cmd) {
-                    cmd_now = desc.extract_hover_cmd(replay.x_cmd, live_tgt_pos.z());
-                    cmd_lookahead = desc.extract_hover_cmd(x_hover_cmd, live_tgt_pos.z());
-                }
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                    "[BodyRelTrace][replay] omega_z(now=%.4f lookahead=%.4f) cmd_yaw_rate(now=%.4f lookahead=%.4f) cmd_vxy(now=%.3f,%.3f lookahead=%.3f,%.3f)",
-                    replay.x_cmd(12), x_hover_cmd(12),
-                    cmd_now[3], cmd_lookahead[3],
-                    cmd_now[0], cmd_now[1], cmd_lookahead[0], cmd_lookahead[1]);
-            }
-            publishCommand(x_hover_cmd, u_cmd);
-        } else {
-            publishCommand(x_cmd, u_cmd);
-        }
+        publishCommand(x_cmd, u_cmd);
 
         if (logging_enabled_ && logging_initialized_) {
-            // In BodyRelative mode the actual sensor state IS body-relative — log it
-            // as-is and label the frame.  The planner has no world-frame data; only
-            // the target_publisher (external) knows the world frame.
-            const Eigen::VectorXd act = drone_state_is_relative_
-                ? getCurrentState()
-                : convertStateToAbsoluteFrame(getCurrentState());
+            // Always log the raw sensor state (13D from cf_1 topics) regardless of
+            // OCP mode. For body-relative OCPs this is still the 13D physical state
+            // [p_T_body, v_rel_body, q_NB, omega_B] as published by target_publisher.
+            // convertStateToAbsoluteFrame is NOT applied so the log is consistent
+            // with the sensor input, and the coord_mode label tells downstream tools
+            // how to interpret it.
+            const Eigen::VectorXd act_raw = getCurrentState();
             const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
-            logger_.logActualState(act, active_solve_num, tgt_pos_now, tgt_vel_now,
+            logger_.logActualState(act_raw, active_solve_num, tgt_pos_now, tgt_vel_now,
                                    currentFrameLabel());
-            if (command_mode_ == OCPDescriptor::CommandMode::CmdHover) {
-                const auto desc2 = OCPRegistry::getDescriptor(ocp_type_);
-                std::array<float, 4> hcmd = {0.f, 0.f, 0.f, 0.f};
-                if (desc2.extract_hover_cmd) {
-                    hcmd = desc2.extract_hover_cmd(x_hover_cmd, tgt_pos_now.z());
-                }
-                logger_.logCommandedHoverState(hcmd, active_solve_num);
-            } else {
-                logger_.logCommandedState(x_cmd, u_cmd, active_solve_num);
-            }
+            logger_.logCommandedState(x_cmd, u_cmd, active_solve_num);
         }
     }
 
@@ -1080,21 +1115,21 @@ private:
         
         // Physical bounds checking
         for (size_t k = 0; k < X.size(); ++k) {
-            if (X[k].size() < 13) continue;
+            if (X[k].size() < state_dim_) continue;
             // Altitude check (reject negative altitude)
-            if (!desc.skip_altitude_validation && X[k](2) < -0.05) return false;
+            if (!desc.skip_altitude_validation && X[k].size() >= 3 && X[k](2) < -0.05) return false;
             
             // Velocity check (reject > 20 m/s)
-            if (X[k].segment(3, 3).norm() > 20.0) return false;
+            if (X[k].size() >= 6 && X[k].segment(3, 3).norm() > 20.0) return false;
             
             // Angular rate check (reject > 50 rad/s)
-            if (X[k].segment(10, 3).norm() > 50.0) return false;
+            if (X[k].size() >= 13 && X[k].segment(10, 3).norm() > 50.0) return false;
         }
         
         if (!U.empty()) {
             for (size_t k = 0; k < U.size(); ++k) {
                 // Thrust bounds (FMAX is ~0.6-0.7 for crazyflie, let's say max 10.0 to be safe across platforms)
-                if (U[k].size() > 0 && (U[k](0) < -0.1 || U[k](0) > 20.0)) {
+                if (U[k].size() > 0 && (U[k](0) < -0.1 || U[k](0) > 50.0)) {
                     return false;
                 }
             }
@@ -1140,25 +1175,16 @@ private:
     }
 
     void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
-        if (platform_ == "crazyflie") {
-            if (command_mode_ == OCPDescriptor::CommandMode::CmdHover) {
-                auto desc = OCPRegistry::getDescriptor(ocp_type_);
-                std::array<float, 4> cmd{
-                    static_cast<float>(s.size() > 3 ? s(3) : 0.0),
-                    static_cast<float>(s.size() > 4 ? s(4) : 0.0),
-                    static_cast<float>(s.size() > 2 ? s(2) : 0.0),
-                    static_cast<float>(s.size() > 12 ? s(12) : 0.0),
-                };
-                if (desc.extract_hover_cmd) {
-                    // Pass live target altitude so z_distance = target_z_world - p_T_body_z
-                    // correctly gives the drone's absolute altitude command.
-                    const auto [live_tgt_pos, live_tgt_vel_] = state_monitor_.getTargetPositionVelocity();
-                    cmd = desc.extract_hover_cmd(s, live_tgt_pos.z());
-                }
-                platform::crazyflie::publishHoverCommandDirect(cf_handles_, cmd);
-            } else {
-                platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
-            }
+        if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
+            geometry_msgs::msg::TwistStamped msg;
+            msg.header.stamp    = this->now();
+            msg.twist.linear.z  = u.size() > 0 ? u(0) : 0.0;
+            msg.twist.angular.x = u.size() > 1 ? u(1) : 0.0;
+            msg.twist.angular.y = u.size() > 2 ? u(2) : 0.0;
+            msg.twist.angular.z = u.size() > 3 ? u(3) : 0.0;
+            bodyrate_cmd_pub_->publish(msg);
+        } else if (platform_ == "crazyflie") {
+            platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
         } else if (platform_ == "px4") {
             platform::px4::publishCommand(this, px4_handles_, s);
         }
@@ -1276,8 +1302,11 @@ private:
 
         if (logging_enabled_) {
             if (!logging_initialized_) {
+                auto dec = OCPRegistry::getDescriptor(ocp_type_);
                 logging_initialized_ = logger_.initialize(
-                    drone_name_, ocp_type_, mode_, solver_type_, this->get_logger(), mass_kg_);
+                    drone_name_, ocp_type_, mode_, solver_type_, this->get_logger(), mass_kg_,
+                    state_dim_, dec.state_names, dec.control_names, dec.log_state_headers,
+                    command_mode_, dec.extract_actual_state_row);
             }
             if (logging_initialized_) {
                 planner_logging::SolveLogMeta meta;
@@ -1293,9 +1322,11 @@ private:
                 meta.target_world_vel_trajectory = result.target_world_vel_trajectory;
 
                 auto desc = OCPRegistry::getDescriptor(ocp_type_);
-                if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyRelative) {
+                if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyFrameRelative) {
                     meta.coord_mode = "body_relative";
-                } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::AbsoluteMinusTarget) {
+                } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::TargetFrameRelative) {
+                    meta.coord_mode = "target_frame_relative";
+                } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget) {
                     meta.coord_mode = "absolute_relative";
                 } else {
                     meta.coord_mode = "absolute";
@@ -1340,8 +1371,6 @@ private:
 
         const int step = ol_replay_step_;
         const Eigen::VectorXd& x_cmd = ol_ref_X_[step];
-        const Eigen::VectorXd& x_hover_cmd =
-            ol_ref_X_[std::min(step + 1, static_cast<int>(ol_ref_X_.size()) - 1)];
         const Eigen::VectorXd u_cmd = (step < static_cast<int>(ol_ref_U_.size()))
             ? ol_ref_U_[step] : Eigen::VectorXd::Zero(4);
 
@@ -1365,11 +1394,7 @@ private:
             }
         }
 
-        if (command_mode_ == OCPDescriptor::CommandMode::CmdHover) {
-            publishCommand(x_hover_cmd, u_cmd);
-        } else {
-            publishCommand(x_cmd, u_cmd);
-        }
+        publishCommand(x_cmd, u_cmd);
 
         if (logging_enabled_ && logging_initialized_) {
             const Eigen::VectorXd act = drone_state_is_relative_
@@ -1377,16 +1402,7 @@ private:
                 : convertStateToAbsoluteFrame(getCurrentState());
             const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
             logger_.logActualState(act, 0, tgt_pos_now, tgt_vel_now, currentFrameLabel());
-            if (command_mode_ == OCPDescriptor::CommandMode::CmdHover) {
-                const auto desc2 = OCPRegistry::getDescriptor(ocp_type_);
-                std::array<float, 4> hcmd = {0.f, 0.f, 0.f, 0.f};
-                if (desc2.extract_hover_cmd) {
-                    hcmd = desc2.extract_hover_cmd(x_hover_cmd, tgt_pos_now.z());
-                }
-                logger_.logCommandedHoverState(hcmd, 0);
-            } else {
-                logger_.logCommandedState(x_cmd, u_cmd, 0);
-            }
+            logger_.logCommandedState(x_cmd, u_cmd, 0);
         }
 
         ++ol_replay_step_;
@@ -1403,6 +1419,7 @@ private:
     bool drone_state_is_relative_ = false;
     std::string drone_odom_topic_;
     std::string body_relative_odom_topic_ = "/drone/body_relative_odom";
+    std::string target_frame_odom_topic_ = "/drone/target_frame_odom";
     std::string target_odom_topic_ = "/target/odom";
     std::string target_accel_topic_ = "/target/accel";
     std::string target_predicted_accel_topic_ = "/target/predicted_accel";
@@ -1424,9 +1441,12 @@ private:
     int n_replay_ = 4;
     double max_constraint_error_ = 1.0;
     OCPDescriptor::CommandMode command_mode_ = OCPDescriptor::CommandMode::CmdFullState;
+    int state_dim_ = 13;
+    int control_dim_ = 4;
+    std::function<Eigen::VectorXd(const Eigen::VectorXd&)> custom_make_hover_state_ = nullptr;
 
     Eigen::Vector3d hover_target_ = Eigen::Vector3d::Zero();
-    Eigen::VectorXd terminal_state_ = Eigen::VectorXd::Zero(13);
+    Eigen::VectorXd terminal_state_ = Eigen::VectorXd();
 
     std::unique_ptr<QuadrotorMPC> alipddp_mpc_;
 
@@ -1441,6 +1461,7 @@ private:
     rclcpp::TimerBase::SharedPtr open_loop_hold_timer_;
 
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr bodyrate_cmd_pub_;
 
     TrajectoryReplayer trajectory_replayer_;
 
@@ -1456,6 +1477,8 @@ private:
     std::atomic<bool> is_primed_{false};
     std::atomic<bool> terminal_freeze_{false};
     Eigen::Vector3d terminal_position_abs_ = Eigen::Vector3d::Zero();
+    Clock::time_point last_accepted_solve_timestamp_{};
+    double last_replan_delay_sec_ = 0.0;
 
     std::vector<Eigen::VectorXd> ol_ref_X_, ol_ref_U_;
     int ol_replay_step_ = 0;
@@ -1470,7 +1493,7 @@ private:
     int last_command_seq_ = 0;
     int stale_warning_count_ = 0;
     bool maintain_hover_hold_ = false;
-    Eigen::VectorXd paused_hover_state_ = Eigen::VectorXd::Zero(13);
+    Eigen::VectorXd paused_hover_state_ = Eigen::VectorXd();
     std::mutex command_mutex_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 

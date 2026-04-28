@@ -55,6 +55,11 @@ public:
     double getOcpDt() const;
     double last_solve_ms_ = 0.0;
 
+    /// Returns true if at least one solve has completed and prev_X_ is populated.
+    bool hasPreviousTrajectory() const { return !prev_X_.empty(); }
+    /// Read-only access to the last solved state trajectory (size N+1, each NX_SS-dim).
+    const std::vector<Eigen::VectorXd>& getPrevX() const { return prev_X_; }
+
 private:
     void setupProblem(const OCPCreateArgs& args);
 

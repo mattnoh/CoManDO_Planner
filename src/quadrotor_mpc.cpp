@@ -154,8 +154,12 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
         last_solve_ms_ = result.solve_time_ms;
 
         if (X_result.size() > 1) {
-            if (config_.ocp_type == "stateswitch" && X_result[1].size() >= 13) {
-                result.next_state = X_result[1].head(13);
+            auto desc = OCPRegistry::getDescriptor(config_.ocp_type);
+            int state_dim = desc.state_dim;
+            if (config_.ocp_type == "stateswitch" && X_result[1].size() >= state_dim) {
+                result.next_state = X_result[1].head(state_dim);
+            } else if (X_result[1].size() >= 13) {
+                result.next_state = X_result[1].head(13); // Default fallback just in case
             } else {
                 result.next_state = X_result[1];
             }
@@ -185,7 +189,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
 }
 
 void QuadrotorMPC::setTerminalState(const Eigen::VectorXd& terminal) {
-    if (terminal.size() == 13) {
+    if (terminal.size() > 0) {
         config_.terminal_state = terminal;
         solver_.reset();
         prev_U_.clear();
