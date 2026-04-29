@@ -6,17 +6,14 @@
 ///   "circle"   — Fully synthetic circular orbit. No external input.
 ///                Phase is driven by wall-clock time and phi0.
 ///
-///   "qualisys" — Real vehicle pose from a Qualisys-sourced PoseStamped topic.
-///                Position comes from the observed pose. Velocity, acceleration,
-///                and the predicted_accel trajectory are computed analytically
-///                from a circular motion model (center + omega). The phase is
-///                re-anchored to the real pose on every update, so the model
-///                stays locked to the actual vehicle while remaining smooth.
+///   "qualisys" — Real vehicle pose from a Qualisys-sourced rigid-bodies topic.
+///                Position comes from the observed pose. Velocity and acceleration
+///                are estimated by finite-differencing a short pose history window.
+///                No circular model assumed — works for any target trajectory.
 ///
 /// Publishes on:
-///   /target/odom             (nav_msgs/msg/Odometry)
-///   /target/accel            (geometry_msgs/msg/AccelStamped)
-///   /target/predicted_accel  (trajectory_msgs/msg/MultiDOFJointTrajectory)
+///   /target/odom   (nav_msgs/msg/Odometry)
+///   /target/accel  (geometry_msgs/msg/AccelStamped)
 ///
 /// Parameters:
 ///   target_mode         — "circle" or "qualisys"           default: "circle"
@@ -33,8 +30,8 @@
 ///
 /// Usage:
 ///   ros2 run comando_planner target_publisher --ros-args -p target_mode:=circle
-///   ros2 run comando_planner target_publisher --ros-args \
-///       -p target_mode:=qualisys -p center_x:=1.0 -p center_y:=0.5 -p omega:=0.3
+///   ros2 run comando_planner target_publisher --ros-args
+///       -p target_mode:=qualisys -p rigid_body_name:=stmini
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -43,9 +40,8 @@
 #ifdef HAS_MOCAP4R2_MSGS
 #include <mocap4r2_msgs/msg/rigid_bodies.hpp>
 #endif
-#include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
-
 #include <Eigen/Geometry>
+#include <deque>
 
 #include "target/circular_target.hpp"
 #include "target/figure8_target.hpp"
@@ -75,12 +71,12 @@ public:
         frame_id_    = declare_parameter<std::string>("frame_id", "world");
         qualisys_pose_topic_  = declare_parameter<std::string>("rigid_body_name", "stmini");
         drone_odom_topic_     = declare_parameter<std::string>("drone_odom_topic", "/cf_1/odom");
-        absolute_relative_odom_topic_  = declare_parameter<std::string>("absolute_relative_odom_topic", "/drone/relative_odometry");
-        enable_absolute_relative_odom_ = declare_parameter<bool>("enable_absolute_relative_odom", true);
-        enable_body_relative_odom_ = declare_parameter<bool>("enable_body_relative_odom", false);
-        body_relative_odom_topic_ = declare_parameter<std::string>("body_relative_odom_topic", "/drone/body_relative_odom");
-        enable_target_frame_odom_ = declare_parameter<bool>("enable_target_frame_odom", false);
-        target_frame_odom_topic_ = declare_parameter<std::string>("target_frame_odom_topic", "/drone/target_frame_odom");
+        // drone_odom_mode: which relative odometry to publish alongside /target/odom
+        //   "none"         — no drone relative output (absolute OCPs)
+        //   "shifted_world" — /drone/relative_odometry: p_drone-p_tgt, v_drone-v_tgt in world
+        //   "target_frame" — /drone/target_frame_odom: p_B^N, v_B^N, q_NB
+        //   "body_frame"   — /drone/body_relative_odom: p_T^B, v_rel^B, q_NB
+        drone_odom_mode_ = declare_parameter<std::string>("drone_odom_mode", "none");
         drone_pose_topic_ = declare_parameter<std::string>("drone_pose_topic", "/cf_1/pose");
         debug_body_relative_trace_ = declare_parameter<bool>("debug_body_relative_trace", false);
         body_relative_angular_unit_ = declare_parameter<std::string>(
@@ -101,19 +97,15 @@ public:
         // ── Publishers ───────────────────────────────────────────────────────
         odom_pub_  = create_publisher<nav_msgs::msg::Odometry>("/target/odom", 10);
         accel_pub_ = create_publisher<geometry_msgs::msg::AccelStamped>("/target/accel", 10);
-        traj_pub_  = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>(
-            "/target/predicted_accel", 10);
 
-        if (enable_absolute_relative_odom_) {
-            abs_rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(absolute_relative_odom_topic_, 10);
+        if (drone_odom_mode_ == "shifted_world") {
+            abs_rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/relative_odometry", 10);
+        } else if (drone_odom_mode_ == "body_frame") {
+            body_rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/body_relative_odom", 10);
+        } else if (drone_odom_mode_ == "target_frame") {
+            target_frame_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/target_frame_odom", 10);
         }
-        if (enable_body_relative_odom_) {
-            body_rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(body_relative_odom_topic_, 10);
-        }
-        if (enable_target_frame_odom_) {
-            target_frame_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(target_frame_odom_topic_, 10);
-        }
-        if (enable_absolute_relative_odom_ || enable_body_relative_odom_ || enable_target_frame_odom_) {
+        if (drone_odom_mode_ != "none") {
             drone_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
                 drone_odom_topic_, 10,
                 [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -122,7 +114,7 @@ public:
                     has_drone_odom_ = true;
                 });
         }
-        if (enable_body_relative_odom_ || enable_target_frame_odom_) {
+        if (drone_odom_mode_ == "body_frame" || drone_odom_mode_ == "target_frame") {
             drone_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
                 drone_pose_topic_, 10,
                 [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -145,14 +137,14 @@ public:
                         RCLCPP_INFO_ONCE(get_logger(),
                             "[TargetPublisher] body seen: '%s'", rb.rigid_body_name.c_str());
                         if (rb.rigid_body_name != qualisys_pose_topic_) continue;
-                        const double dx = rb.pose.position.x - center_x_;
-                        const double dy = rb.pose.position.y - center_y_;
+                        PoseObs obs;
+                        obs.t   = rclcpp::Time(msg->header.stamp).seconds();
+                        obs.pos = {rb.pose.position.x, rb.pose.position.y, rb.pose.position.z};
                         std::lock_guard<std::mutex> lk(pose_mutex_);
-                        last_phi_    = std::atan2(dy, dx);
-                        last_R_      = std::sqrt(dx * dx + dy * dy);
-                        last_z_      = rb.pose.position.z;
-                        last_pose_t_ = rclcpp::Time(msg->header.stamp).seconds();
-                        has_pose_    = true;
+                        pose_history_.push_back(obs);
+                        if (pose_history_.size() > N_POSE_HISTORY) {
+                            pose_history_.pop_front();
+                        }
                         break;
                     }
                 });
@@ -174,23 +166,20 @@ public:
             center_x_, center_y_, center_z_, radius_, omega_, publish_hz_);
 #endif
 
-        if (enable_absolute_relative_odom_) {
+        if (drone_odom_mode_ == "shifted_world") {
             RCLCPP_INFO(get_logger(),
-            "[TargetPublisher] Absolute-relative odom enabled: in=%s out=%s",
-            drone_odom_topic_.c_str(), absolute_relative_odom_topic_.c_str());
-        }
-        if (enable_body_relative_odom_) {
+                "[TargetPublisher] drone_odom_mode=shifted_world → /drone/relative_odometry (drone-target in world frame)");
+        } else if (drone_odom_mode_ == "body_frame") {
             RCLCPP_INFO(get_logger(),
-            "[TargetPublisher] Body-relative odom enabled: pose=%s odom=%s out=%s",
-            drone_pose_topic_.c_str(), drone_odom_topic_.c_str(), body_relative_odom_topic_.c_str());
+                "[TargetPublisher] drone_odom_mode=body_frame → /drone/body_relative_odom (target in drone body frame)");
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] Body-relative angular input unit='%s' (set body_relative_input_angular_unit to 'rad_s' if upstream already publishes rad/s)",
+                "[TargetPublisher] Angular unit='%s' (set body_relative_input_angular_unit:=rad_s if upstream publishes rad/s)",
                 body_relative_angular_unit_.c_str());
-        }
-        if (enable_target_frame_odom_) {
+        } else if (drone_odom_mode_ == "target_frame") {
             RCLCPP_INFO(get_logger(),
-            "[TargetPublisher] Target-frame odom enabled: pose=%s odom=%s out=%s",
-            drone_pose_topic_.c_str(), drone_odom_topic_.c_str(), target_frame_odom_topic_.c_str());
+                "[TargetPublisher] drone_odom_mode=target_frame → /drone/target_frame_odom (drone in target N frame)");
+        } else {
+            RCLCPP_INFO(get_logger(), "[TargetPublisher] drone_odom_mode=none — no relative odometry output");
         }
 
         // ── Timer ────────────────────────────────────────────────────────────
@@ -234,34 +223,45 @@ private:
         const double t = stamp.seconds();
 
         Kinematics k{};
-        double phi_now = 0.0;
-        double R_now   = radius_;
 
         if (target_mode_ == "qualisys") {
-            // ── qualisys mode: re-anchor phase from latest observed pose ─────
-            double phi_obs, R_obs, z_obs, t_obs;
-            {
-                std::lock_guard<std::mutex> lk(pose_mutex_);
-                if (!has_pose_) {
-                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                        "[TargetPublisher] Waiting for '%s' in /rigid_bodies ...",
-                        qualisys_pose_topic_.c_str());
-                    return;
-                }
-                phi_obs = last_phi_;
-                R_obs   = last_R_;
-                z_obs   = last_z_;
-                t_obs   = last_pose_t_;
+            // ── qualisys mode: finite-differenced velocity and acceleration ──
+            std::lock_guard<std::mutex> lk(pose_mutex_);
+            if (pose_history_.empty()) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "[TargetPublisher] Waiting for '%s' in /rigid_bodies ...",
+                    qualisys_pose_topic_.c_str());
+                return;
             }
-
-            // Extrapolate phase from last observation to now
-            phi_now = phi_obs + omega_ * (t - t_obs);
-            R_now   = R_obs;
-            k = circleKinematics(phi_now, R_now, z_obs);
+            const auto& latest = pose_history_.back();
+            k.px = latest.pos.x();
+            k.py = latest.pos.y();
+            k.pz = latest.pos.z();
+            if (pose_history_.size() >= 2) {
+                const auto& oldest = pose_history_.front();
+                const double dt = latest.t - oldest.t;
+                if (dt > 1e-6) {
+                    const Eigen::Vector3d vel = (latest.pos - oldest.pos) / dt;
+                    k.vx = vel.x(); k.vy = vel.y(); k.vz = vel.z();
+                }
+            }
+            if (pose_history_.size() >= 3) {
+                const auto& p0   = pose_history_.front();
+                const auto& pmid = pose_history_[pose_history_.size() / 2];
+                const auto& p1   = pose_history_.back();
+                const double dt0 = pmid.t - p0.t;
+                const double dt1 = p1.t  - pmid.t;
+                if (dt0 > 1e-6 && dt1 > 1e-6) {
+                    const Eigen::Vector3d v0  = (pmid.pos - p0.pos) / dt0;
+                    const Eigen::Vector3d v1  = (p1.pos  - pmid.pos) / dt1;
+                    const Eigen::Vector3d acc = (v1 - v0) / (0.5 * (dt0 + dt1));
+                    k.ax = acc.x(); k.ay = acc.y(); k.az = acc.z();
+                }
+            }
 
         } else {
             // ── circle mode: fully synthetic ─────────────────────────────────
-            phi_now = phi0_ + omega_ * t;
+            const double phi_now = phi0_ + omega_ * t;
             k = circleKinematics(phi_now, radius_, center_z_);
         }
 
@@ -313,7 +313,7 @@ private:
             }
         }
 
-        if (enable_absolute_relative_odom_ && abs_rel_odom_pub_ && have_drone_odom) {
+        if (drone_odom_mode_ == "shifted_world" && abs_rel_odom_pub_ && have_drone_odom) {
             nav_msgs::msg::Odometry rel = drone_odom_copy;
             rel.header.stamp    = drone_odom_copy.header.stamp;
             rel.header.frame_id = frame_id_;
@@ -330,7 +330,7 @@ private:
             abs_rel_odom_pub_->publish(rel);
         }
 
-        if (enable_body_relative_odom_ && body_rel_odom_pub_ && have_drone_odom && have_drone_pose) {
+        if (drone_odom_mode_ == "body_frame" && body_rel_odom_pub_ && have_drone_odom && have_drone_pose) {
             const Eigen::Vector3d target_world(k.px, k.py, k.pz);
             const Eigen::Vector3d drone_world(
                 drone_pose_copy.pose.position.x,
@@ -395,7 +395,7 @@ private:
             }
         }
 
-        if (enable_target_frame_odom_ && target_frame_odom_pub_ && have_drone_odom && have_drone_pose) {
+        if (drone_odom_mode_ == "target_frame" && target_frame_odom_pub_ && have_drone_odom && have_drone_pose) {
             // Cheating estimator: uses ground-truth world-frame drone pose/odom to compute
             // what an ideal target-frame relative estimator would output for the tf OCP.
             // p_B^N = R_NW * (p_drone - p_tgt)
@@ -445,100 +445,47 @@ private:
             target_frame_odom_pub_->publish(tf_odom);
         }
 
-        // ── Predicted acceleration trajectory (10 Hz) ────────────────────────
-        static int traj_counter = 0;
-        if (traj_counter++ % static_cast<int>(publish_hz_ / 10.0) == 0) {
-            trajectory_msgs::msg::MultiDOFJointTrajectory traj;
-            traj.header.stamp    = stamp;
-            traj.header.frame_id = frame_id_;
-            traj.joint_names.push_back("target");
-
-            constexpr int   NUM_POINTS = 400;   // 20 s at 0.05 s resolution
-            constexpr double DT        = 0.05;
-            traj.points.reserve(NUM_POINTS);
-
-            for (int i = 0; i < NUM_POINTS; ++i) {
-                const double phi_i = phi_now + omega_ * i * DT;
-                const Kinematics ki = circleKinematics(phi_i, R_now,
-                    (target_mode_ == "qualisys") ? k.pz : center_z_);
-
-                trajectory_msgs::msg::MultiDOFJointTrajectoryPoint pt;
-                pt.time_from_start = rclcpp::Duration::from_seconds(i * DT);
-
-                geometry_msgs::msg::Transform trans;
-                trans.translation.x = ki.px;
-                trans.translation.y = ki.py;
-                trans.translation.z = ki.pz;
-                trans.rotation.w    = 1.0;
-                pt.transforms.push_back(trans);
-
-                geometry_msgs::msg::Twist vel;
-                vel.linear.x = ki.vx;
-                vel.linear.y = ki.vy;
-                vel.linear.z = ki.vz;
-                pt.velocities.push_back(vel);
-
-                geometry_msgs::msg::Twist acc;
-                acc.linear.x = ki.ax;
-                acc.linear.y = ki.ay;
-                acc.linear.z = ki.az;
-                pt.accelerations.push_back(acc);
-
-                traj.points.push_back(pt);
-            }
-            traj_pub_->publish(traj);
-        }
-
         // ── Diagnostics (every 5 s) ──────────────────────────────────────────
         static double last_diag = -5.0;
         if (t - last_diag >= 5.0) {
             last_diag = t;
             RCLCPP_DEBUG(get_logger(),
-                "[TargetPublisher] t=%.2f  phi=%.3f  R=%.3f  "
-                "pos=(%.3f,%.3f,%.3f)  vel=(%.3f,%.3f)",
-                t, phi_now, R_now, k.px, k.py, k.pz, k.vx, k.vy);
+                "[TargetPublisher] t=%.2f  pos=(%.3f,%.3f,%.3f)  vel=(%.3f,%.3f,%.3f)",
+                t, k.px, k.py, k.pz, k.vx, k.vy, k.vz);
         }
     }
 
     // ── Parameters ─────────────────────────────────────────────────────────
     std::string target_mode_;
     double center_x_, center_y_, center_z_;
-    double radius_, amp_x_, amp_y_, omega_, phi0_, publish_hz_;
+    double radius_, omega_, phi0_, publish_hz_;
     std::string frame_id_;
     std::string qualisys_pose_topic_;
     std::string drone_odom_topic_;
-    std::string absolute_relative_odom_topic_;
-    bool enable_absolute_relative_odom_ = true;
-    bool enable_body_relative_odom_ = false;
-    std::string body_relative_odom_topic_;
-    bool enable_target_frame_odom_ = false;
-    std::string target_frame_odom_topic_;
+    std::string drone_odom_mode_;  // "none" | "shifted_world" | "body_frame" | "target_frame"
     std::string drone_pose_topic_;
     bool debug_body_relative_trace_ = false;
     std::string body_relative_angular_unit_ = "deg_s";
     Eigen::Quaterniond last_target_quat_ = Eigen::Quaterniond::Identity();
 
     // ── ROS handles ────────────────────────────────────────────────────────
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr                      odom_pub_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr                      abs_rel_odom_pub_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr                      body_rel_odom_pub_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr                      target_frame_odom_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::AccelStamped>::SharedPtr             accel_pub_;
-    rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr traj_pub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr                   drone_odom_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr           drone_pose_sub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          odom_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          abs_rel_odom_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          body_rel_odom_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          target_frame_odom_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::AccelStamped>::SharedPtr accel_pub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr       drone_odom_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr drone_pose_sub_;
 #ifdef HAS_MOCAP4R2_MSGS
-    rclcpp::Subscription<mocap4r2_msgs::msg::RigidBodies>::SharedPtr            rigid_bodies_sub_;
+    rclcpp::Subscription<mocap4r2_msgs::msg::RigidBodies>::SharedPtr rigid_bodies_sub_;
 #endif
     rclcpp::TimerBase::SharedPtr timer_;
 
-    // ── Qualisys state (guarded by pose_mutex_) ─────────────────────────────
+    // ── Qualisys pose history (guarded by pose_mutex_) ───────────────────────
+    struct PoseObs { double t; Eigen::Vector3d pos; };
+    static constexpr std::size_t N_POSE_HISTORY = 8;
     std::mutex pose_mutex_;
-    double last_phi_    = 0.0;
-    double last_R_      = 1.0;
-    double last_z_      = 0.0;
-    double last_pose_t_ = 0.0;
-    bool   has_pose_    = false;
+    std::deque<PoseObs> pose_history_;
 
     // ── Drone odom (guarded by drone_mutex_) ────────────────────────────────
     std::mutex drone_mutex_;
