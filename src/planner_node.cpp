@@ -52,6 +52,8 @@ public:
         //   ros2 service call /mavros/param/get mavros_msgs/srv/ParamGet "{param_id: MPC_THR_HOVER}"
         this->declare_parameter("hover_thrust", 0.3);
         hover_thrust_param_ = float(this->get_parameter("hover_thrust").as_double());
+        this->declare_parameter("skip_trajectory_validation", false);
+        skip_trajectory_validation_ = this->get_parameter("skip_trajectory_validation").as_bool();
         open_loop_abort_on_divergence_ = runtime_cfg.open_loop_abort_on_divergence;
         open_loop_abort_max_z_error_m_ = runtime_cfg.open_loop_abort_max_z_error_m;
         open_loop_abort_max_vz_error_mps_ = runtime_cfg.open_loop_abort_max_vz_error_mps;
@@ -1000,23 +1002,24 @@ private:
         }
 
         // Trajectory Validation
-        bool valid = true;
-        if (!result.success || result.state_trajectory.size() < 2) {
-            RCLCPP_WARN(this->get_logger(), "Solve FAILED — keeping previous trajectory locally");
-            valid = false;
-        } else if (result.constraint_error > max_constraint_error_) {
-            RCLCPP_WARN(this->get_logger(), "Solve constraint error (%.3f) > threshold (%.3f) — keeping previous trajectory",
-                        result.constraint_error, max_constraint_error_);
-            valid = false;
-        } else if (!validateTrajectory(result.state_trajectory, result.control_trajectory)) {
-            RCLCPP_WARN(this->get_logger(), "Solve physical bounds violated — keeping previous trajectory");
-            valid = false;
-        }
-
-        if (!valid) {
-            // Do NOT publish hover hold here! The replayer keeps playing the old trajectory.
-            // The solver will immediately retry on the next 1ms tick.
-            return;
+        if (!skip_trajectory_validation_) {
+            bool valid = true;
+            if (!result.success || result.state_trajectory.size() < 2) {
+                RCLCPP_WARN(this->get_logger(), "Solve FAILED — keeping previous trajectory locally");
+                valid = false;
+            } else if (result.constraint_error > max_constraint_error_) {
+                RCLCPP_WARN(this->get_logger(), "Solve constraint error (%.3f) > threshold (%.3f) — keeping previous trajectory",
+                            result.constraint_error, max_constraint_error_);
+                valid = false;
+            } else if (!validateTrajectory(result.state_trajectory, result.control_trajectory)) {
+                RCLCPP_WARN(this->get_logger(), "Solve physical bounds violated — keeping previous trajectory");
+                valid = false;
+            }
+            if (!valid) {
+                // Do NOT publish hover hold here! The replayer keeps playing the old trajectory.
+                // The solver will immediately retry on the next 1ms tick.
+                return;
+            }
         }
 
         stale_warning_count_ = 0;
@@ -1514,6 +1517,7 @@ private:
     double open_loop_abort_max_vz_error_mps_ = 1.00;
     int n_replay_ = 4;
     double max_constraint_error_ = 1.0;
+    bool skip_trajectory_validation_ = false;
     OCPDescriptor::CommandMode command_mode_ = OCPDescriptor::CommandMode::CmdFullState;
     int state_dim_ = 13;
     int control_dim_ = 4;
