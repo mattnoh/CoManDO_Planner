@@ -912,6 +912,14 @@ def build_plots(data_dir, out_path=None, elev=22):
         actual_raw_df, solves_df,
         state_cols, control_cols, abs_state_cols, rel_state_cols, theta_col)
 
+    # For absolute_shifted OCPs (e.g. stateswitch with valid target), the solver
+    # trajectory is in (drone − target) frame. Add target back to get world frame.
+    if "coord_mode" in solves_df.columns and (solves_df["coord_mode"] == "absolute_shifted").any():
+        for _sc, _tc in [("px","tgt_x"),("py","tgt_y"),("pz","tgt_z"),
+                          ("vx","tgt_vx"),("vy","tgt_vy"),("vz","tgt_vz")]:
+            if _sc in solve_df_abs.columns and _tc in solve_df_abs.columns:
+                solve_df_abs[_sc] = solve_df_abs[_sc].values + solve_df_abs[_tc].values
+
     first_traj = get_first_solve_traj(solves_df)
     target_df  = solve_df_abs[TARGET_COLS].copy().ffill().bfill()
 

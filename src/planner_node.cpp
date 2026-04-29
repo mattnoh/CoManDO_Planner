@@ -1068,6 +1068,9 @@ private:
             } else {
                 meta.coord_mode = "absolute";
             }
+            if (result.is_relative_plan) {
+                meta.coord_mode = "absolute_shifted";
+            }
             if (desc.prepare_log_meta) {
                 desc.prepare_log_meta(meta, result.extra, runtime_cfg_);
             }
