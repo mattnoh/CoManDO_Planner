@@ -235,9 +235,20 @@ def _fc(df, *candidates):
             return df[c]
     return pd.Series(np.nan, index=df.index)
 
+def _normalise_solves(df):
+    """Rename columns from newer logging schema to the names the rest of the script expects."""
+    renames = {"solve_id": "solve_num", "solve_ms": "solve_time_ms", "t_acc": "t"}
+    df = df.rename(columns={k: v for k, v in renames.items() if k in df.columns})
+    if "solve_iters" not in df.columns:
+        df["solve_iters"] = 0
+    if "coord_mode" not in df.columns:
+        df["coord_mode"] = ""
+    return df
+
+
 def load_data(data_dir):
     actual = pd.read_csv(os.path.join(data_dir, "actual_state.csv"))
-    solves = pd.read_csv(os.path.join(data_dir, "all_solves.csv"))
+    solves = _normalise_solves(pd.read_csv(os.path.join(data_dir, "all_solves.csv")))
     cmd_path = os.path.join(data_dir, "commanded_state.csv")
     commanded = pd.read_csv(cmd_path) if os.path.exists(cmd_path) else None
     return actual, solves, commanded
@@ -571,8 +582,8 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
                 color=C_FIRST, lw=1.4, ls=":", alpha=0.55, zorder=3)
 
             # Commanded / stitched path (dashed)
-            ax.plot(ctraj[:, 0], ctraj[:, 1], ctraj[:, 2],
-                color=C_CMD, lw=1.5, ls="--", alpha=0.70, zorder=4)
+            # ax.plot(ctraj[:, 0], ctraj[:, 1], ctraj[:, 2],
+            #     color=C_CMD, lw=1.5, ls="--", alpha=0.70, zorder=4)
 
             # Actual trajectory (solid, coloured by speed)
             from matplotlib.colors import Normalize
@@ -605,7 +616,7 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
                 handles = [
                     Line2D([0],[0], color=C_ACTUAL, lw=2.2,           label="Actual path"),
                     Line2D([0],[0], color="#d12be6", lw=2.5,         label="Target"),
-                    Line2D([0],[0], color=C_CMD,    lw=1.5, ls="--",  label=command_label),
+                    # Line2D([0],[0], color=C_CMD,    lw=1.5, ls="--",  label=command_label),
                     Line2D([0],[0], color=C_FIRST,  lw=1.4, ls=":",   label="Planned solve nodes"),
                     Line2D([0],[0], color=CONE_COL, lw=1.2,           label="Glideslope"),
                 ]
@@ -1162,4 +1173,3 @@ if __name__ == "__main__":
     print(f"  Unique solves  : {solves_df['solve_num'].nunique()}")
 
     build_plots(args.dir, out_path=args.out, elev=args.elev)
-    

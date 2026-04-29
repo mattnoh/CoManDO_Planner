@@ -8,7 +8,7 @@ namespace target_models {
 struct CircularTarget {
     Eigen::Vector3d center{0.0, 0.0, 0.2};
     double R = 1.0;
-    double omega = 0.1;
+    double omega = 0.4;
     double phi0 = 0.0;
 
     Eigen::Vector3d pos(double t) const {

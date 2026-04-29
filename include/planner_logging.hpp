@@ -34,6 +34,9 @@ struct SolveLogMeta {
     Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
+    Eigen::Vector4d target_snapshot_quat = Eigen::Vector4d(1,0,0,0); // [qw,qx,qy,qz]
+    Eigen::Vector3d target_snapshot_omega = Eigen::Vector3d::Zero(); // Ω_N
+    Eigen::Vector3d target_snapshot_beta = Eigen::Vector3d::Zero();  // β_N
 
     // Optional node-wise reconstructed target trajectory (world frame).
     std::vector<Eigen::Vector3d> target_world_pos_trajectory;
@@ -106,7 +109,11 @@ public:
             // Always emit "theta" col in the prefix already; extra u elements would be u4+ only.
 
             // Target at the end
-            all_solves_log_ << ",tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz\n";
+            all_solves_log_ << ",tgt_x,tgt_y,tgt_z,tgt_vx,tgt_vy,tgt_vz"
+                           << ",tgt_ax,tgt_ay,tgt_az"
+                           << ",tgt_qw,tgt_qx,tgt_qy,tgt_qz"
+                           << ",tgt_wx,tgt_wy,tgt_wz"
+                           << ",tgt_alfx,tgt_alfy,tgt_alfz\n";
         }
 
         // ── commanded_state.csv (CmdFullState only) ──────────────────────────
@@ -121,11 +128,18 @@ public:
             commanded_state_log_ << ",fz,mx,my,mz,acc_x,acc_y,acc_z\n";
         }
 
-        // ── commanded_hover_state.csv (CmdHover only) ────────────────────────
+        // ── commanded_hover_state.csv (CmdBodyRate + platform=crazyflie) ────────
         commanded_hover_log_.open(folder + "/commanded_hover_state.csv");
         if (commanded_hover_log_.is_open()) {
             commanded_hover_log_
                 << "timestamp,solve_num,vx,vy,z_distance,yaw_rate\n";
+        }
+
+        // ── commanded_bodyrate_state.csv (CmdBodyRate + platform=mavros/generic) ─
+        commanded_bodyrate_log_.open(folder + "/commanded_bodyrate_state.csv");
+        if (commanded_bodyrate_log_.is_open()) {
+            commanded_bodyrate_log_
+                << "timestamp,solve_num,T_ms2,omega_x,omega_y,omega_z\n";
         }
 
         // ── actual_state.csv ─────────────────────────────────────────────────
@@ -141,6 +155,7 @@ public:
         initialized_ = all_solves_log_.is_open() &&
                        commanded_state_log_.is_open() &&
                        commanded_hover_log_.is_open() &&
+                       commanded_bodyrate_log_.is_open() &&
                        actual_state_log_.is_open();
         RCLCPP_INFO(ros_logger, "Logging to: %s", folder.c_str());
         return initialized_;
@@ -232,7 +247,11 @@ public:
             // Target columns at end
             all_solves_log_ << ","
                             << tgt_p.x() << "," << tgt_p.y() << "," << tgt_p.z() << ","
-                            << tgt_v.x() << "," << tgt_v.y() << "," << tgt_v.z()
+                            << tgt_v.x() << "," << tgt_v.y() << "," << tgt_v.z() << ","
+                            << meta.target_snapshot_acc.x() << "," << meta.target_snapshot_acc.y() << "," << meta.target_snapshot_acc.z() << ","
+                            << meta.target_snapshot_quat(0) << "," << meta.target_snapshot_quat(1) << "," << meta.target_snapshot_quat(2) << "," << meta.target_snapshot_quat(3) << ","
+                            << meta.target_snapshot_omega.x() << "," << meta.target_snapshot_omega.y() << "," << meta.target_snapshot_omega.z() << ","
+                            << meta.target_snapshot_beta.x() << "," << meta.target_snapshot_beta.y() << "," << meta.target_snapshot_beta.z()
                             << "\n";
         }
         all_solves_log_.flush();
@@ -264,18 +283,31 @@ public:
         actual_state_log_.flush();
     }
 
-    /// Log hover command (CmdHover mode only — skipped if CmdFullState).
+    /// Log hover command [vx, vy, z_cmd, yaw_rate] (CmdBodyRate + platform=crazyflie).
     void logCommandedHoverState(const std::array<float, 4>& cmd, int solve_num) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!initialized_ || !commanded_hover_log_.is_open()) {
             return;
         }
-        return;  // CmdHover removed — this function is never used
         commanded_hover_log_ << std::fixed << std::setprecision(6)
                              << wallTimeSec() << "," << solve_num << ","
                              << cmd[0] << "," << cmd[1] << ","
                              << cmd[2] << "," << cmd[3] << "\n";
         commanded_hover_log_.flush();
+    }
+
+    /// Log body-rate command [T_ms2, ωx, ωy, ωz] (CmdBodyRate + platform=mavros or generic).
+    void logCommandedBodyRateState(const Eigen::VectorXd& u, int solve_num) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!initialized_ || !commanded_bodyrate_log_.is_open()) return;
+        commanded_bodyrate_log_ << std::fixed << std::setprecision(6)
+                                << wallTimeSec() << "," << solve_num << ","
+                                << (u.size() > 0 ? u(0) : 0.0) << ","   // T_ms2
+                                << (u.size() > 1 ? u(1) : 0.0) << ","   // omega_x
+                                << (u.size() > 2 ? u(2) : 0.0) << ","   // omega_y
+                                << (u.size() > 3 ? u(3) : 0.0)          // omega_z
+                                << "\n";
+        commanded_bodyrate_log_.flush();
     }
 
     /// Log full commanded state (CmdFullState mode only — skipped if CmdHover).
@@ -327,6 +359,7 @@ private:
     std::ofstream all_solves_log_;
     std::ofstream commanded_state_log_;
     std::ofstream commanded_hover_log_;
+    std::ofstream commanded_bodyrate_log_;
     std::ofstream actual_state_log_;
 };
 

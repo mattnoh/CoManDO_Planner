@@ -641,6 +641,9 @@ private:
     void publishPausedHoverHoldTick() {
         if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
             if (platform_ == "crazyflie") {
+                if (drone_state_is_relative_) {
+                    return; // Let goto hold the drone, we cannot give an absolute z before the first solve
+                }
                 // Hold altitude using cmd_hover with zero velocity
                 const Eigen::VectorXd x_abs = convertStateToAbsoluteFrame(getCurrentState());
                 const float z_hold = (x_abs.size() >= 3) ? float(x_abs(2)) : 0.3f;
@@ -937,17 +940,9 @@ private:
             x0 = desc.transform_state(x0_abs, target_snapshot);
         }
 
-        // Carry forward solver-propagated augmented states (e.g. Ω_N, a_T^B, β_N).
-        // transform_state always initialises augmented states from the current snapshot
-        // which kills look-ahead: the OCP always sees the target "as of now" instead
-        // of where it will be. merge_prev_augmented replaces those indices with the
-        // values the solver's own dynamics propagated to the n_replay_-th node.
-        // On the cold-start (no previous trajectory) this is skipped, so transform_state
-        // provides the bootstrap augmented values from the snapshot — correct behaviour.
-        if (desc.merge_prev_augmented
-                && alipddp_mpc_ && alipddp_mpc_->hasPreviousTrajectory()) {
-            desc.merge_prev_augmented(x0, alipddp_mpc_->getPrevX(), n_replay_);
-        }
+        // merge_prev_augmented has been removed. Augmented target state variables
+        // (Ω_N, a_T^B, β_N) are now populated purely from the fresh sensor snapshot
+        // in transform_state, leaving look-ahead entirely to the solver dynamics.
 
         const double pos_err = apply_registry_transform
             ? x0.segment(0, 3).norm()
@@ -1057,6 +1052,9 @@ private:
             meta.target_snapshot_pos = result.target_snapshot_pos;
             meta.target_snapshot_vel = result.target_snapshot_vel;
             meta.target_snapshot_acc = result.target_snapshot_acc;
+            meta.target_snapshot_quat = result.target_snapshot_quat;
+            meta.target_snapshot_omega = result.target_snapshot_omega;
+            meta.target_snapshot_beta = result.target_snapshot_beta;
             meta.target_world_pos_trajectory = result.target_world_pos_trajectory;
             meta.target_world_vel_trajectory = result.target_world_vel_trajectory;
 
@@ -1090,12 +1088,7 @@ private:
             return;
         }
         if (!is_primed_.load()) {
-            // For body-rate OCPs the high-level commander doesn't hold altitude —
-            // send a neutral hover command until the first solve arrives.
-            if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
-                publishPausedHoverHoldTick();
-            }
-            return;
+            return;  // high-level goto keeps drone in place until first solve arrives
         }
 
         auto replay = trajectory_replayer_.sample(Clock::now(), ocp_dt_);
@@ -1215,6 +1208,9 @@ private:
             result.target_snapshot_pos = target_snapshot.position;
             result.target_snapshot_vel = target_snapshot.velocity;
             result.target_snapshot_acc = target_snapshot.acceleration;
+            result.target_snapshot_quat = target_snapshot.orientation;
+            result.target_snapshot_omega = target_snapshot.angular_velocity;
+            result.target_snapshot_beta = target_snapshot.angular_acceleration;
             result.target_motion_source = "snapshot";
         }
         return result;
@@ -1386,6 +1382,9 @@ private:
                 meta.target_snapshot_pos = result.target_snapshot_pos;
                 meta.target_snapshot_vel = result.target_snapshot_vel;
                 meta.target_snapshot_acc = result.target_snapshot_acc;
+                meta.target_snapshot_quat = result.target_snapshot_quat;
+                meta.target_snapshot_omega = result.target_snapshot_omega;
+                meta.target_snapshot_beta = result.target_snapshot_beta;
                 meta.target_world_pos_trajectory = result.target_world_pos_trajectory;
                 meta.target_world_vel_trajectory = result.target_world_vel_trajectory;
 

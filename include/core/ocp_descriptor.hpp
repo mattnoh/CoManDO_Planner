@@ -39,6 +39,9 @@ struct SolverResult {
     Eigen::Vector3d target_snapshot_pos = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_vel = Eigen::Vector3d::Zero();
     Eigen::Vector3d target_snapshot_acc = Eigen::Vector3d::Zero();
+    Eigen::Vector4d target_snapshot_quat = Eigen::Vector4d(1,0,0,0);
+    Eigen::Vector3d target_snapshot_omega = Eigen::Vector3d::Zero();
+    Eigen::Vector3d target_snapshot_beta = Eigen::Vector3d::Zero();
     std::vector<Eigen::Vector3d> target_world_pos_trajectory;
     std::vector<Eigen::Vector3d> target_world_vel_trajectory;
     std::string target_motion_source = "snapshot";

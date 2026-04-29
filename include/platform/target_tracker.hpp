@@ -50,6 +50,7 @@ struct TargetState {
     Eigen::Vector3d velocity     = Eigen::Vector3d::Zero();
     Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
     Eigen::Vector3d angular_velocity = Eigen::Vector3d::Zero();  // Ω_N in world frame
+    Eigen::Vector3d angular_acceleration = Eigen::Vector3d::Zero(); // β_N in world frame
     Eigen::Vector4d orientation  = Eigen::Vector4d(1,0,0,0);     // target quat [qw,qx,qy,qz]
 
     // Separate timestamps per topic so each can be checked independently.
@@ -154,6 +155,7 @@ inline void setup(
             target_state.velocity << msg->twist.twist.linear.x,
                                      msg->twist.twist.linear.y,
                                      msg->twist.twist.linear.z;
+            Eigen::Vector3d prev_omega = target_state.angular_velocity;
             target_state.angular_velocity << msg->twist.twist.angular.x,
                                              msg->twist.twist.angular.y,
                                              msg->twist.twist.angular.z;
@@ -161,13 +163,24 @@ inline void setup(
                                         msg->pose.pose.orientation.x,
                                         msg->pose.pose.orientation.y,
                                         msg->pose.pose.orientation.z;
-            target_state.odom_received = true;
 
-            // Update ONLY the odom timestamp; accel timestamp is unaffected.
-            target_state.odom_timestamp =
+            rclcpp::Time new_timestamp =
                 (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0)
                     ? rclcpp::Time(msg->header.stamp)
                     : node->now();
+
+            if (target_state.odom_received) {
+                double dt = (new_timestamp - target_state.odom_timestamp).seconds();
+                if (dt > 1e-6 && dt < 0.5) {
+                    target_state.angular_acceleration =
+                        (target_state.angular_velocity - prev_omega) / dt;
+                }
+            }
+
+            target_state.odom_received = true;
+
+            // Update ONLY the odom timestamp; accel timestamp is unaffected.
+            target_state.odom_timestamp = new_timestamp;
         },
         opts);
 
@@ -183,6 +196,13 @@ inline void setup(
                 target_state.acceleration << msg->accel.linear.x,
                                              msg->accel.linear.y,
                                              msg->accel.linear.z;
+                
+                // Read optional angular acceleration from the AccelStamped message.
+                // This overrides the finite-difference estimate from odom if both exist.
+                target_state.angular_acceleration << msg->accel.angular.x,
+                                                     msg->accel.angular.y,
+                                                     msg->accel.angular.z;
+                
                 target_state.accel_received = true;
 
                 // Update ONLY the accel timestamp; odom timestamp is unaffected.

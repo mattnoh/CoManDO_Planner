@@ -284,6 +284,7 @@ inline OCPDescriptor descriptor() {
     d.command_mode = OCPDescriptor::CommandMode::CmdBodyRate;
     d.drone_odom_mode = OCPDescriptor::DroneOdomMode::TargetFrameRelative;
     d.skip_altitude_validation = true;
+    d.skip_trajectory_validation = true;
     d.variable_dt = true;
     d.state_dim = NX;
     d.control_dim = NU;

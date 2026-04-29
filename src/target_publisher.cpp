@@ -62,6 +62,7 @@ public:
         // ── Parameters ──────────────────────────────────────────────────────
         // Circle trajectory shape is configured in include/target/circular_target.hpp
         target_mode_ = declare_parameter<std::string>("target_mode", "circle");
+        target_yaw_rate_ = declare_parameter<double>("target_yaw_rate", 0.3);
         publish_hz_  = declare_parameter<double>("publish_hz", 100.0);
         frame_id_    = declare_parameter<std::string>("frame_id", "world");
         qualisys_pose_topic_  = declare_parameter<std::string>("rigid_body_name", "stmini");
@@ -134,6 +135,8 @@ public:
                         PoseObs obs;
                         obs.t   = rclcpp::Time(msg->header.stamp).seconds();
                         obs.pos = {rb.pose.position.x, rb.pose.position.y, rb.pose.position.z};
+                        obs.q   = Eigen::Quaterniond(rb.pose.orientation.w, rb.pose.orientation.x, rb.pose.orientation.y, rb.pose.orientation.z);
+                        obs.q.normalize();
                         std::lock_guard<std::mutex> lk(pose_mutex_);
                         pose_history_.push_back(obs);
                         if (pose_history_.size() > N_POSE_HISTORY) {
@@ -189,6 +192,9 @@ private:
         double px, py, pz;
         double vx, vy, vz;
         double ax, ay, az;
+        double wx, wy, wz;
+        double alfx, alfy, alfz;
+        Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
     };
 
     // ── Timer callback ───────────────────────────────────────────────────────
@@ -212,12 +218,22 @@ private:
             k.px = latest.pos.x();
             k.py = latest.pos.y();
             k.pz = latest.pos.z();
+            k.q  = latest.q;
+            
+            Eigen::Vector3d w0 = Eigen::Vector3d::Zero();
+            Eigen::Vector3d w1 = Eigen::Vector3d::Zero();
+
             if (pose_history_.size() >= 2) {
                 const auto& oldest = pose_history_.front();
                 const double dt = latest.t - oldest.t;
                 if (dt > 1e-6) {
                     const Eigen::Vector3d vel = (latest.pos - oldest.pos) / dt;
                     k.vx = vel.x(); k.vy = vel.y(); k.vz = vel.z();
+                    
+                    Eigen::Quaterniond dq = latest.q * oldest.q.conjugate();
+                    Eigen::AngleAxisd aa(dq);
+                    Eigen::Vector3d w = aa.axis() * aa.angle() / dt;
+                    k.wx = w.x(); k.wy = w.y(); k.wz = w.z();
                 }
             }
             if (pose_history_.size() >= 3) {
@@ -231,6 +247,17 @@ private:
                     const Eigen::Vector3d v1  = (p1.pos  - pmid.pos) / dt1;
                     const Eigen::Vector3d acc = (v1 - v0) / (0.5 * (dt0 + dt1));
                     k.ax = acc.x(); k.ay = acc.y(); k.az = acc.z();
+                    
+                    Eigen::Quaterniond dq0 = pmid.q * p0.q.conjugate();
+                    Eigen::AngleAxisd aa0(dq0);
+                    w0 = aa0.axis() * aa0.angle() / dt0;
+                    
+                    Eigen::Quaterniond dq1 = p1.q * pmid.q.conjugate();
+                    Eigen::AngleAxisd aa1(dq1);
+                    w1 = aa1.axis() * aa1.angle() / dt1;
+                    
+                    Eigen::Vector3d alf = (w1 - w0) / (0.5 * (dt0 + dt1));
+                    k.alfx = alf.x(); k.alfy = alf.y(); k.alfz = alf.z();
                 }
             }
 
@@ -240,7 +267,11 @@ private:
             const Eigen::Vector3d p = circle_model_.pos(t_rel);
             const Eigen::Vector3d v = circle_model_.vel(t_rel);
             const Eigen::Vector3d a = circle_model_.accel(t_rel);
-            k = {p.x(), p.y(), p.z(), v.x(), v.y(), v.z(), a.x(), a.y(), a.z()};
+            k = {p.x(), p.y(), p.z(), v.x(), v.y(), v.z(), a.x(), a.y(), a.z(), 0.0, 0.0, target_yaw_rate_, 0.0, 0.0, 0.0, Eigen::Quaterniond::Identity()};
+            
+            // Yaw model
+            double psi = target_yaw_rate_ * t_rel;
+            k.q = Eigen::Quaterniond(std::cos(psi/2.0), 0.0, 0.0, std::sin(psi/2.0));
         }
 
         // ── Odometry message ─────────────────────────────────────────────────
@@ -252,15 +283,21 @@ private:
         odom.pose.pose.position.x    = k.px;
         odom.pose.pose.position.y    = k.py;
         odom.pose.pose.position.z    = k.pz;
-        odom.pose.pose.orientation.w = 1.0;
+        odom.pose.pose.orientation.w = k.q.w();
+        odom.pose.pose.orientation.x = k.q.x();
+        odom.pose.pose.orientation.y = k.q.y();
+        odom.pose.pose.orientation.z = k.q.z();
 
         odom.twist.twist.linear.x = k.vx;
         odom.twist.twist.linear.y = k.vy;
         odom.twist.twist.linear.z = k.vz;
 
+        odom.twist.twist.angular.x = k.wx;
+        odom.twist.twist.angular.y = k.wy;
+        odom.twist.twist.angular.z = k.wz;
+
         // Record target quaternion for relative odom computations below.
-        // For circle/qualisys (no yaw), target orientation is identity.
-        last_target_quat_ = Eigen::Quaterniond(1.0, 0.0, 0.0, 0.0);
+        last_target_quat_ = k.q;
 
         odom_pub_->publish(odom);
 
@@ -271,6 +308,10 @@ private:
         accel.accel.linear.x  = k.ax;
         accel.accel.linear.y  = k.ay;
         accel.accel.linear.z  = k.az;
+        
+        accel.accel.angular.x = k.alfx;
+        accel.accel.angular.y = k.alfy;
+        accel.accel.angular.z = k.alfz;
 
         accel_pub_->publish(accel);
 
@@ -380,8 +421,8 @@ private:
             // v_B^N = R_NW * (v_drone - v_tgt) - Om_N x p_B^N
             // q_NB  = q_target^{-1} * q_drone
             const Eigen::Matrix3d R_NW = last_target_quat_.conjugate().toRotationMatrix();
-            // Om_N = 0 for circle/qualisys with no target yaw; extend if yaw is added
-            const Eigen::Vector3d Om_N = Eigen::Vector3d::Zero();
+            // Om_N: use actual estimated target angular velocity
+            const Eigen::Vector3d Om_N = Eigen::Vector3d(k.wx, k.wy, k.wz);
 
             const Eigen::Vector3d p_drone(drone_pose_copy.pose.position.x,
                                            drone_pose_copy.pose.position.y,
@@ -435,6 +476,7 @@ private:
 
     // ── Parameters ─────────────────────────────────────────────────────────
     std::string target_mode_;
+    double target_yaw_rate_;
     double publish_hz_;
     std::string frame_id_;
     target_models::CircularTarget circle_model_;  // trajectory defined in circular_target.hpp
@@ -461,7 +503,7 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
 
     // ── Qualisys pose history (guarded by pose_mutex_) ───────────────────────
-    struct PoseObs { double t; Eigen::Vector3d pos; };
+    struct PoseObs { double t; Eigen::Vector3d pos; Eigen::Quaterniond q = Eigen::Quaterniond::Identity(); };
     static constexpr std::size_t N_POSE_HISTORY = 8;
     std::mutex pose_mutex_;
     std::deque<PoseObs> pose_history_;

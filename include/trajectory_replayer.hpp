@@ -25,14 +25,12 @@ public:
         state_trajectory_.clear();
         control_trajectory_.clear();
         active_solve_num_ = -1;
-        plan_is_relative_ = false;
         has_variable_dt_ = false;
         state_dim_ = 13;
         last_solve_wall_time_ = std::chrono::steady_clock::time_point{};
         pending_state_trajectory_.clear();
         pending_control_trajectory_.clear();
         pending_solve_num_ = -1;
-        pending_plan_is_relative_ = false;
         pending_has_variable_dt_ = false;
         pending_state_dim_ = 13;
         pending_solve_wall_time_ = std::chrono::steady_clock::time_point{};
@@ -43,13 +41,11 @@ public:
     struct ReplaySample {
         bool has_plan = false;
         int active_solve_num = -1;
-        bool plan_is_relative = false;
         double elapsed = 0.0;
         double horizon_end = 0.0;
         Eigen::VectorXd x_cmd;
         Eigen::VectorXd x_cmd_lookahead;
         Eigen::VectorXd u_cmd;
-        Eigen::VectorXd x_rel_k;
     };
 
     /// Push a new trajectory into the buffer.
@@ -61,7 +57,6 @@ public:
                     const std::vector<Eigen::VectorXd>& control_trajectory,
                     double /*solve_time_ms*/,
                     int solve_num,
-                    bool is_relative_plan,
                     const std::chrono::steady_clock::time_point& solve_timestamp,
                     double /*ocp_dt*/,
                     int min_replay_before_swap,
@@ -75,7 +70,6 @@ public:
             state_trajectory_ = state_trajectory;
             control_trajectory_ = control_trajectory;
             active_solve_num_ = solve_num;
-            plan_is_relative_ = is_relative_plan;
             last_solve_wall_time_ = solve_timestamp;
             has_variable_dt_ = is_variable_dt;
             state_dim_ = state_dim;
@@ -86,7 +80,6 @@ public:
         pending_state_trajectory_ = state_trajectory;
         pending_control_trajectory_ = control_trajectory;
         pending_solve_num_ = solve_num;
-        pending_plan_is_relative_ = is_relative_plan;
         pending_solve_wall_time_ = solve_timestamp;
         pending_has_variable_dt_ = is_variable_dt;
         pending_state_dim_ = state_dim;
@@ -111,7 +104,6 @@ public:
 
         s.has_plan = true;
         s.active_solve_num = active_solve_num_;
-        s.plan_is_relative = plan_is_relative_;
         s.elapsed = std::chrono::duration<double>(now - last_solve_wall_time_).count();
 
         const int N = static_cast<int>(state_trajectory_.size()) - 1;
@@ -128,9 +120,6 @@ public:
 
         s.x_cmd = sampleStateAt(t_sample, ocp_dt);
         s.x_cmd_lookahead = sampleStateAt(t_lookahead, ocp_dt);
-        if (plan_is_relative_) {
-            s.x_rel_k = sampleStateAt(t_sample, ocp_dt);
-        }
 
         // --- Control: zero-order hold from lower node, truncated to 4-dim ---
         if (!control_trajectory_.empty()) {
@@ -226,7 +215,6 @@ private:
         state_trajectory_ = pending_state_trajectory_;
         control_trajectory_ = pending_control_trajectory_;
         active_solve_num_ = pending_solve_num_;
-        plan_is_relative_ = pending_plan_is_relative_;
         last_solve_wall_time_ = pending_solve_wall_time_;
         has_variable_dt_ = pending_has_variable_dt_;
         state_dim_ = pending_state_dim_;
@@ -234,7 +222,6 @@ private:
         pending_state_trajectory_.clear();
         pending_control_trajectory_.clear();
         pending_solve_num_ = -1;
-        pending_plan_is_relative_ = false;
         pending_has_variable_dt_ = false;
         pending_state_dim_ = 13;
         pending_solve_wall_time_ = std::chrono::steady_clock::time_point{};
@@ -254,7 +241,6 @@ private:
     std::vector<Eigen::VectorXd> state_trajectory_;
     std::vector<Eigen::VectorXd> control_trajectory_;
     int active_solve_num_ = -1;
-    bool plan_is_relative_ = false;
     bool has_variable_dt_ = false;
     int state_dim_ = 13;  ///< Physical state dimension; DT slot lives at index state_dim_
     std::chrono::steady_clock::time_point last_solve_wall_time_{};
@@ -262,7 +248,6 @@ private:
     std::vector<Eigen::VectorXd> pending_state_trajectory_;
     std::vector<Eigen::VectorXd> pending_control_trajectory_;
     int pending_solve_num_ = -1;
-    bool pending_plan_is_relative_ = false;
     bool pending_has_variable_dt_ = false;
     int pending_state_dim_ = 13;
     std::chrono::steady_clock::time_point pending_solve_wall_time_{};

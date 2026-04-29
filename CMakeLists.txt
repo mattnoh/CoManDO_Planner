@@ -37,6 +37,12 @@ if(px4_msgs_FOUND)
 else()
   message(STATUS "px4_msgs NOT FOUND — building without PX4 support")
 endif()
+find_package(mavros_msgs QUIET)
+if(mavros_msgs_FOUND)
+  message(STATUS "mavros_msgs FOUND — MAVROS platform support enabled")
+else()
+  message(STATUS "mavros_msgs NOT FOUND — building without MAVROS support")
+endif()
 
 # ── Shared sources (no main) ──────────────────────────────────────────────────
 # quadrotor_mpc.cpp is the only shared translation unit.
@@ -59,6 +65,9 @@ macro(configure_target TARGET_NAME)
   if(COMANDO_ENABLE_QUALISYS AND mocap4r2_msgs_FOUND)
     target_compile_definitions(${TARGET_NAME} PRIVATE HAS_MOCAP4R2_MSGS)
   endif()
+  if(mavros_msgs_FOUND)
+    target_compile_definitions(${TARGET_NAME} PRIVATE HAS_MAVROS_MSGS)
+  endif()
 
   target_link_libraries(${TARGET_NAME}
     alipddp_library
@@ -77,6 +86,9 @@ macro(configure_target TARGET_NAME)
   endif()
   if(COMANDO_ENABLE_QUALISYS AND mocap4r2_msgs_FOUND)
     list(APPEND _AMENT_DEPS mocap4r2_msgs)
+  endif()
+  if(mavros_msgs_FOUND)
+    list(APPEND _AMENT_DEPS mavros_msgs)
   endif()
   ament_target_dependencies(${TARGET_NAME} ${_AMENT_DEPS})
 

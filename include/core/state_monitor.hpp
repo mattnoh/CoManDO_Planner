@@ -80,6 +80,7 @@ public:
         s.velocity = target_state_.velocity;
         s.acceleration = target_state_.acceleration;
         s.angular_velocity = target_state_.angular_velocity;
+        s.angular_acceleration = target_state_.angular_acceleration;
         s.orientation = target_state_.orientation;
         s.odom_stamp_sec = target_state_.odom_timestamp.seconds();
         s.accel_stamp_sec = target_state_.accel_timestamp.seconds();

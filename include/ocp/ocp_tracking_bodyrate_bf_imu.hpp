@@ -314,6 +314,7 @@ inline OCPDescriptor descriptor() {
     d.command_mode = OCPDescriptor::CommandMode::CmdBodyRate;
     d.drone_odom_mode = OCPDescriptor::DroneOdomMode::BodyFrameRelative;
     d.skip_altitude_validation = true;
+    d.skip_trajectory_validation = true;
     d.variable_dt = true;
     d.state_dim = NX;
     d.control_dim = NU;
@@ -350,7 +351,7 @@ inline OCPDescriptor descriptor() {
         const Eigen::Matrix3d R_WB = Quad6DOFVarTime<double>::calcC(q_NB);
         x.segment(IDX_OMN, 3) = tgt.angular_velocity;
         x.segment(IDX_AT,  3) = R_WB.transpose() * tgt.acceleration;  // a_T^B
-        x.segment(IDX_BN,  3) = Eigen::Vector3d::Zero();
+        x.segment(IDX_BN,  3) = tgt.angular_acceleration;
         return x;
     };
     d.validate_target = [](const TargetSnapshot& t, double, double) { return t.valid; };
@@ -371,15 +372,7 @@ inline OCPDescriptor descriptor() {
         }
     };
     // Carry augmented states forward from solver-propagated trajectory
-    d.merge_prev_augmented = [](Eigen::VectorXd& x0,
-                                const std::vector<Eigen::VectorXd>& prev_X,
-                                int n_shift) {
-        const int idx = std::min(n_shift, static_cast<int>(prev_X.size()) - 1);
-        if (idx < 0 || prev_X[idx].size() < NX_SS) return;
-        x0.segment(IDX_OMN, 3) = prev_X[idx].segment(IDX_OMN, 3);
-        x0.segment(IDX_AT,  3) = prev_X[idx].segment(IDX_AT,  3);
-        x0.segment(IDX_BN,  3) = prev_X[idx].segment(IDX_BN,  3);
-    };
+    // Removed merge_prev_augmented: sensor values are authoritative for x0.
     // v_rel^B (drone-target in body) → world frame via R_WN*R_NB, then add target vel
     d.extract_hover_cmd = [](const Eigen::VectorXd& state,
                               const Eigen::VectorXd& control,
