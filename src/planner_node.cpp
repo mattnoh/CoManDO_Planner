@@ -624,6 +624,18 @@ private:
         last_replan_delay_sec_ = 0.0;
     }
 
+    // Publishes a world-frame state directly without applying reconstruct_world_state.
+    // Use for hover-hold ticks where paused_hover_state_ is already in world frame.
+    void publishCommandAbsolute(const Eigen::VectorXd& s_world, const Eigen::VectorXd& u) {
+        if (platform_ == "crazyflie") {
+            platform::crazyflie::publishCommand(this, cf_handles_, s_world, u, mass_kg_);
+        } else if (platform_ == "px4") {
+            platform::px4::publishCommand(this, px4_handles_, s_world);
+        } else if (platform_ == "mavros") {
+            platform::mavros::publishFullStateCommand(mavros_handles_, s_world);
+        }
+    }
+
     void publishPausedHoverHoldTick() {
         if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
             if (platform_ == "crazyflie") {
@@ -656,7 +668,7 @@ private:
             hasState(),
             x_now_abs,
             paused_hover_state_,
-            [this](const auto& x, const auto& u) { publishCommand(x, u); }
+            [this](const auto& x, const auto& u) { publishCommandAbsolute(x, u); }
         );
         if (ocp_active_.load()) {
             const Eigen::VectorXd x_now = x_now_abs;
@@ -694,7 +706,7 @@ private:
             command_paused_,
             maintain_hover_hold_,
             paused_hover_state_,
-            [this](const auto& x, const auto& u) { publishCommand(x, u); },
+            [this](const auto& x, const auto& u) { publishCommandAbsolute(x, u); },
             [this](const char* r) {
                 RCLCPP_INFO(this->get_logger(),
                     "Command finished (%s). Holding hover and waiting for next command_seq.", r);
