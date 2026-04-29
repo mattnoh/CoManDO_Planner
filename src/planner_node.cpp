@@ -1422,6 +1422,12 @@ private:
         const int N = static_cast<int>(ol_ref_X_.size()) - 1;
 
         if (ol_replay_step_ >= N) {
+            if (hasState() && is_configured_) {
+                const Eigen::VectorXd x_now = convertStateToAbsoluteFrame(getCurrentState());
+                paused_hover_state_ = hover_controller::makeHoverState(
+                    x_now, state_dim_, custom_make_hover_state_);
+                maintain_hover_hold_ = true;
+            }
             transitionOpenLoopToHold("nominal horizon end");
             return;
         }
