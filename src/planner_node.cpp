@@ -11,6 +11,7 @@
 #include "core/ocp_registry.hpp"
 #include "platform/crazyflie.hpp"
 #include "platform/px4.hpp"
+#include "platform/mavros.hpp"
 #include "platform/target_tracker.hpp"
 #include "core/state_monitor.hpp"
 #include "trajectory_replayer.hpp"
@@ -46,6 +47,11 @@ public:
         mode_ = runtime_cfg.mode;
         n_replay_ = runtime_cfg.n_replay;
         mass_kg_ = runtime_cfg.mass_kg;
+        // hover_thrust: normalized [0,1] throttle at hover — used by MAVROS platform.
+        // Read from PX4 MPC_THR_HOVER after a calibration flight:
+        //   ros2 service call /mavros/param/get mavros_msgs/srv/ParamGet "{param_id: MPC_THR_HOVER}"
+        this->declare_parameter("hover_thrust", 0.3);
+        hover_thrust_param_ = float(this->get_parameter("hover_thrust").as_double());
         open_loop_abort_on_divergence_ = runtime_cfg.open_loop_abort_on_divergence;
         open_loop_abort_max_z_error_m_ = runtime_cfg.open_loop_abort_max_z_error_m;
         open_loop_abort_max_vz_error_mps_ = runtime_cfg.open_loop_abort_max_vz_error_mps;
@@ -101,6 +107,11 @@ public:
             platform::px4::setup(
                 this, sensor_cb_group_,
                 state_monitor_.px4State(), state_monitor_.stateMutex(), px4_handles_);
+        } else if (platform_ == "mavros") {
+            platform::mavros::setup(
+                this, sensor_cb_group_, hover_thrust_param_,
+                state_monitor_.crazyflieState().current,  // reuse 13D ENU state slot
+                state_monitor_.stateMutex(), mavros_handles_);
         } else {
             RCLCPP_ERROR(this->get_logger(), "Unknown platform: %s", platform_.c_str());
             throw std::runtime_error("Unknown platform: " + platform_);
@@ -615,10 +626,20 @@ private:
 
     void publishPausedHoverHoldTick() {
         if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
-            geometry_msgs::msg::TwistStamped msg;
-            msg.header.stamp   = this->now();
-            msg.twist.linear.z = 9.81;
-            bodyrate_cmd_pub_->publish(msg);
+            if (platform_ == "crazyflie") {
+                // Hold altitude using cmd_hover with zero velocity
+                const Eigen::VectorXd x_abs = convertStateToAbsoluteFrame(getCurrentState());
+                const float z_hold = (x_abs.size() >= 3) ? float(x_abs(2)) : 0.3f;
+                platform::crazyflie::publishHoverCommandDirect(cf_handles_,
+                    {0.0f, 0.0f, z_hold, 0.0f});
+            } else if (platform_ == "mavros") {
+                // MAVROS keepalive handled by heartbeat_timer in mavros.hpp
+            } else {
+                geometry_msgs::msg::TwistStamped msg;
+                msg.header.stamp   = this->now();
+                msg.twist.linear.z = 9.81;
+                bodyrate_cmd_pub_->publish(msg);
+            }
             return;
         }
         if (drone_state_is_relative_) {
@@ -815,7 +836,16 @@ private:
                 return result;
             }
             last_command_seq_ = new_command_seq;
-            maintain_hover_hold_ = false;
+            // Capture current drone position as the pre-solve hover target.
+            // mpcReplayTick publishes this hold while !is_primed_ (solver working on first plan).
+            if (hasState() && is_configured_ && mass_kg_ > 0.0) {
+                const Eigen::VectorXd x_now = convertStateToAbsoluteFrame(getCurrentState());
+                paused_hover_state_ = hover_controller::makeHoverState(
+                    x_now, state_dim_, custom_make_hover_state_);
+                maintain_hover_hold_ = true;
+            } else {
+                maintain_hover_hold_ = false;
+            }
             command_paused_.store(false);
             ocp_active_.store(true);
             resetForNewCommand();
@@ -937,6 +967,8 @@ private:
                 "State received - starting RH MPC (%s)", solver_type_.c_str());
             if (platform_ == "px4") {
                 platform::px4::arm(this, px4_handles_);
+            } else if (platform_ == "mavros") {
+                platform::mavros::markArmed(mavros_handles_);
             }
             if (logging_enabled_ && !logging_initialized_) {
                 auto dec = OCPRegistry::getDescriptor(ocp_type_);
@@ -990,7 +1022,6 @@ private:
             result.control_trajectory,
             result.solve_time_ms,
             solve_count_,
-            result.is_relative_plan,
             result.solve_timestamp,
             ocp_dt_,
             n_replay_,
@@ -1019,8 +1050,6 @@ private:
                 meta.coord_mode = "body_relative";
             } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::TargetFrameRelative) {
                 meta.coord_mode = "target_frame_relative";
-            } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget) {
-                meta.coord_mode = "absolute_relative";
             } else {
                 meta.coord_mode = "absolute";
             }
@@ -1043,7 +1072,7 @@ private:
             return;
         }
         if (!is_primed_.load()) {
-            return;
+            return;  // high-level goto keeps drone in place until first solve arrives
         }
 
         auto replay = trajectory_replayer_.sample(Clock::now(), ocp_dt_);
@@ -1054,26 +1083,18 @@ private:
         replay_ticks_since_solve_.fetch_add(1);
 
         const int active_solve_num = replay.active_solve_num;
-        const bool plan_is_relative = replay.plan_is_relative;
         const double elapsed = replay.elapsed;
         const double horizon_end = replay.horizon_end;
 
         Eigen::VectorXd x_cmd = replay.x_cmd;
         Eigen::VectorXd u_cmd = replay.u_cmd;
-        const Eigen::VectorXd x_rel_k = replay.x_rel_k;
 
         const bool stale = (elapsed > horizon_end + 0.2);
         if (stale) {
             ++stale_warning_count_;
-            if (plan_is_relative) {
-                RCLCPP_WARN(this->get_logger(),
-                    "Stateswitch trajectory stale (elapsed=%.3fs, horizon=%.3fs), clamping to terminal",
-                    elapsed, horizon_end);
-            } else {
-                RCLCPP_WARN(this->get_logger(),
-                    "Trajectory stale (elapsed=%.3fs, horizon=%.3fs), clamping to terminal",
-                    elapsed, horizon_end);
-            }
+            RCLCPP_WARN(this->get_logger(),
+                "Trajectory stale (elapsed=%.3fs, horizon=%.3fs), clamping to terminal",
+                elapsed, horizon_end);
 
             if (stale_warning_count_ >= 3) {
                 holdHoverAndPause("trajectory stale 3x");
@@ -1083,15 +1104,7 @@ private:
             stale_warning_count_ = 0;
         }
 
-        if (plan_is_relative) {
-            const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
-        if (x_rel_k.size() >= state_dim_) {
-                x_cmd.segment(0, 3) = x_rel_k.segment(0, 3) + tgt_pos_now;
-                x_cmd.segment(3, 3) = x_rel_k.segment(3, 3) + tgt_vel_now;
-                if (state_dim_ >= 13) x_cmd.segment(6, 7) = x_rel_k.segment(6, 7);
-            }
-        }
-
+        last_target_snapshot_ = getTargetSnapshot();
         publishCommand(x_cmd, u_cmd);
 
         if (logging_enabled_ && logging_initialized_) {
@@ -1105,7 +1118,17 @@ private:
             const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
             logger_.logActualState(act_raw, active_solve_num, tgt_pos_now, tgt_vel_now,
                                    currentFrameLabel());
-            logger_.logCommandedState(x_cmd, u_cmd, active_solve_num);
+            if (command_mode_ == OCPDescriptor::CommandMode::CmdFullState) {
+                logger_.logCommandedState(x_cmd, u_cmd, active_solve_num);
+            } else {
+                const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+                if (platform_ == "crazyflie" && desc.extract_hover_cmd) {
+                    const auto cmd = desc.extract_hover_cmd(x_cmd, u_cmd, last_target_snapshot_);
+                    logger_.logCommandedHoverState(cmd, active_solve_num);
+                } else {
+                    logger_.logCommandedBodyRateState(u_cmd, active_solve_num);
+                }
+            }
         }
     }
 
@@ -1176,17 +1199,36 @@ private:
 
     void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
         if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
-            geometry_msgs::msg::TwistStamped msg;
-            msg.header.stamp    = this->now();
-            msg.twist.linear.z  = u.size() > 0 ? u(0) : 0.0;
-            msg.twist.angular.x = u.size() > 1 ? u(1) : 0.0;
-            msg.twist.angular.y = u.size() > 2 ? u(2) : 0.0;
-            msg.twist.angular.z = u.size() > 3 ? u(3) : 0.0;
-            bodyrate_cmd_pub_->publish(msg);
+            if (platform_ == "crazyflie") {
+                // CF has no native body-rate interface — extract hover velocity command instead
+                const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+                if (desc.extract_hover_cmd) {
+                    const auto cmd = desc.extract_hover_cmd(s, u, last_target_snapshot_);
+                    platform::crazyflie::publishHoverCommandDirect(cf_handles_, cmd);
+                }
+            } else if (platform_ == "mavros") {
+                platform::mavros::publishBodyRateCommand(mavros_handles_, u);
+            } else {
+                // Generic fallback (px4 / unknown) — TwistStamped on /drone/cmd_bodyrate
+                geometry_msgs::msg::TwistStamped msg;
+                msg.header.stamp    = this->now();
+                msg.twist.linear.z  = u.size() > 0 ? u(0) : 0.0;
+                msg.twist.angular.x = u.size() > 1 ? u(1) : 0.0;
+                msg.twist.angular.y = u.size() > 2 ? u(2) : 0.0;
+                msg.twist.angular.z = u.size() > 3 ? u(3) : 0.0;
+                bodyrate_cmd_pub_->publish(msg);
+            }
         } else if (platform_ == "crazyflie") {
-            platform::crazyflie::publishCommand(this, cf_handles_, s, u, mass_kg_);
+            const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+            Eigen::VectorXd s_world = s;
+            if (desc.reconstruct_world_state) {
+                s_world = desc.reconstruct_world_state(s, last_target_snapshot_);
+            }
+            platform::crazyflie::publishCommand(this, cf_handles_, s_world, u, mass_kg_);
         } else if (platform_ == "px4") {
             platform::px4::publishCommand(this, px4_handles_, s);
+        } else if (platform_ == "mavros") {
+            platform::mavros::publishFullStateCommand(mavros_handles_, s);
         }
     }
 
@@ -1394,6 +1436,7 @@ private:
             }
         }
 
+        last_target_snapshot_ = getTargetSnapshot();
         publishCommand(x_cmd, u_cmd);
 
         if (logging_enabled_ && logging_initialized_) {
@@ -1402,7 +1445,17 @@ private:
                 : convertStateToAbsoluteFrame(getCurrentState());
             const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
             logger_.logActualState(act, 0, tgt_pos_now, tgt_vel_now, currentFrameLabel());
-            logger_.logCommandedState(x_cmd, u_cmd, 0);
+            if (command_mode_ == OCPDescriptor::CommandMode::CmdFullState) {
+                logger_.logCommandedState(x_cmd, u_cmd, 0);
+            } else {
+                const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+                if (platform_ == "crazyflie" && desc.extract_hover_cmd) {
+                    const auto cmd = desc.extract_hover_cmd(x_cmd, u_cmd, last_target_snapshot_);
+                    logger_.logCommandedHoverState(cmd, 0);
+                } else {
+                    logger_.logCommandedBodyRateState(u_cmd, 0);
+                }
+            }
         }
 
         ++ol_replay_step_;
@@ -1452,7 +1505,11 @@ private:
 
     platform::crazyflie::Handles cf_handles_;
     platform::px4::Handles px4_handles_;
+    platform::mavros::Handles mavros_handles_;
     platform::target_tracker::Handles target_handles_;
+
+    float hover_thrust_param_ = 0.3f;
+    TargetSnapshot last_target_snapshot_;
 
     rclcpp::TimerBase::SharedPtr solver_timer_;
     rclcpp::TimerBase::SharedPtr mpc_replay_timer_;
