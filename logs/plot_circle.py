@@ -948,6 +948,11 @@ def build_plots(data_dir, out_path=None, elev=22):
         frame_reason = "no world-frame position columns in actual_state.csv"
         actual_df   = actual_raw_df.copy()
 
+    # Inject px/py/pz aliases so 13D OCP dynamic-state pages can match solve columns
+    for _alias, _canon in {"px": "x", "py": "y", "pz": "z"}.items():
+        if _alias not in actual_df.columns and _canon in actual_df.columns:
+            actual_df[_alias] = actual_df[_canon].values
+
     # ── Commanded state: align published or fall back to solve trajectory ─────
     if aligned_cmd is not None:
         common = [c for c in STATE_COLS + CONTROL_COLS
