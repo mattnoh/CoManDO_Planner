@@ -340,7 +340,6 @@ inline OCPDescriptor descriptor() {
     };
     d.validate_target = [](const TargetSnapshot& t, double, double) { return t.valid; };
     d.post_process_result = [](SolverResult& r, const TargetSnapshot& t) {
-        r.is_relative_plan = true;
         r.target_snapshot_pos = t.position;
         r.target_snapshot_vel = t.velocity;
         r.target_snapshot_acc = t.acceleration;
@@ -355,6 +354,18 @@ inline OCPDescriptor descriptor() {
             r.target_world_pos_trajectory.push_back(tgt_p);
             r.target_world_vel_trajectory.push_back(t.velocity + t.acceleration * t_node);
         }
+    };
+    // v_rel^B (drone-target in body) → world frame via R_WN*R_NB, then add target vel
+    d.extract_hover_cmd = [](const Eigen::VectorXd& state,
+                              const Eigen::VectorXd& control,
+                              const TargetSnapshot& target) -> std::array<float,4> {
+        const Eigen::Vector4d q_NB = state.segment(IDX_Q, 4);
+        const Eigen::Matrix3d R_NB = Quad6DOFVarTime<double>::calcC(q_NB);
+        const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(target.orientation);
+        const Eigen::Vector3d v_drone_world = R_WN * R_NB * state.segment(IDX_VD, 3) + target.velocity;
+        return {float(v_drone_world.x()), float(v_drone_world.y()),
+                float(target.position.z() - state(IDX_P + 2)),
+                float(control.size() > 3 ? control(3) : 0.0)};
     };
     d.getSolverParams = getSolverParams;
     d.create = [](const OCPCreateArgs& a) {

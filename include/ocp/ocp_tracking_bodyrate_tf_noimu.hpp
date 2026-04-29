@@ -318,7 +318,6 @@ inline OCPDescriptor descriptor() {
     };
     d.validate_target = [](const TargetSnapshot& t, double, double) { return t.valid; };
     d.post_process_result = [](SolverResult& r, const TargetSnapshot& t) {
-        r.is_relative_plan = true;
         r.target_snapshot_pos = t.position;
         r.target_snapshot_vel = t.velocity;
         r.target_snapshot_acc = t.acceleration;
@@ -335,6 +334,16 @@ inline OCPDescriptor descriptor() {
         }
     };
     // No merge_prev_augmented — no augmented states in this OCP
+    // v_B^N (drone vel in target frame N) → world frame via R_WN = calcC(target.orientation)
+    d.extract_hover_cmd = [](const Eigen::VectorXd& state,
+                              const Eigen::VectorXd& control,
+                              const TargetSnapshot& target) -> std::array<float,4> {
+        const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(target.orientation);
+        const Eigen::Vector3d v_W  = R_WN * state.segment(IDX_V, 3) + target.velocity;
+        const double z_cmd = target.position.z() + state(IDX_P + 2);
+        return {float(v_W.x()), float(v_W.y()), float(z_cmd),
+                float(control.size() > 3 ? control(3) : 0.0)};
+    };
     d.getSolverParams = getSolverParams;
     d.create = [](const OCPCreateArgs& a) {
         return create(a.current_state, a.prev_U, a.prev_X, a.prev_K);
