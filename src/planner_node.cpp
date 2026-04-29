@@ -1313,6 +1313,9 @@ private:
         startup_timer_->cancel();
 
         Eigen::VectorXd x0 = getCurrentState();
+        if (desc.transform_state) {
+            x0 = desc.transform_state(x0, target_snapshot);
+        }
         RCLCPP_INFO(this->get_logger(), "[OpenLoop] Solving...");
         SolverResult result = callSolver(x0, target_snapshot);
 
