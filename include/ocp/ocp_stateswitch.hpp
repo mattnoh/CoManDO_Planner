@@ -468,10 +468,11 @@ inline OCPDescriptor descriptor() {
     d.default_mass_kg = DEFAULT_MASS_KG;
     d.warm_start = OCPDescriptor::WarmStart::Feedback;
     d.command_mode = OCPDescriptor::CommandMode::CmdFullState;
-    d.drone_odom_mode = OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget;
+    d.drone_odom_mode = OCPDescriptor::DroneOdomMode::Absolute;
     d.variable_dt = true;
     d.state_dim = 13;
     d.control_dim = 4;
+    d.skip_altitude_validation = true;
     d.log_state_headers = OCPLoggerDefaults::getStateHeaders13D();
     d.state_names = OCPLoggerDefaults::getStateNames13D();
     d.control_names = OCPLoggerDefaults::getControlNames4D();
@@ -513,6 +514,14 @@ inline OCPDescriptor descriptor() {
             ex.buf.populateFromModel(circ, t_abs, buf_dur, 0.05);
         }
         return std::any(ex);
+    };
+    d.reconstruct_world_state = [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
+        Eigen::VectorXd xw = x;
+        if (t.valid && xw.size() >= 6) {
+            xw.segment(0, 3) += t.position;
+            xw.segment(3, 3) += t.velocity;
+        }
+        return xw;
     };
     d.getSolverParams = getSolverParams;
     d.create = [](const OCPCreateArgs& a) {
