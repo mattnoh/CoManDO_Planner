@@ -473,6 +473,7 @@ inline OCPDescriptor descriptor() {
     d.state_dim = 13;
     d.control_dim = 4;
     d.skip_altitude_validation = true;
+    d.skip_trajectory_validation = true;
     d.log_state_headers = OCPLoggerDefaults::getStateHeaders13D();
     d.state_names = OCPLoggerDefaults::getStateNames13D();
     d.control_names = OCPLoggerDefaults::getControlNames4D();

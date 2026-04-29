@@ -1002,7 +1002,7 @@ private:
         }
 
         // Trajectory Validation
-        if (!skip_trajectory_validation_) {
+        if (!skip_trajectory_validation_ && !desc.skip_trajectory_validation) {
             bool valid = true;
             if (!result.success || result.state_trajectory.size() < 2) {
                 RCLCPP_WARN(this->get_logger(), "Solve FAILED — keeping previous trajectory locally");
@@ -1090,7 +1090,12 @@ private:
             return;
         }
         if (!is_primed_.load()) {
-            return;  // high-level goto keeps drone in place until first solve arrives
+            // For body-rate OCPs the high-level commander doesn't hold altitude —
+            // send a neutral hover command until the first solve arrives.
+            if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
+                publishPausedHoverHoldTick();
+            }
+            return;
         }
 
         auto replay = trajectory_replayer_.sample(Clock::now(), ocp_dt_);
