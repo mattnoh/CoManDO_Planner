@@ -499,19 +499,18 @@ inline OCPDescriptor descriptor() {
             r.target_snapshot_acc.setZero();
         }
     };
-    d.prepare_extra = [](const PlannerConfig& cfg, double t_abs, const TargetSnapshot&) {
+    d.prepare_extra = [](const PlannerConfig& cfg, double t_abs, const TargetSnapshot& tgt_snapshot) {
         StateswitchExtra ex;
         ex.t0_abs = t_abs;
         if (cfg.target_accel_buffer.has_value() && !cfg.target_accel_buffer->accels.empty()) {
             ex.buf = cfg.target_accel_buffer.value();
         } else {
-            target_models::CircularTarget circ;
-            circ.center << cfg.circle_center_x, cfg.circle_center_y, cfg.circle_center_z;
-            circ.R = cfg.circle_R;
-            circ.omega = cfg.circle_omega;
-            circ.phi0 = cfg.circle_phi0 - cfg.circle_omega * cfg.t_start_abs;
+            // Zero-jerk constant-acceleration prediction: a(t) = a_snapshot
             const double buf_dur = HORIZON * THH + 1.0;
-            ex.buf.populateFromModel(circ, t_abs, buf_dur, 0.05);
+            const int n_steps = static_cast<int>(buf_dur / TH_INIT) + 2;
+            ex.buf.t_start = t_abs;
+            ex.buf.dt = TH_INIT;
+            ex.buf.accels.assign(n_steps, tgt_snapshot.acceleration);
         }
         return std::any(ex);
     };
