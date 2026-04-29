@@ -155,6 +155,86 @@ CONTROL_COLS = ["fz", "mx", "my", "mz"]
 TARGET_COLS = ["tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz"]
 STREAM_COLS = STATE_COLS + CONTROL_COLS + ["theta"] + TARGET_COLS
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Dynamic schema detection — reads column structure from all_solves.csv headers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_FIXED_PREFIX = {"solve_num", "solve_time_ms", "solve_iters", "coord_mode", "node", "t", "theta"}
+_FIXED_SUFFIX = {"tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz"}
+_CONTROL_STARTERS = {"fz", "T", "thrust", "mx", "omx"}
+
+
+def detect_schema(solves_df):
+    """Infer state_cols, control_cols from all_solves.csv column headers.
+
+    Returns:
+        state_cols      : list of logical state column names
+        control_cols    : list of logical control column names (excluding Theta)
+        theta_col       : "theta" if present, else None
+        abs_state_cols  : list of abs_* prefixed columns (empty for non-relative OCPs)
+        rel_state_cols  : list of rel_* prefixed columns
+    """
+    middle = [c for c in solves_df.columns
+              if c not in _FIXED_PREFIX and c not in _FIXED_SUFFIX]
+    theta_col = "theta" if "theta" in solves_df.columns else None
+
+    abs_state_cols = [c for c in middle if c.startswith("abs_")]
+    rel_state_cols = [c for c in middle if c.startswith("rel_")]
+    plain_cols = [c for c in middle
+                  if not c.startswith("abs_") and not c.startswith("rel_")]
+
+    if abs_state_cols:
+        # Relative OCP: abs_x/rel_x encoding; controls are in plain_cols
+        state_cols = [c[4:] for c in abs_state_cols]  # strip "abs_"
+        control_cols = [c for c in plain_cols if c not in ("theta", "Theta")]
+    else:
+        # Absolute/body-frame OCP: plain state columns then plain control columns
+        split = len(plain_cols)
+        for i, c in enumerate(plain_cols):
+            if c in _CONTROL_STARTERS:
+                split = i
+                break
+        state_cols = plain_cols[:split]
+        control_cols = [c for c in plain_cols[split:]
+                        if c not in ("theta", "Theta")]
+
+    return state_cols, control_cols, theta_col, abs_state_cols, rel_state_cols
+
+
+def group_state_cols(state_cols):
+    """Group detected state columns by semantic type for page generation.
+
+    Returns list of (group_label, col_list, units) tuples.
+    """
+    _POS  = {"px","py","pz","x","y","z","p0","p1","p2"}
+    _VEL  = {"vx","vy","vz","vdx","vdy","vdz","v0","v1","v2"}
+    _QUAT = {"qw","qx","qy","qz"}
+    _ANGV = {"wx","wy","wz"}
+    _DT   = {"DT"}
+
+    pos  = [c for c in state_cols if c in _POS  or c.startswith("p_") or c[:2] in ("px","py","pz")]
+    vel  = [c for c in state_cols if c in _VEL  or c.startswith("v_") or c[:2] in ("vx","vy","vz")]
+    quat = [c for c in state_cols if c in _QUAT]
+    angv = [c for c in state_cols if c in _ANGV]
+    skip = set(pos) | set(vel) | set(quat) | set(angv) | _DT
+    aug  = [c for c in state_cols if c not in skip]
+
+    groups = []
+    if pos:  groups.append(("Position",       pos,  "m"))
+    if vel:  groups.append(("Velocity",        vel,  "m/s"))
+    if quat: groups.append(("Quaternion",      quat, "—"))
+    if angv: groups.append(("Angular Rate",    angv, "rad/s"))
+    if aug:  groups.append(("Augmented State", aug,  "mixed"))
+    return groups
+
+
+def _fc(df, *candidates):
+    """Return the first column from candidates that exists in df, else empty series."""
+    for c in candidates:
+        if c in df.columns:
+            return df[c]
+    return pd.Series(np.nan, index=df.index)
+
 def load_data(data_dir):
     actual = pd.read_csv(os.path.join(data_dir, "actual_state.csv"))
     solves = pd.read_csv(os.path.join(data_dir, "all_solves.csv"))
@@ -163,35 +243,77 @@ def load_data(data_dir):
     return actual, solves, commanded
 
 
-def compute_solve_aligned_states(actual_df, solves_df):
+def compute_solve_aligned_states(actual_df, solves_df,
+                                  state_cols=None, control_cols=None,
+                                  abs_state_cols=None, rel_state_cols=None,
+                                  theta_col=None):
     """
     For each row in actual_df (with a given solve_num), pull the corresponding
     planned node from all_solves.csv.  Node counter advances independently for
     each solve, so solve transitions always restart at node 0.
+
+    Works with any column layout detected by detect_schema().
+    Returns (cmd_df_abs, cmd_df_rel) — both have the same set of output columns.
+    Output columns are: state_cols + control_cols + ['theta'] + TARGET_COLS
     """
-    # all_solves.csv uses abs_ and rel_ prefixes for state, but not for controls.
-    _abs = {"x": "abs_x", "y": "abs_y", "z": "abs_z",
-            "vx": "abs_vx", "vy": "abs_vy", "vz": "abs_vz",
-            "qw": "abs_qw", "qx": "abs_qx", "qy": "abs_qy", "qz": "abs_qz",
-            "wx": "abs_wx", "wy": "abs_wy", "wz": "abs_wz",
-            "fz": "fz", "mx": "mx", "my": "my", "mz": "mz", "theta": "theta",
-            "tgt_x": "tgt_x", "tgt_y": "tgt_y", "tgt_z": "tgt_z",
-            "tgt_vx": "tgt_vx", "tgt_vy": "tgt_vy", "tgt_vz": "tgt_vz"}
-    
-    _rel = {"x": "rel_x", "y": "rel_y", "z": "rel_z",
-            "vx": "rel_vx", "vy": "rel_vy", "vz": "rel_vz",
-            "qw": "rel_qw", "qx": "rel_qx", "qy": "rel_qy", "qz": "rel_qz",
-            "wx": "rel_wx", "wy": "rel_wy", "wz": "rel_wz",
-            "fz": "fz", "mx": "mx", "my": "my", "mz": "mz", "theta": "theta",
-            "tgt_x": "tgt_x", "tgt_y": "tgt_y", "tgt_z": "tgt_z",
-            "tgt_vx": "tgt_vx", "tgt_vy": "tgt_vy", "tgt_vz": "tgt_vz"}
+    # Detect schema if not provided
+    if state_cols is None:
+        state_cols, control_cols, theta_col, abs_state_cols, rel_state_cols = \
+            detect_schema(solves_df)
+
+    has_abs_rel = len(abs_state_cols) > 0
+    all_out_cols = list(state_cols) + list(control_cols) + \
+                   (["theta"] if theta_col else []) + list(TARGET_COLS)
+    nan_row = {c: np.nan for c in all_out_cols}
+
+    # Build mapping: logical_name → csv_column_name
+    def _make_abs_map():
+        m = {}
+        for c in abs_state_cols:
+            m[c[4:]] = c   # "abs_x" → "x" → "abs_x"
+        for c in control_cols:
+            m[c] = c
+        if theta_col:
+            m["theta"] = theta_col
+        for c in TARGET_COLS:
+            m[c] = c
+        return m
+
+    def _make_rel_map():
+        m = {}
+        for c in rel_state_cols:
+            m[c[4:]] = c
+        for c in control_cols:
+            m[c] = c
+        if theta_col:
+            m["theta"] = theta_col
+        for c in TARGET_COLS:
+            m[c] = c
+        return m
+
+    def _make_plain_map():
+        m = {}
+        for c in state_cols:
+            m[c] = c
+        for c in control_cols:
+            m[c] = c
+        if theta_col:
+            m["theta"] = theta_col
+        for c in TARGET_COLS:
+            m[c] = c
+        return m
+
+    if has_abs_rel:
+        map_abs = _make_abs_map()
+        map_rel = _make_rel_map()
+    else:
+        map_abs = _make_plain_map()
+        map_rel = _make_plain_map()   # no relative version for plain OCPs
 
     # Build dict: solve_num → sorted DataFrame of nodes
     solve_groups = {int(sn): grp.sort_values("node").reset_index(drop=True)
                     for sn, grp in solves_df.groupby("solve_num")}
 
-    nan_row_abs = {c: np.nan for c in STREAM_COLS}
-    nan_row_rel = {c: np.nan for c in STREAM_COLS}
     node_idx = {}
     cmd_rows_abs = []
     cmd_rows_rel = []
@@ -199,16 +321,20 @@ def compute_solve_aligned_states(actual_df, solves_df):
     for _, row in actual_df.iterrows():
         sn = int(row["solve_num"])
         if sn not in solve_groups:
-            cmd_rows_abs.append(nan_row_abs.copy())
-            cmd_rows_rel.append(nan_row_rel.copy())
+            cmd_rows_abs.append(nan_row.copy())
+            cmd_rows_rel.append(nan_row.copy())
             continue
         if sn not in node_idx:
             node_idx[sn] = 0
         grp  = solve_groups[sn]
         nidx = min(node_idx[sn], len(grp) - 1)
         r    = grp.iloc[nidx]
-        cmd_rows_abs.append({c: r[_abs[c]] if _abs[c] in r.index else np.nan for c in STREAM_COLS})
-        cmd_rows_rel.append({c: r[_rel[c]] if _rel[c] in r.index else np.nan for c in STREAM_COLS})
+        cmd_rows_abs.append(
+            {c: r[map_abs[c]] if c in map_abs and map_abs[c] in r.index else np.nan
+             for c in all_out_cols})
+        cmd_rows_rel.append(
+            {c: r[map_rel[c]] if c in map_rel and map_rel[c] in r.index else np.nan
+             for c in all_out_cols})
         node_idx[sn] += 1
 
     return pd.DataFrame(cmd_rows_abs), pd.DataFrame(cmd_rows_rel)
@@ -298,29 +424,49 @@ def find_solve_update_indices(actual_df):
 #  Page 1 – 3-D trajectory (4 views)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str, command_label):
-    dpos  = actual_df[["x","y","z"]].values
-    quats = actual_df[["qw","qx","qy","qz"]].values
+def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str, command_label,
+                   pos_cols=None, actual_pos_cols=None):
+    if pos_cols is None:
+        pos_cols = ["x", "y", "z"]
+    pc  = pos_cols[:3]
+    apc = actual_pos_cols[:3] if actual_pos_cols else pc
+
+    def _safe_arr(df, cols):
+        return np.stack([df[c].values.astype(float) if c in df.columns
+                         else np.zeros(len(df)) for c in cols], axis=1)
+
+    dpos  = _safe_arr(actual_df, apc)
+    # Quaternion for body-frame arrows (optional — only if columns exist)
+    _qcols = ["qw","qx","qy","qz"]
+    has_quat = all(c in actual_df.columns for c in _qcols)
+    quats = actual_df[_qcols].values if has_quat else None
     time_actual = actual_df["timestamp"].values
-    t_rel = time_actual - time_actual[0]
+    t_rel = time_actual - time_actual[0]  # noqa: F841 (kept for future use)
 
     # --- Target trajectory ----------------------------------------------------
-    # Extract target from the commanded node directly!
     tgt_df = cmd_df_abs[["tgt_x", "tgt_y", "tgt_z"]]
-    tgt_df = tgt_df.fillna(method="bfill").fillna(method="ffill")
+    tgt_df = tgt_df.ffill().bfill()
     tgt_pos = tgt_df.values
 
     # Relative actual position
     rel_pos = dpos - tgt_pos
 
-    cmd_pos_abs = cmd_df_abs[["x","y","z"]].values
-    cmd_pos_rel = cmd_df_rel[["x","y","z"]].values
-    
-    first_pos_abs = first_traj[["abs_x","abs_y","abs_z"]].values
-    first_pos_rel = first_traj[["rel_x","rel_y","rel_z"]].values
+    cmd_pos_abs = _safe_arr(cmd_df_abs, pc)
+    cmd_pos_rel = _safe_arr(cmd_df_rel, pc)
+
+    # First trajectory: prefer abs_* prefix, then plain
+    abs_pc = [f"abs_{c}" for c in pc]
+    rel_pc = [f"rel_{c}" for c in pc]
+    first_pos_abs = (_safe_arr(first_traj, abs_pc)
+                     if all(c in first_traj.columns for c in abs_pc)
+                     else _safe_arr(first_traj, pc))
+    first_pos_rel = (_safe_arr(first_traj, rel_pc)
+                     if all(c in first_traj.columns for c in rel_pc)
+                     else first_pos_abs)
 
     # Speed magnitude for colormap
-    vel  = actual_df[["vx","vy","vz"]].values
+    _vcols = ["vx","vy","vz"]
+    vel  = _safe_arr(actual_df, _vcols)
     vmag = np.linalg.norm(vel, axis=1)
 
     replan_idx = find_solve_update_indices(actual_df)
@@ -439,16 +585,17 @@ def page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, titl
                 ax.plot(traj[j:j+2, 0], traj[j:j+2, 1], traj[j:j+2, 2],
                         color=c, lw=2.2, alpha=0.90, zorder=5)
 
-            # Body-frame axes at 10 sampled points along the trajectory
-            body_indices = np.linspace(0, len(traj) - 1, 10, dtype=int)
-            for ridx in body_indices:
-                if ridx >= len(traj): continue
-                pos = traj[ridx]
-                R_mat = quat_to_rotmat(*quats[ridx])
-                s_val = BODY_AZSCALE
-                ax.quiver(*pos, *(R_mat[:, 0]*s_val), color=BODY_X, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
-                ax.quiver(*pos, *(R_mat[:, 1]*s_val), color=BODY_Y, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
-                ax.quiver(*pos, *(R_mat[:, 2]*s_val), color=BODY_Z, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
+            # Body-frame axes at 10 sampled points (only when quaternion data present)
+            if has_quat:
+                body_indices = np.linspace(0, len(traj) - 1, 10, dtype=int)
+                for ridx in body_indices:
+                    if ridx >= len(traj): continue
+                    pos = traj[ridx]
+                    R_mat = quat_to_rotmat(*quats[ridx])
+                    s_val = BODY_AZSCALE
+                    ax.quiver(*pos, *(R_mat[:, 0]*s_val), color=BODY_X, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
+                    ax.quiver(*pos, *(R_mat[:, 1]*s_val), color=BODY_Y, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
+                    ax.quiver(*pos, *(R_mat[:, 2]*s_val), color=BODY_Z, lw=1.5, arrow_length_ratio=0.35, alpha=0.8)
 
             # Start / end markers
             ax.plot(*traj[0], "o", color=C_ACTUAL, markersize=8, zorder=10)
@@ -707,205 +854,278 @@ def page_controls(time, actual_ctrl, cmd_ctrl, title_str):
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     return fig
 
+
+def page_controls_dynamic(time, cmd_ctrl_df, control_cols, theta_col, title_str):
+    """Dynamic control page — one subplot per control column, works with any OCP."""
+    has_theta = theta_col is not None and theta_col in cmd_ctrl_df.columns
+    n_plots = len(control_cols) + (1 if has_theta else 0)
+    if n_plots == 0:
+        return None
+
+    fig = _fig(f"{title_str}  —  Control Inputs", figsize=(16, max(6, 3 * n_plots)))
+    gs  = gridspec.GridSpec(n_plots, 1, hspace=0.4)
+
+    for i, col in enumerate(control_cols):
+        ax = fig.add_subplot(gs[i])
+        _col = col
+        if col in ("fz", "thrust"):
+            unit = "[N]"
+        elif col == "T":
+            unit = "[m/s²]"
+        elif col.startswith("om"):
+            unit = "[rad/s]"
+        else:
+            unit = ""
+        _style_ax(ax, "Time [s]", f"{_col} {unit}", _col)
+        if col in cmd_ctrl_df.columns:
+            ax.plot(time, cmd_ctrl_df[col].values, color=COMP_COLS[i % 4],
+                    lw=1.8, ls="--", label=f"cmd {col}")
+            if col in ("fz", "thrust"):
+                ax.axhline(FMIN, color="r", lw=1.2, ls=":", label="FMIN")
+                ax.axhline(FMAX, color="r", lw=1.2, ls=":", label="FMAX")
+        ax.legend(loc="upper right", fontsize=10)
+
+    if has_theta:
+        ax = fig.add_subplot(gs[len(control_cols)])
+        _style_ax(ax, "Time [s]", "DT [s]", "Node Interval (theta)")
+        ax.plot(time, cmd_ctrl_df[theta_col].values, color="#606060", lw=2.0, label="theta")
+        ax.axhline(THL, color="r", lw=1.2, ls=":", label="THL")
+        ax.axhline(THH, color="r", lw=1.2, ls=":", label="THH")
+        ax.legend(loc="upper right", fontsize=10)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    return fig
+
+
 def build_plots(data_dir, out_path=None, elev=22):
     global ELEV_VIEW
     ELEV_VIEW = elev
 
     actual_raw_df, solves_df, commanded_df = load_data(data_dir)
-    solve_df_abs, solve_df_rel = compute_solve_aligned_states(actual_raw_df, solves_df)
+
+    # ── Dynamic schema from all_solves.csv headers ────────────────────────────
+    state_cols, control_cols, theta_col, abs_state_cols, rel_state_cols = \
+        detect_schema(solves_df)
+    state_groups = group_state_cols(state_cols)
+
+    solve_df_abs, solve_df_rel = compute_solve_aligned_states(
+        actual_raw_df, solves_df,
+        state_cols, control_cols, abs_state_cols, rel_state_cols, theta_col)
+
     first_traj = get_first_solve_traj(solves_df)
+    target_df  = solve_df_abs[TARGET_COLS].copy().ffill().bfill()
 
-    target_df = solve_df_abs[TARGET_COLS].copy().fillna(method="bfill").fillna(method="ffill")
-    aligned_cmd = align_published_command(actual_raw_df, commanded_df)
+    # Helper: safely extract an (N, k) float array from a DataFrame
+    def _get_arr(df, cols):
+        return np.stack([df[c].values.astype(float) if c in df.columns
+                         else np.full(len(df), np.nan) for c in cols], axis=1)
 
-    frame_mode, frame_reason = infer_actual_frame(actual_raw_df, solve_df_abs, solve_df_rel, target_df, aligned_cmd)
-    actual_abs_state = normalize_actual_absolute(actual_raw_df, frame_mode, target_df)
-    actual_df = actual_raw_df.copy()
-    for col in STATE_COLS:
-        actual_df[col] = actual_abs_state[col].values
+    # Helper: extract first-trajectory array, preferring abs_* prefix columns
+    def _get_first_arr(cols):
+        abs_cols = [f"abs_{c}" for c in cols]
+        if all(c in first_traj.columns for c in abs_cols):
+            return _get_arr(first_traj, abs_cols)
+        return _get_arr(first_traj, cols)
 
-    if aligned_cmd is None:
-        cmd_df_abs = solve_df_abs[STREAM_COLS].copy()
-        cmd_df_rel = solve_df_rel[STREAM_COLS].copy()
-        command_label = "reconstructed command"
-        print("  Warning: commanded_state.csv missing/incompatible; using reconstructed command from all_solves.csv")
+    # ── Actual-state normalisation (13D absolute OCPs only) ───────────────────
+    _standard_pos = ("x", "y", "z")
+    has_world_pos = all(c in actual_raw_df.columns for c in _standard_pos)
+
+    if has_world_pos:
+        aligned_cmd = align_published_command(actual_raw_df, commanded_df)
+        frame_mode, frame_reason = infer_actual_frame(
+            actual_raw_df, solve_df_abs, solve_df_rel, target_df, aligned_cmd)
+        actual_abs_state = normalize_actual_absolute(actual_raw_df, frame_mode, target_df)
+        actual_df = actual_raw_df.copy()
+        for col in actual_abs_state.columns:
+            if col in actual_df.columns:
+                actual_df[col] = actual_abs_state[col].values
+        if frame_mode == "relative":
+            print("  Applied relative→absolute conversion using target from all_solves.csv")
     else:
-        cmd_df_abs = solve_df_abs[STREAM_COLS].copy()
-        cmd_df_abs[STATE_COLS + CONTROL_COLS] = aligned_cmd[STATE_COLS + CONTROL_COLS].to_numpy()
-        cmd_df_rel = cmd_df_abs.copy()
-        cmd_df_rel[["x", "y", "z"]] = cmd_df_abs[["x", "y", "z"]].to_numpy(dtype=float) - target_df[["tgt_x", "tgt_y", "tgt_z"]].to_numpy(dtype=float)
-        cmd_df_rel[["vx", "vy", "vz"]] = cmd_df_abs[["vx", "vy", "vz"]].to_numpy(dtype=float) - target_df[["tgt_vx", "tgt_vy", "tgt_vz"]].to_numpy(dtype=float)
-        command_label = "published command"
+        aligned_cmd = None
+        frame_mode  = "body_frame"
+        frame_reason = "no world-frame position columns in actual_state.csv"
+        actual_df   = actual_raw_df.copy()
 
-    print(f"  Actual frame mode: {frame_mode} ({frame_reason})")
-    if frame_mode == "relative":
-        print("  Applied relative->absolute conversion for actual_state.csv using target snapshots from all_solves.csv")
+    # ── Commanded state: align published or fall back to solve trajectory ─────
+    if aligned_cmd is not None:
+        common = [c for c in STATE_COLS + CONTROL_COLS
+                  if c in aligned_cmd.columns and c in solve_df_abs.columns]
+        if common:
+            solve_df_abs.loc[:, common] = aligned_cmd[common].to_numpy()
+        command_label = "published command"
+    else:
+        command_label = "reconstructed command"
+        if commanded_df is not None:
+            print("  Warning: commanded_state.csv columns incompatible; using solve trajectory.")
+
+    print(f"  Schema: state={state_cols}, controls={control_cols}"
+          f"{', theta' if theta_col else ''}")
+    print(f"  State groups: {[g[0] for g in state_groups]}")
+    print(f"  Frame mode:   {frame_mode} ({frame_reason})")
 
     title_str = os.path.basename(os.path.normpath(data_dir))
-
     if out_path is None:
         out_path = os.path.join(data_dir, f"{title_str}_analysis.pdf")
 
-    # ── Time axes ──────────────────────────────────────────────────────────────
+    # ── Time axis ─────────────────────────────────────────────────────────────
     time = actual_df["timestamp"].values.astype(float)
     time = time - time[0]
 
     first_t = first_traj["t"].values.astype(float)
-    if first_t[0] != 0:
+    if len(first_t) and first_t[0] != 0:
         first_t = first_t - first_t[0]
 
-    # ── State arrays ───────────────────────────────────────────────────────────
-    actual_pos  = actual_df[["x","y","z"]].values
-    actual_vel  = actual_df[["vx","vy","vz"]].values
-    actual_quat = actual_df[["qw","qx","qy","qz"]].values
-    actual_angv = actual_df[["wx","wy","wz"]].values
+    # ── Detect whether world-frame 3D page is possible ────────────────────────
+    pos_group  = next((g for g in state_groups if g[0] == "Position"), None)
+    vel_group  = next((g for g in state_groups if g[0] == "Velocity"), None)
+    pos_cols_3 = pos_group[1][:3] if pos_group else []
+    # actual_state.csv may use "x","y","z" while all_solves.csv uses "px","py","pz"
+    _ACTUAL_XYZ = ["x","y","z"]
+    actual_pos_cols_3 = (pos_cols_3 if all(c in actual_df.columns for c in pos_cols_3)
+                         else [c for c in _ACTUAL_XYZ if c in actual_df.columns][:3])
+    has_3d = (bool(pos_cols_3)
+              and all(c in solve_df_abs.columns for c in pos_cols_3)
+              and len(actual_pos_cols_3) == 3)
 
-    cmd_pos_abs = cmd_df_abs[["x","y","z"]].values
-    cmd_vel_abs = cmd_df_abs[["vx","vy","vz"]].values
-    cmd_quat_abs= cmd_df_abs[["qw","qx","qy","qz"]].values
-    cmd_angv_abs= cmd_df_abs[["wx","wy","wz"]].values
+    # Target columns for relative / tracking pages
+    tgt_x  = _fc(solve_df_abs, "tgt_x").values.astype(float)
+    tgt_y  = _fc(solve_df_abs, "tgt_y").values.astype(float)
+    tgt_z  = _fc(solve_df_abs, "tgt_z").values.astype(float)
+    tgt_vx = _fc(solve_df_abs, "tgt_vx").values.astype(float)
+    tgt_vy = _fc(solve_df_abs, "tgt_vy").values.astype(float)
+    tgt_vz = _fc(solve_df_abs, "tgt_vz").values.astype(float)
+    has_target = np.isfinite(tgt_x).any()
 
-    first_pos_abs = first_traj[["abs_x","abs_y","abs_z"]].values
-    first_vel_abs = first_traj[["abs_vx","abs_vy","abs_vz"]].values
-    first_quat_abs= first_traj[["abs_qw","abs_qx","abs_qy","abs_qz"]].values
-    first_angv_abs= first_traj[["abs_wx","abs_wy","abs_wz"]].values
-
+    page_num = 1
     print(f"  Building PDF → {out_path}")
     with PdfPages(out_path) as pdf:
 
-        # ── Page 1 : 3-D views ─────────────────────────────────────────────────
-        print("  [1/10] 3-D views (Abs/Rel) …")
-        fig1 = page_3d_views(actual_df, solves_df, cmd_df_abs, cmd_df_rel, first_traj, title_str, command_label)
-        pdf.savefig(fig1, facecolor=FIG_BG); plt.close(fig1)
+        # ── 3-D trajectory page ───────────────────────────────────────────────
+        if has_3d:
+            print(f"  [{page_num}] 3-D views …")
+            fig_3d = page_3d_views(actual_df, solves_df, solve_df_abs, solve_df_rel,
+                                   first_traj, title_str, command_label,
+                                   pos_cols=pos_cols_3,
+                                   actual_pos_cols=actual_pos_cols_3)
+            pdf.savefig(fig_3d, facecolor=FIG_BG); plt.close(fig_3d)
+            page_num += 1
 
-        # ── Page 2 : Position (Absolute) ──────────────────────────────────────
-        print("  [2/10] Position states (Absolute) …")
-        fig2 = _state_page(
-            time, actual_pos, cmd_pos_abs,
-            first_t, first_pos_abs,
-            labels=["x", "y", "z"], units="m",
-            page_title=f"{title_str}  —  Position (Absolute)",
-            fig_title="Absolute Position  [x, y, z]",
-            command_label=command_label)
-        pdf.savefig(fig2, facecolor=FIG_BG); plt.close(fig2)
+        # ── Dynamic state pages (one per semantic group) ──────────────────────
+        for grp_label, grp_cols, grp_units in state_groups:
+            # Use columns that exist in actual_df (some OCPs log a subset)
+            avail = [c for c in grp_cols if c in actual_df.columns]
+            if not avail:
+                continue
+            print(f"  [{page_num}] {grp_label} ({', '.join(avail)}) …")
+            actual_arr = _get_arr(actual_df,   avail)
+            cmd_arr    = _get_arr(solve_df_abs, avail)
+            first_arr  = _get_first_arr(avail)
+            fig_s = _state_page(
+                time, actual_arr, cmd_arr,
+                first_t, first_arr,
+                labels=avail, units=grp_units,
+                page_title=f"{title_str}  —  {grp_label}",
+                fig_title=f"{grp_label}  [{', '.join(avail)}]",
+                command_label=command_label)
+            pdf.savefig(fig_s, facecolor=FIG_BG); plt.close(fig_s)
+            page_num += 1
 
-        # ── Page 3 : Velocity (Absolute) ──────────────────────────────────────
-        print("  [3/11] Velocity states (Absolute) …")
-        fig3 = _state_page(
-            time, actual_vel, cmd_vel_abs,
-            first_t, first_vel_abs,
-            labels=["vx", "vy", "vz"], units="m/s",
-            page_title=f"{title_str}  —  Velocity (Absolute)",
-            fig_title="Absolute Velocity  [vx, vy, vz]",
-            command_label=command_label)
-        # Reference vz_ref
-        for ax in fig3.get_axes():
-            if ax.get_title().startswith("Absolute Velocity"):
-                ax.axhline(VZ_REF, color="r", lw=1.2, ls="--", alpha=0.6, label="VZ_REF")
-                _legend(ax, ax.get_lines(), loc="best")
-        pdf.savefig(fig3, facecolor=FIG_BG); plt.close(fig3)
+        # ── Relative position & velocity page ─────────────────────────────────
+        if has_target and has_3d and pos_group and vel_group:
+            vel_cols_3 = vel_group[1][:3]
+            actual_vel_cols_3 = (vel_cols_3 if all(c in actual_df.columns for c in vel_cols_3)
+                                 else [c for c in ["vx","vy","vz"] if c in actual_df.columns][:3])
+            if len(actual_vel_cols_3) == 3:
+                print(f"  [{page_num}] Relative states …")
+                actual_pos = _get_arr(actual_df, actual_pos_cols_3)
+                actual_vel = _get_arr(actual_df, actual_vel_cols_3)
+                rel_pos = actual_pos - np.stack([tgt_x, tgt_y, tgt_z], axis=1)
+                rel_vel = actual_vel - np.stack([tgt_vx, tgt_vy, tgt_vz], axis=1)
 
-        # ── Page 4 : Quaternion ───────────────────────────────────────────────
-        print("  [4/10] Quaternion states …")
-        fig4 = _state_page(
-            time, actual_quat, cmd_quat_abs,
-            first_t, first_quat_abs,
-            labels=["qw", "qx", "qy", "qz"], units="–",
-            page_title=f"{title_str}  —  Quaternion",
-            fig_title="Attitude quaternion  [qw, qx, qy, qz]",
-            command_label=command_label)
-        pdf.savefig(fig4, facecolor=FIG_BG); plt.close(fig4)
+                fig_rel = _fig(f"{title_str}  —  Relative States", figsize=(16, 10))
+                gs_r = gridspec.GridSpec(2, 1, hspace=0.3)
+                ax_rp = fig_rel.add_subplot(gs_r[0])
+                ax_rv = fig_rel.add_subplot(gs_r[1])
+                _style_ax(ax_rp, "Time [s]", "Pos [m]",   "Relative Position (Drone − Target)")
+                _style_ax(ax_rv, "Time [s]", "Vel [m/s]", "Relative Velocity (Drone − Target)")
+                for k in range(3):
+                    ax_rp.plot(time, rel_pos[:, k], color=COMP_COLS[k], lw=2.0,
+                               label=f"r{pos_cols_3[k]}")
+                    ax_rv.plot(time, rel_vel[:, k], color=COMP_COLS[k], lw=2.0,
+                               label=f"r{vel_cols_3[k]}")
+                ax_rp.legend(); ax_rv.legend()
+                pdf.savefig(fig_rel, facecolor=FIG_BG); plt.close(fig_rel)
+                page_num += 1
 
-        # ── Page 5 : Angular velocity ─────────────────────────────────────────
-        print("  [5/10] Angular velocity states …")
-        fig5 = _state_page(
-            time, actual_angv, cmd_angv_abs,
-            first_t, first_angv_abs,
-            labels=["wx", "wy", "wz"], units="rad/s",
-            page_title=f"{title_str}  —  Angular Velocity",
-            fig_title="Angular velocity  [wx, wy, wz]",
-            command_label=command_label)
-        pdf.savefig(fig5, facecolor=FIG_BG); plt.close(fig5)
+        # ── Target tracking page ──────────────────────────────────────────────
+        if has_target and has_3d and pos_group:
+            avail_pos = [c for c in pos_cols_3 if c in actual_df.columns]
+            if len(avail_pos) >= 2:
+                print(f"  [{page_num}] Target tracking …")
+                actual_pos = _get_arr(actual_df, avail_pos[:2])
+                fig_trk = _fig(f"{title_str}  —  Target Tracking", figsize=(16, 10))
+                for ki, (lbl, tgt) in enumerate(zip(avail_pos[:2], [tgt_x, tgt_y])):
+                    ax = fig_trk.add_subplot(2, 1, ki + 1)
+                    _style_ax(ax, "Time [s]", f"{lbl} [m]", f"{lbl} Tracking")
+                    ax.plot(time, tgt,              color="#d12be6",    lw=1.5, ls="--", label=f"Target {lbl}")
+                    ax.plot(time, actual_pos[:, ki], color=COMP_COLS[ki], lw=2.0, label=f"Drone {lbl}")
+                    ax.legend()
+                pdf.savefig(fig_trk, facecolor=FIG_BG); plt.close(fig_trk)
+                page_num += 1
 
-        # ── Page 6 : Relative Position & Velocity ─────────────────────────────
-        # Extract target trajectory from commanded states
-        tgt_df = cmd_df_abs[["tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz"]]
-        tgt_df = tgt_df.fillna(method="bfill").fillna(method="ffill")
-        
-        tgt_x = tgt_df["tgt_x"].values
-        tgt_y = tgt_df["tgt_y"].values
-        tgt_z = tgt_df["tgt_z"].values
-        tgt_vx = tgt_df["tgt_vx"].values
-        tgt_vy = tgt_df["tgt_vy"].values
-        tgt_vz = tgt_df["tgt_vz"].values
-        
-        actual_rel_pos = actual_pos - np.stack([tgt_x, tgt_y, tgt_z], axis=1)
-        actual_rel_vel = actual_vel - np.stack([tgt_vx, tgt_vy, tgt_vz], axis=1)
-        
-        fig6 = _fig(f"{title_str}  —  Relative States", figsize=(16, 10))
-        gs6 = gridspec.GridSpec(2, 1, hspace=0.3)
-        ax6a = fig6.add_subplot(gs6[0]); _style_ax(ax6a, "Time [s]", "Pos [m]", "Relative Position (Drone - Target)")
-        ax6b = fig6.add_subplot(gs6[1]); _style_ax(ax6b, "Time [s]", "Vel [m/s]", "Relative Velocity (Drone - Target)")
-        
-        for k in range(3):
-            ax6a.plot(time, actual_rel_pos[:, k], color=COMP_COLS[k], lw=2.0, label=["rx","ry","rz"][k])
-            ax6b.plot(time, actual_rel_vel[:, k], color=COMP_COLS[k], lw=2.0, label=["rvx","rvy","rvz"][k])
-        ax6b.axhline(VZ_REF, color="r", lw=1.2, ls="--", alpha=0.6, label="VZ_REF")
-        ax6a.legend(); ax6b.legend()
-        pdf.savefig(fig6, facecolor=FIG_BG); plt.close(fig6)
+        # ── Position error page ───────────────────────────────────────────────
+        if has_3d and pos_group:
+            avail_pos = [c for c in pos_cols_3 if c in actual_df.columns and c in solve_df_abs.columns]
+            if avail_pos:
+                print(f"  [{page_num}] Position error …")
+                fig_ep = _error_page(
+                    time,
+                    _get_arr(actual_df,   avail_pos),
+                    _get_arr(solve_df_abs, avail_pos),
+                    labels=avail_pos, units="m",
+                    page_title=f"{title_str}  —  Position Tracking Error",
+                    fig_title=f"Position error  (actual − {command_label})")
+                pdf.savefig(fig_ep, facecolor=FIG_BG); plt.close(fig_ep)
+                page_num += 1
 
-        # ── Page 7 : Target Tracking ──────────────────────────────────────────
-        print("  [7/10] Target tracking …")
-        fig7 = _fig(f"{title_str}  —  Target Tracking", figsize=(16, 10))
-        # Plot x, y components vs target
-        ax7a = fig7.add_subplot(2, 1, 1); _style_ax(ax7a, "Time [s]", "X [m]", "X Tracking")
-        ax7a.plot(time, tgt_x, color="#d12be6", lw=1.5, ls="--", label="Target X")
-        ax7a.plot(time, actual_pos[:, 0], color=COMP_COLS[0], lw=2.0, label="Drone X")
-        ax7a.legend()
-        
-        ax7b = fig7.add_subplot(2, 1, 2); _style_ax(ax7b, "Time [s]", "Y [m]", "Y Tracking")
-        ax7b.plot(time, tgt_y, color="#d12be6", lw=1.5, ls="--", label="Target Y")
-        ax7b.plot(time, actual_pos[:, 1], color=COMP_COLS[1], lw=2.0, label="Drone Y")
-        ax7b.legend()
-        pdf.savefig(fig7, facecolor=FIG_BG); plt.close(fig7)
+        # ── Velocity error page ───────────────────────────────────────────────
+        if vel_group:
+            vel_cols_3 = vel_group[1][:3]
+            avail_vel = [c for c in vel_cols_3
+                         if c in actual_df.columns and c in solve_df_abs.columns]
+            if avail_vel:
+                print(f"  [{page_num}] Velocity error …")
+                fig_ev = _error_page(
+                    time,
+                    _get_arr(actual_df,   avail_vel),
+                    _get_arr(solve_df_abs, avail_vel),
+                    labels=avail_vel, units="m/s",
+                    page_title=f"{title_str}  —  Velocity Tracking Error",
+                    fig_title=f"Velocity error  (actual − {command_label})")
+                pdf.savefig(fig_ev, facecolor=FIG_BG); plt.close(fig_ev)
+                page_num += 1
 
-        # ── Page 8 : Position error ───────────────────────────────────────────
-        print("  [8/10] Position error …")
-        fig8 = _error_page(
-            time, actual_pos, cmd_pos_abs,
-            labels=["x", "y", "z"], units="m",
-            page_title=f"{title_str}  —  Position Tracking Error",
-            fig_title=f"Position error  (actual − {command_label})")
-        pdf.savefig(fig8, facecolor=FIG_BG); plt.close(fig8)
+        # ── Solver stats ──────────────────────────────────────────────────────
+        print(f"  [{page_num}] Solver stats …")
+        fig_sv = page_solver_stats(solves_df, title_str)
+        pdf.savefig(fig_sv, facecolor=FIG_BG); plt.close(fig_sv)
+        page_num += 1
 
-        # ── Page 9 : Velocity error ───────────────────────────────────────────
-        print("  [9/10] Velocity error …")
-        fig9 = _error_page(
-            time, actual_vel, cmd_vel_abs,
-            labels=["vx", "vy", "vz"], units="m/s",
-            page_title=f"{title_str}  —  Velocity Tracking Error",
-            fig_title=f"Velocity error  (actual − {command_label})")
-        pdf.savefig(fig9, facecolor=FIG_BG); plt.close(fig9)
-
-        # ── Page 10 : Solver Stats ───────────────────────────────────────────
-        print("  [10/11] Solver stats …")
-        fig10 = page_solver_stats(solves_df, title_str)
-        pdf.savefig(fig10, facecolor=FIG_BG); plt.close(fig10)
-
-        # ── Page 11 : Control Inputs ─────────────────────────────────────────
-        print("  [11/11] Control inputs …")
-        # Extract controls fz, mx, my, mz from cmd_df_abs (they are logged in all_solves)
-        cmd_ctrl = cmd_df_abs[["fz", "mx", "my", "mz"]].values
-        # For theta, we might need to find it in solves_df if it's there
-        fig11 = page_controls(time, cmd_df_abs, cmd_ctrl, title_str)
-        pdf.savefig(fig11, facecolor=FIG_BG); plt.close(fig11)
+        # ── Controls page ─────────────────────────────────────────────────────
+        print(f"  [{page_num}] Control inputs …")
+        fig_ctrl = page_controls_dynamic(time, solve_df_abs, control_cols, theta_col, title_str)
+        if fig_ctrl is not None:
+            pdf.savefig(fig_ctrl, facecolor=FIG_BG); plt.close(fig_ctrl)
+            page_num += 1
 
         # PDF metadata
         d = pdf.infodict()
-        d["Title"]   = f"Landing MPC analysis: {title_str}"
-        d["Subject"] = "MPC landing trajectory analysis"
+        d["Title"]   = f"CoManDO analysis: {title_str}"
+        d["Subject"] = "MPC trajectory analysis"
 
-    print(f"  ✓  Saved {out_path}")
+    print(f"  ✓  Saved {out_path}  ({page_num - 1} pages)")
     return out_path
 
 

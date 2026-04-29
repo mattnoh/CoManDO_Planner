@@ -288,7 +288,7 @@ inline OCPDescriptor descriptor() {
     d.state_dim = NX;
     d.control_dim = NU;
 
-    d.state_names = {"px","py","pz","vx","vy","vz","qw","qx","qy","qz","DT"};
+    d.state_names = {"px_tgt","py_tgt","pz_tgt","vx_tgt","vy_tgt","vz_tgt","qw","qx","qy","qz","DT"};
     d.control_names = {"T","omx","omy","omz","Theta"};
     d.log_state_headers = {"px_tgt","py_tgt","pz_tgt","vx_tgt","vy_tgt","vz_tgt",
                            "qw","qx","qy","qz","DT"};
