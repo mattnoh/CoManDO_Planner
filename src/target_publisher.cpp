@@ -60,13 +60,8 @@ public:
     BenchmarkTargetPublisher() : Node("circular_target_publisher")
     {
         // ── Parameters ──────────────────────────────────────────────────────
+        // Circle trajectory shape is configured in include/target/circular_target.hpp
         target_mode_ = declare_parameter<std::string>("target_mode", "circle");
-        center_x_    = declare_parameter<double>("center_x",   0.0);
-        center_y_    = declare_parameter<double>("center_y",   0.0);
-        center_z_    = declare_parameter<double>("center_z",   0.4);
-        radius_      = declare_parameter<double>("radius",     1.0);
-        omega_       = declare_parameter<double>("omega",      0.3);
-        phi0_        = declare_parameter<double>("phi0",       0.0);
         publish_hz_  = declare_parameter<double>("publish_hz", 100.0);
         frame_id_    = declare_parameter<std::string>("frame_id", "world");
         qualisys_pose_topic_  = declare_parameter<std::string>("rigid_body_name", "stmini");
@@ -91,8 +86,7 @@ public:
         }
 #endif
 
-        // circle mode: shift phi0 so phase matches requested value at node startup
-        phi0_ = phi0_ - omega_ * now().seconds();
+        t0_ = now().seconds();  // circle mode uses relative time from here
 
         // ── Publishers ───────────────────────────────────────────────────────
         odom_pub_  = create_publisher<nav_msgs::msg::Odometry>("/target/odom", 10);
@@ -149,21 +143,21 @@ public:
                     }
                 });
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] mode=qualisys  body_name=%s  "
-                "center=(%.2f,%.2f,%.2f)  ω=%.2f rad/s",
-                qualisys_pose_topic_.c_str(),
-                center_x_, center_y_, center_z_, omega_);
+                "[TargetPublisher] mode=qualisys  body_name=%s",
+                qualisys_pose_topic_.c_str());
         } else {
             RCLCPP_INFO(get_logger(),
                 "[TargetPublisher] mode=circle  center=(%.2f,%.2f,%.2f)  "
                 "R=%.2f  ω=%.2f rad/s  %.0f Hz",
-                center_x_, center_y_, center_z_, radius_, omega_, publish_hz_);
+                circle_model_.center.x(), circle_model_.center.y(), circle_model_.center.z(),
+                circle_model_.R, circle_model_.omega, publish_hz_);
         }
 #else
         RCLCPP_INFO(get_logger(),
             "[TargetPublisher] mode=circle  center=(%.2f,%.2f,%.2f)  "
             "R=%.2f  ω=%.2f rad/s  %.0f Hz",
-            center_x_, center_y_, center_z_, radius_, omega_, publish_hz_);
+            circle_model_.center.x(), circle_model_.center.y(), circle_model_.center.z(),
+            circle_model_.R, circle_model_.omega, publish_hz_);
 #endif
 
         if (drone_odom_mode_ == "shifted_world") {
@@ -191,30 +185,11 @@ public:
 
 private:
 
-    // ── Kinematics from phase ────────────────────────────────────────────────
-    // All returned in world frame. R is the instantaneous orbit radius.
     struct Kinematics {
         double px, py, pz;
         double vx, vy, vz;
         double ax, ay, az;
     };
-
-    Kinematics circleKinematics(double phi, double R, double pz) const
-    {
-        const double cp = std::cos(phi);
-        const double sp = std::sin(phi);
-        return {
-            center_x_ + R * cp,          // px
-            center_y_ + R * sp,          // py
-            pz,                          // pz
-            -omega_ * R * sp,            // vx
-             omega_ * R * cp,            // vy
-            0.0,                         // vz
-            -omega_ * omega_ * R * cp,   // ax  (centripetal)
-            -omega_ * omega_ * R * sp,   // ay
-            0.0                          // az
-        };
-    }
 
     // ── Timer callback ───────────────────────────────────────────────────────
     void timerCallback()
@@ -260,9 +235,12 @@ private:
             }
 
         } else {
-            // ── circle mode: fully synthetic ─────────────────────────────────
-            const double phi_now = phi0_ + omega_ * t;
-            k = circleKinematics(phi_now, radius_, center_z_);
+            // ── circle mode: fully synthetic, trajectory defined in circular_target.hpp
+            const double t_rel = t - t0_;
+            const Eigen::Vector3d p = circle_model_.pos(t_rel);
+            const Eigen::Vector3d v = circle_model_.vel(t_rel);
+            const Eigen::Vector3d a = circle_model_.accel(t_rel);
+            k = {p.x(), p.y(), p.z(), v.x(), v.y(), v.z(), a.x(), a.y(), a.z()};
         }
 
         // ── Odometry message ─────────────────────────────────────────────────
@@ -457,9 +435,10 @@ private:
 
     // ── Parameters ─────────────────────────────────────────────────────────
     std::string target_mode_;
-    double center_x_, center_y_, center_z_;
-    double radius_, omega_, phi0_, publish_hz_;
+    double publish_hz_;
     std::string frame_id_;
+    target_models::CircularTarget circle_model_;  // trajectory defined in circular_target.hpp
+    double t0_ = 0.0;  // wall-clock time at startup, for relative time in circle mode
     std::string qualisys_pose_topic_;
     std::string drone_odom_topic_;
     std::string drone_odom_mode_;  // "none" | "shifted_world" | "body_frame" | "target_frame"
