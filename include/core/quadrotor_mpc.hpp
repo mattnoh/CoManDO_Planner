@@ -38,6 +38,9 @@ public:
         double                        solve_time_ms = 0.0;
         double                        constraint_error = 0.0;
         int                           solve_iters   = 0;
+        std::chrono::steady_clock::time_point solve_start_time;
+        std::chrono::steady_clock::time_point solve_finish_time;
+        // Temporary compatibility alias while planner call sites migrate.
         std::chrono::steady_clock::time_point solve_timestamp;
         std::any                      extra_params;
     };

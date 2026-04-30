@@ -33,6 +33,9 @@ struct SolverResult {
     double solve_time_ms = 0.0;
     double constraint_error = 0.0;
     int solve_iters = 0;
+    std::chrono::steady_clock::time_point solve_start_time;
+    std::chrono::steady_clock::time_point solve_finish_time;
+    // Temporary compatibility alias while call sites migrate.
     std::chrono::steady_clock::time_point solve_timestamp;
 
     bool is_relative_plan = false;
@@ -82,6 +85,7 @@ struct OCPDescriptor {
     bool skip_altitude_validation = false;
     bool skip_trajectory_validation = false;  // bypass all post-solve rejection gates for this OCP
     bool variable_dt = false;
+    bool use_predicted_handoff_state = true;
 
     // --- State / control dimensions ---
     int state_dim = 13;
@@ -138,6 +142,10 @@ struct OCPDescriptor {
     std::function<void(Eigen::VectorXd&,
                        const std::vector<Eigen::VectorXd>&,
                        int)> merge_prev_augmented;
+
+    /// Clamp/sanitize a warm-start control in the OCP's own units.
+    /// Used by generic MPC feedback warm-start code before handing controls to create().
+    std::function<void(Eigen::VectorXd&)> sanitize_warm_control;
 
     /// Convert body-rate OCP output to [vx_world, vy_world, z_cmd, yaw_rate] for cmd_hover.
     /// Called only when platform="crazyflie" and command_mode=CmdBodyRate.

@@ -26,13 +26,16 @@ std::vector<Eigen::VectorXd> QuadrotorMPC::makeUwarm(int n_shift) const {
     if (N == 1) return prev_U_;
 
     const int NEX = std::max(1, std::min(n_shift, N - 1));
+    const auto desc = OCPRegistry::getDescriptor(config_.ocp_type);
 
     Eigen::VectorXd u_tail = prev_U_[N - 1 - NEX];
     if (u_tail.size() >= 4) {
         u_tail(1) = 0.0;
         u_tail(2) = 0.0;
         u_tail(3) = 0.0;
-        u_tail(0) = std::max(0.08, std::min(0.6, u_tail(0)));
+    }
+    if (desc.sanitize_warm_control) {
+        desc.sanitize_warm_control(u_tail);
     }
 
     std::vector<Eigen::VectorXd> uw(N);
@@ -41,6 +44,9 @@ std::vector<Eigen::VectorXd> QuadrotorMPC::makeUwarm(int n_shift) const {
             uw[i] = prev_U_[i + NEX];
         } else {
             uw[i] = u_tail;
+        }
+        if (desc.sanitize_warm_control) {
+            desc.sanitize_warm_control(uw[i]);
         }
     }
     return uw;
@@ -90,6 +96,8 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
     Result result;
     result.success = false;
     auto t0 = chrono::steady_clock::now();
+    result.solve_start_time = t0;
+    result.solve_timestamp = t0;
 
     try {
         target_accel_ = target_accel;
@@ -145,9 +153,11 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
         auto U_result = solver_->getResU();
         auto K_result = solver_->getResK();
 
+        const auto t_finish = chrono::steady_clock::now();
+        result.solve_finish_time = t_finish;
         result.solve_time_ms = chrono::duration<double, milli>(
-            chrono::steady_clock::now() - t0).count();
-        result.solve_timestamp = t0;
+            t_finish - t0).count();
+        result.solve_timestamp = result.solve_start_time;
         result.constraint_error = solver_->getError();
         result.solve_iters = static_cast<int>(solver_->getAllCost().size());
         result.extra_params = extra_params;
@@ -183,6 +193,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
     } catch (const exception& e) {
         std::cerr << "ERROR in solve: " << e.what() << "\n";
         last_solve_ms_ = 0.0;
+        result.solve_finish_time = chrono::steady_clock::now();
     }
 
     return result;

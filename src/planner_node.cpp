@@ -90,6 +90,7 @@ public:
         } else {
             ocp_dt_ = 0.0;
             drone_state_is_relative_ = false;
+            drone_odom_mode_ = OCPDescriptor::DroneOdomMode::Absolute;
             drone_odom_topic_.clear();
             is_configured_ = false;
         }
@@ -155,7 +156,7 @@ public:
             "To run next OCP from another terminal: set ocp/mode/n_replay/target then increment command_seq.");
         RCLCPP_INFO(this->get_logger(),
             "Input state mode: %s (drone_odom_topic='%s')",
-            drone_state_is_relative_ ? "body-relative-pass-through" : "absolute-with-registry-transform",
+            droneOdomModeName(drone_odom_mode_),
             drone_odom_topic_.c_str());
     }
 
@@ -250,6 +251,7 @@ private:
         const bool mode_changed = (needs_relative != drone_state_is_relative_);
         const bool topic_changed = (desired_odom_topic != drone_odom_topic_);
 
+        drone_odom_mode_ = desc.drone_odom_mode;
         drone_state_is_relative_ = needs_relative;
         drone_odom_topic_ = desired_odom_topic;
 
@@ -473,7 +475,59 @@ private:
     }
 
     const char* currentFrameLabel() const {
-        return drone_state_is_relative_ ? "body_relative" : "absolute";
+        switch (drone_odom_mode_) {
+            case OCPDescriptor::DroneOdomMode::TargetFrameRelative:
+                return "target_frame_relative";
+            case OCPDescriptor::DroneOdomMode::BodyFrameRelative:
+                return "body_relative";
+            case OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget:
+                return "absolute_shifted";
+            case OCPDescriptor::DroneOdomMode::Absolute:
+            default:
+                return "absolute";
+        }
+    }
+
+    Eigen::VectorXd selectSolverInitialState(const Eigen::VectorXd& live_x0,
+                                             const OCPDescriptor& desc,
+                                             double* handoff_pos_err,
+                                             double* handoff_vel_err,
+                                             const char** x0_source) {
+        if (handoff_pos_err) *handoff_pos_err = 0.0;
+        if (handoff_vel_err) *handoff_vel_err = 0.0;
+        if (x0_source) *x0_source = "live";
+
+        if (!is_primed_.load() || !desc.use_predicted_handoff_state) {
+            return live_x0;
+        }
+
+        TrajectoryReplayer::ReplaySample predicted;
+        if (!trajectory_replayer_.sampleActiveAtElapsed(last_replan_delay_sec_, ocp_dt_, &predicted) ||
+            !predicted.has_plan ||
+            predicted.x_cmd.size() < live_x0.size()) {
+            if (x0_source) *x0_source = "live_no_prediction";
+            return live_x0;
+        }
+
+        Eigen::VectorXd predicted_x0 = predicted.x_cmd.head(live_x0.size());
+        double pos_err = 0.0;
+        double vel_err = 0.0;
+        if (live_x0.size() >= 6 && predicted_x0.size() >= 6) {
+            pos_err = (live_x0.segment(0, 3) - predicted_x0.segment(0, 3)).norm();
+            vel_err = (live_x0.segment(3, 3) - predicted_x0.segment(3, 3)).norm();
+        }
+        if (handoff_pos_err) *handoff_pos_err = pos_err;
+        if (handoff_vel_err) *handoff_vel_err = vel_err;
+
+        constexpr double kMaxHandoffPosError = 0.25;
+        constexpr double kMaxHandoffVelError = 1.0;
+        if (pos_err > kMaxHandoffPosError || vel_err > kMaxHandoffVelError) {
+            if (x0_source) *x0_source = "live_tracking_error";
+            return live_x0;
+        }
+
+        if (x0_source) *x0_source = "predicted_handoff";
+        return predicted_x0;
     }
 
     std::vector<Eigen::VectorXd> makeTrajectoryForPublishing(const SolverResult& result) const {
@@ -939,6 +993,10 @@ private:
         if (apply_registry_transform) {
             x0 = desc.transform_state(x0_abs, target_snapshot);
         }
+        double handoff_pos_err = 0.0;
+        double handoff_vel_err = 0.0;
+        const char* x0_source = "live";
+        x0 = selectSolverInitialState(x0, desc, &handoff_pos_err, &handoff_vel_err, &x0_source);
 
         // merge_prev_augmented has been removed. Augmented target state variables
         // (Ω_N, a_T^B, β_N) are now populated purely from the fresh sensor snapshot
@@ -1019,24 +1077,36 @@ private:
 
         stale_warning_count_ = 0;
         replay_ticks_since_solve_.store(0);
-        last_accepted_solve_timestamp_ = result.solve_timestamp;
+        const auto previous_plan_origin = last_accepted_solve_timestamp_;
+        const double previous_replan_delay_sec = last_replan_delay_sec_;
+        const bool first_plan = !is_primed_.load();
         last_replan_delay_sec_ = replayAdvanceTime(result.state_trajectory);
 
         RCLCPP_INFO(this->get_logger(),
-            "[RH %d] %.1fms iters=%d x0=[%.3f,%.3f,%.3f] replan_delay=%.3fs",
+            "[RH %d] %.1fms iters=%d x0=[%.3f,%.3f,%.3f] source=%s handoff_err(p=%.3f,v=%.3f) replan_delay=%.3fs",
             solve_count_, result.solve_time_ms, result.solve_iters,
-            x0(0), x0(1), x0(2), last_replan_delay_sec_);
+            x0(0), x0(1), x0(2), x0_source, handoff_pos_err, handoff_vel_err,
+            last_replan_delay_sec_);
+
+        const auto plan_origin_time = first_plan
+            ? result.solve_finish_time
+            : previous_plan_origin + std::chrono::duration_cast<Clock::duration>(
+                  std::chrono::duration<double>(previous_replan_delay_sec));
+        const auto earliest_activation_time = plan_origin_time;
 
         trajectory_replayer_.updatePlan(
             result.state_trajectory,
             result.control_trajectory,
             result.solve_time_ms,
             solve_count_,
-            result.solve_timestamp,
+            plan_origin_time,
+            earliest_activation_time,
             ocp_dt_,
             n_replay_,
             OCPRegistry::getDescriptor(ocp_type_).variable_dt,
             state_dim_);
+
+        last_accepted_solve_timestamp_ = plan_origin_time;
 
         is_primed_.store(true);
 
@@ -1094,6 +1164,13 @@ private:
         auto replay = trajectory_replayer_.sample(Clock::now(), ocp_dt_);
         if (!replay.has_plan) {
             return;
+        }
+        if (auto diag = trajectory_replayer_.consumeLastHandoffDiagnostic()) {
+            RCLCPP_INFO(this->get_logger(),
+                "[handoff] solve %d -> %d age=%.3fs latency=%.3fs state_jump=%.4f control_jump=%.4f",
+                diag->previous_solve_num, diag->new_solve_num,
+                diag->active_plan_age_sec, diag->solve_latency_sec,
+                diag->state_jump_norm, diag->control_jump_norm);
         }
 
         replay_ticks_since_solve_.fetch_add(1);
@@ -1202,6 +1279,8 @@ private:
             result.solve_time_ms = r.solve_time_ms;
             result.constraint_error = r.constraint_error;
             result.solve_iters = r.solve_iters;
+            result.solve_start_time = r.solve_start_time;
+            result.solve_finish_time = r.solve_finish_time;
             result.solve_timestamp = r.solve_timestamp;
             result.extra = r.extra_params;
 
@@ -1501,6 +1580,7 @@ private:
 
     std::string ocp_type_, platform_, solver_type_, mode_, drone_name_;
     bool drone_state_is_relative_ = false;
+    OCPDescriptor::DroneOdomMode drone_odom_mode_ = OCPDescriptor::DroneOdomMode::Absolute;
     std::string drone_odom_topic_;
     std::string body_relative_odom_topic_ = "/drone/body_relative_odom";
     std::string target_frame_odom_topic_ = "/drone/target_frame_odom";
