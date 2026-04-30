@@ -21,6 +21,16 @@ find_package(Eigen3 REQUIRED)
 # ── Include ALIPDDP solver as a standalone sibling ────────────────────────────
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../ALIPDDP-main ${CMAKE_CURRENT_BINARY_DIR}/alipddp)
 
+add_library(planner_core INTERFACE)
+target_include_directories(planner_core INTERFACE
+  ${EIGEN3_INCLUDE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/config
+)
+target_link_libraries(planner_core INTERFACE
+  alipddp_library
+)
+
 option(COMANDO_ENABLE_QUALISYS "Enable Qualisys/mocap4r2 message support" ON)
 find_package(mocap4r2_msgs QUIET)
 if(COMANDO_ENABLE_QUALISYS AND mocap4r2_msgs_FOUND)
@@ -60,7 +70,7 @@ macro(configure_target TARGET_NAME)
   endif()
 
   target_link_libraries(${TARGET_NAME}
-    alipddp_library
+    planner_core
   )
 
   set(_AMENT_DEPS
@@ -102,7 +112,7 @@ target_include_directories(test_poly_ocp PRIVATE
   config
 )
 target_link_libraries(test_poly_ocp
-  alipddp_library
+  planner_core
 )
 
 add_executable(test_trajectory_replayer
@@ -111,6 +121,9 @@ add_executable(test_trajectory_replayer
 target_include_directories(test_trajectory_replayer PRIVATE
   ${EIGEN3_INCLUDE_DIR}
   include
+)
+target_link_libraries(test_trajectory_replayer
+  planner_core
 )
 
 add_executable(test_target_frame_warm_start
@@ -122,7 +135,7 @@ target_include_directories(test_target_frame_warm_start PRIVATE
   config
 )
 target_link_libraries(test_target_frame_warm_start
-  alipddp_library
+  planner_core
 )
 
 # ── Install ───────────────────────────────────────────────────────────────────

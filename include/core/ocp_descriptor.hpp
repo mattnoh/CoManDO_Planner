@@ -7,7 +7,6 @@
 
 #include <Eigen/Dense>
 #include <any>
-#include <array>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -146,16 +145,6 @@ struct OCPDescriptor {
     /// Clamp/sanitize a warm-start control in the OCP's own units.
     /// Used by generic MPC feedback warm-start code before handing controls to create().
     std::function<void(Eigen::VectorXd&)> sanitize_warm_control;
-
-    /// Convert body-rate OCP output to [vx_world, vy_world, z_cmd, yaw_rate] for cmd_hover.
-    /// Called only when platform="crazyflie" and command_mode=CmdBodyRate.
-    /// state:   full OCP state (indices 0-9 are physical — same layout for noimu and imu variants)
-    /// control: [T_ms2, ωx, ωy, ωz, Theta]
-    /// target:  provides position.z (fixed altitude) and velocity (world-frame vx, vy recovery)
-    std::function<std::array<float,4>(
-        const Eigen::VectorXd& state,
-        const Eigen::VectorXd& control,
-        const TargetSnapshot& target)> extract_hover_cmd;
 
     /// Convert raw OCP state → world-frame 13D state for CmdFullState publishing.
     /// nullptr → state is already world-frame (Absolute OCPs: hover, landing, etc.)

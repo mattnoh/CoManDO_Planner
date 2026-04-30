@@ -141,8 +141,8 @@ planner_node ──► StateMonitor  (thread-safe drone + target state)
 | `crazyflie` | `/{name}/pose` + `/{name}/odom` | `/{name}/cmd_full_state` or `/{name}/cmd_hover` | ENU |
 | `mavros` | `/mavros/local_position/odom` | `/mavros/setpoint_raw/attitude` or `/mavros/setpoint_raw/local` | ENU |
 
-**CmdBodyRate dispatch:** The OCP declares `command_mode = CmdBodyRate`. The planner dispatches by platform:
-- **crazyflie** → `extract_hover_cmd` callback converts body-rate output to `[vx, vy, z, yaw_rate]` → `cmd_hover`
+**CmdBodyRate dispatch:** The OCP declares `command_mode = CmdBodyRate`. The planner core command adapter dispatches by platform:
+- **crazyflie** → converts body-rate output to `[vx_body, vy_body, z_world, yaw_rate]` → `cmd_hover`
 - **mavros** → `AttitudeTarget` (body rates + normalized thrust)
 
 ---
@@ -156,5 +156,5 @@ When `enable_logging:=true`, logs go to `./logs/{drone}_{ocp}_{mode}_{solver}_{t
 | `all_solves.csv` | Per-solve metadata + full state/control trajectories |
 | `commanded_state.csv` | Per-command output (CmdFullState only) |
 | `commanded_hover_state.csv` | Per-command `[vx, vy, z, yaw_rate]` (CmdBodyRate + crazyflie) |
-| `commanded_bodyrate_state.csv` | Per-command `[T_ms2, ωx, ωy, ωz]` (CmdBodyRate + mavros/generic) |
+| `commanded_bodyrate_state.csv` | Per-command `[T_ms2, ωx, ωy, ωz]` (CmdBodyRate + mavros) |
 | `actual_state.csv` | Raw sensor measurements |

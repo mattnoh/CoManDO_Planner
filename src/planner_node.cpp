@@ -4,7 +4,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <nav_msgs/msg/path.hpp>
-#include <geometry_msgs/msg/twist_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <Eigen/Dense>
 
 #include "core/quadrotor_mpc.hpp"
@@ -16,6 +16,8 @@
 #include "trajectory_replayer.hpp"
 #include "planner_runtime_config.hpp"
 #include "planner_logging.hpp"
+#include "planner_core/command_adapter.hpp"
+#include "planner_core/frame_adapter.hpp"
 #include "hover_controller.hpp"
 
 #include <chrono>
@@ -124,8 +126,6 @@ public:
 
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
-        bodyrate_cmd_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(
-            "/" + drone_name_ + "/cmd_bodyrate", 10);
 
         if (is_configured_) {
             createModeTimers();
@@ -223,6 +223,17 @@ private:
             default:
                 return "absolute";
         }
+    }
+
+    planner_core::Platform corePlatform() const {
+        if (platform_ == "mavros") {
+            return planner_core::Platform::Mavros;
+        }
+        return planner_core::Platform::Crazyflie;
+    }
+
+    static std::array<float, 4> hoverArray(const Eigen::Vector4d& hover) {
+        return {float(hover(0)), float(hover(1)), float(hover(2)), float(hover(3))};
     }
 
     void applyOcpDroneOdomMode(bool rebuild_subscriptions) {
@@ -477,17 +488,7 @@ private:
     }
 
     const char* currentFrameLabel() const {
-        switch (drone_odom_mode_) {
-            case OCPDescriptor::DroneOdomMode::TargetFrameRelative:
-                return "target_frame_relative";
-            case OCPDescriptor::DroneOdomMode::BodyFrameRelative:
-                return "body_relative";
-            case OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget:
-                return "absolute_shifted";
-            case OCPDescriptor::DroneOdomMode::Absolute:
-            default:
-                return "absolute";
-        }
+        return planner_core::frameLabel(drone_odom_mode_);
     }
 
     Eigen::VectorXd selectSolverInitialState(const Eigen::VectorXd& live_x0,
@@ -705,11 +706,6 @@ private:
                     {0.0f, 0.0f, z_hold, 0.0f});
             } else if (platform_ == "mavros") {
                 // MAVROS keepalive handled by heartbeat_timer in mavros.hpp
-            } else {
-                geometry_msgs::msg::TwistStamped msg;
-                msg.header.stamp   = this->now();
-                msg.twist.linear.z = 9.81;
-                bodyrate_cmd_pub_->publish(msg);
             }
             return;
         }
@@ -987,10 +983,21 @@ private:
 
         Eigen::VectorXd x0 = x0_abs;
         auto desc = OCPRegistry::getDescriptor(ocp_type_);
-        const bool apply_registry_transform = (desc.transform_state != nullptr);
-        if (apply_registry_transform) {
-            x0 = desc.transform_state(x0_abs, target_snapshot);
+        const auto frame_check = planner_core::validateFrameContract(
+            desc, drone_odom_mode_, drone_odom_topic_,
+            body_relative_odom_topic_, target_frame_odom_topic_);
+        if (!frame_check.ok) {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Frame contract rejected solve: ocp=%s expected=%s active=%s topic='%s' reason=%s",
+                ocp_type_.c_str(),
+                planner_core::frameLabel(desc.drone_odom_mode),
+                planner_core::frameLabel(drone_odom_mode_),
+                drone_odom_topic_.c_str(),
+                frame_check.reason.c_str());
+            return;
         }
+        const bool apply_registry_transform = (desc.transform_state != nullptr);
+        x0 = planner_core::prepareOcpState(desc, x0_abs, target_snapshot);
         double handoff_pos_err = 0.0;
         double handoff_vel_err = 0.0;
         const char* x0_source = "live";
@@ -1211,9 +1218,10 @@ private:
                 logger_.logCommandedState(x_cmd, u_cmd, active_solve_num);
             } else {
                 const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
-                if (platform_ == "crazyflie" && desc.extract_hover_cmd) {
-                    const auto cmd = desc.extract_hover_cmd(x_cmd, u_cmd, last_target_snapshot_);
-                    logger_.logCommandedHoverState(cmd, active_solve_num);
+                const auto cmd = planner_core::makePlannerCommand(
+                    corePlatform(), desc, x_cmd, u_cmd, last_target_snapshot_);
+                if (cmd.kind == planner_core::CommandKind::Hover) {
+                    logger_.logCommandedHoverState(hoverArray(cmd.hover), active_solve_num);
                 } else {
                     logger_.logCommandedBodyRateState(u_cmd, active_solve_num);
                 }
@@ -1292,35 +1300,18 @@ private:
     }
 
     void publishCommand(const Eigen::VectorXd& s, const Eigen::VectorXd& u) {
-        if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
-            if (platform_ == "crazyflie") {
-                // CF has no native body-rate interface — extract hover velocity command instead
-                const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
-                if (desc.extract_hover_cmd) {
-                    const auto cmd = desc.extract_hover_cmd(s, u, last_target_snapshot_);
-                    platform::crazyflie::publishHoverCommandDirect(cf_handles_, cmd);
-                }
-            } else if (platform_ == "mavros") {
-                platform::mavros::publishBodyRateCommand(mavros_handles_, u);
-            } else {
-                // Generic fallback for unsupported body-rate publishers.
-                geometry_msgs::msg::TwistStamped msg;
-                msg.header.stamp    = this->now();
-                msg.twist.linear.z  = u.size() > 0 ? u(0) : 0.0;
-                msg.twist.angular.x = u.size() > 1 ? u(1) : 0.0;
-                msg.twist.angular.y = u.size() > 2 ? u(2) : 0.0;
-                msg.twist.angular.z = u.size() > 3 ? u(3) : 0.0;
-                bodyrate_cmd_pub_->publish(msg);
-            }
-        } else if (platform_ == "crazyflie") {
-            const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
-            Eigen::VectorXd s_world = s;
-            if (desc.reconstruct_world_state) {
-                s_world = desc.reconstruct_world_state(s, last_target_snapshot_);
-            }
-            platform::crazyflie::publishCommand(this, cf_handles_, s_world, u, mass_kg_);
-        } else if (platform_ == "mavros") {
-            platform::mavros::publishFullStateCommand(mavros_handles_, s);
+        const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+        const auto cmd = planner_core::makePlannerCommand(
+            corePlatform(), desc, s, u, last_target_snapshot_);
+
+        if (cmd.kind == planner_core::CommandKind::Hover && platform_ == "crazyflie") {
+            platform::crazyflie::publishHoverCommandDirect(cf_handles_, hoverArray(cmd.hover));
+        } else if (cmd.kind == planner_core::CommandKind::BodyRate && platform_ == "mavros") {
+            platform::mavros::publishBodyRateCommand(mavros_handles_, cmd.control);
+        } else if (cmd.kind == planner_core::CommandKind::FullState && platform_ == "crazyflie") {
+            platform::crazyflie::publishCommand(this, cf_handles_, cmd.state, cmd.control, mass_kg_);
+        } else if (cmd.kind == planner_core::CommandKind::FullState && platform_ == "mavros") {
+            platform::mavros::publishFullStateCommand(mavros_handles_, cmd.state);
         }
     }
 
@@ -1551,9 +1542,10 @@ private:
                 logger_.logCommandedState(x_cmd, u_cmd, 0);
             } else {
                 const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
-                if (platform_ == "crazyflie" && desc.extract_hover_cmd) {
-                    const auto cmd = desc.extract_hover_cmd(x_cmd, u_cmd, last_target_snapshot_);
-                    logger_.logCommandedHoverState(cmd, 0);
+                const auto cmd = planner_core::makePlannerCommand(
+                    corePlatform(), desc, x_cmd, u_cmd, last_target_snapshot_);
+                if (cmd.kind == planner_core::CommandKind::Hover) {
+                    logger_.logCommandedHoverState(hoverArray(cmd.hover), 0);
                 } else {
                     logger_.logCommandedBodyRateState(u_cmd, 0);
                 }
@@ -1621,7 +1613,6 @@ private:
     rclcpp::TimerBase::SharedPtr open_loop_hold_timer_;
 
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr bodyrate_cmd_pub_;
 
     TrajectoryReplayer trajectory_replayer_;
 

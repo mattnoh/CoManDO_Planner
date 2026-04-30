@@ -92,7 +92,8 @@ Controls which topic the planner subscribes to for drone state:
 
 | Platform | Input | Output | Frame |
 |----------|-------|--------|-------|
-| Crazyflie | `/{name}/pose`, `/{name}/odom` | `/{name}/cmd_full_state` or `/{name}/cmd_bodyrate` | ENU |
+| Crazyflie | `/{name}/pose`, `/{name}/odom` | `/{name}/cmd_full_state` or `/{name}/cmd_hover` | ENU |
+| MAVROS | `/mavros/local_position/odom` | `/mavros/setpoint_raw/local` or `/mavros/setpoint_raw/attitude` | ENU/NED adapter boundary |
 
 Crazyflie angular velocity from crazyswarm2 arrives in deg/s and is converted to rad/s internally.
 

@@ -135,7 +135,7 @@ public:
                 << "timestamp,solve_num,vx,vy,z_distance,yaw_rate\n";
         }
 
-        // ── commanded_bodyrate_state.csv (CmdBodyRate + platform=mavros/generic) ─
+        // ── commanded_bodyrate_state.csv (CmdBodyRate + platform=mavros) ─
         commanded_bodyrate_log_.open(folder + "/commanded_bodyrate_state.csv");
         if (commanded_bodyrate_log_.is_open()) {
             commanded_bodyrate_log_
@@ -296,7 +296,7 @@ public:
         commanded_hover_log_.flush();
     }
 
-    /// Log body-rate command [T_ms2, ωx, ωy, ωz] (CmdBodyRate + platform=mavros or generic).
+    /// Log body-rate command [T_ms2, ωx, ωy, ωz] (CmdBodyRate + platform=mavros).
     void logCommandedBodyRateState(const Eigen::VectorXd& u, int solve_num) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!initialized_ || !commanded_bodyrate_log_.is_open()) return;

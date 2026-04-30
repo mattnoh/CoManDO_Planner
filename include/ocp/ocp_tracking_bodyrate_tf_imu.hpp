@@ -366,21 +366,6 @@ inline OCPDescriptor descriptor() {
     };
     // Carry augmented states forward from solver-propagated trajectory
     // Removed merge_prev_augmented: sensor values are authoritative for x0.
-    // Crazyswarm2 cmd_hover takes horizontal velocity in the hover/body command frame and
-    // z_distance as an absolute world-height setpoint.
-    d.extract_hover_cmd = [](const Eigen::VectorXd& state,
-                              const Eigen::VectorXd& control,
-                              const TargetSnapshot& target) -> std::array<float,4> {
-        const Eigen::Vector4d q_NB = state.segment(IDX_Q, 4);
-        const Eigen::Matrix3d R_NB = Quad6DOFVarTime<double>::calcC(q_NB);
-        const Eigen::Vector3d v_B = R_NB.transpose() * state.segment(IDX_V, 3);
-        const double z_world = target.position.z() + state(IDX_P + 2);
-        const double z_cmd = std::clamp(z_world, 0.1, 3.0);
-        return {float(std::clamp(v_B.x(), -1.0, 1.0)),
-                float(std::clamp(v_B.y(), -1.0, 1.0)),
-                float(z_cmd),
-                float(control.size() > 3 ? control(3) : 0.0)};
-    };
     d.getSolverParams = getSolverParams;
     d.create = [](const OCPCreateArgs& a) {
         return create(a.current_state, a.prev_U, a.prev_X, a.prev_K);
