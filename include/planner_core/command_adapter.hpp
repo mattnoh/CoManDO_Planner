@@ -40,8 +40,8 @@ inline Eigen::Vector4d makeCrazyflieHoverCommand(const OCPDescriptor& desc,
         const Eigen::Vector4d q_NB = state.segment(6, 4);
         const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(target.orientation);
         const Eigen::Matrix3d R_WB = R_WN * Quad6DOFVarTime<double>::calcC(q_NB);
-        const double drone_above_target = -(R_WB * state.segment(0, 3))(2);
-        z_world = target.position.z() - drone_above_target;
+        const Eigen::Vector3d p_target_from_drone_world = R_WB * state.segment(0, 3);
+        z_world = target.position.z() - p_target_from_drone_world.z();
     } else {
         vx_body = state(3);
         vy_body = state(4);
