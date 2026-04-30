@@ -367,7 +367,7 @@ private:
         return k * ocp_dt;
     }
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::vector<Eigen::VectorXd> state_trajectory_;
     std::vector<Eigen::VectorXd> control_trajectory_;
     int active_solve_num_ = -1;
