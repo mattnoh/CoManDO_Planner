@@ -366,14 +366,19 @@ inline OCPDescriptor descriptor() {
     };
     // Carry augmented states forward from solver-propagated trajectory
     // Removed merge_prev_augmented: sensor values are authoritative for x0.
-    // v_B^N (drone vel in target frame N) → world frame via R_WN = calcC(target.orientation)
+    // Crazyswarm2 cmd_hover takes horizontal velocity in the hover/body command frame and
+    // z_distance as an absolute world-height setpoint.
     d.extract_hover_cmd = [](const Eigen::VectorXd& state,
                               const Eigen::VectorXd& control,
                               const TargetSnapshot& target) -> std::array<float,4> {
-        const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(target.orientation);
-        const Eigen::Vector3d v_W  = R_WN * state.segment(IDX_V, 3) + target.velocity;
-        const double z_cmd = target.position.z() + state(IDX_P + 2);
-        return {float(v_W.x()), float(v_W.y()), float(z_cmd),
+        const Eigen::Vector4d q_NB = state.segment(IDX_Q, 4);
+        const Eigen::Matrix3d R_NB = Quad6DOFVarTime<double>::calcC(q_NB);
+        const Eigen::Vector3d v_B = R_NB.transpose() * state.segment(IDX_V, 3);
+        const double z_world = target.position.z() + state(IDX_P + 2);
+        const double z_cmd = std::clamp(z_world, 0.1, 3.0);
+        return {float(std::clamp(v_B.x(), -1.0, 1.0)),
+                float(std::clamp(v_B.y(), -1.0, 1.0)),
+                float(z_cmd),
                 float(control.size() > 3 ? control(3) : 0.0)};
     };
     d.getSolverParams = getSolverParams;

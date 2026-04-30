@@ -160,8 +160,15 @@ STREAM_COLS = STATE_COLS + CONTROL_COLS + ["theta"] + TARGET_COLS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _FIXED_PREFIX = {"solve_num", "solve_time_ms", "solve_iters", "coord_mode", "node", "t", "theta"}
-_FIXED_SUFFIX = {"tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz"}
-_CONTROL_STARTERS = {"fz", "T", "thrust", "mx", "omx"}
+_FIXED_SUFFIX = {
+    "tgt_x", "tgt_y", "tgt_z", "tgt_vx", "tgt_vy", "tgt_vz",
+    "tgt_ax", "tgt_ay", "tgt_az",
+    "tgt_qw", "tgt_qx", "tgt_qy", "tgt_qz",
+    "tgt_wx", "tgt_wy", "tgt_wz",
+    "tgt_alfx", "tgt_alfy", "tgt_alfz",
+    "p_T_norm", "cone_viol",
+}
+_CONTROL_STARTERS = {"fz", "fz_B", "T", "thrust", "mx", "Mx", "omx"}
 
 
 def detect_schema(solves_df):
@@ -206,7 +213,10 @@ def group_state_cols(state_cols):
 
     Returns list of (group_label, col_list, units) tuples.
     """
-    _POS  = {"px","py","pz","x","y","z","p0","p1","p2"}
+    _POS  = {
+        "px","py","pz","x","y","z","p0","p1","p2",
+        "drone_x","drone_y","drone_z",
+    }
     _VEL  = {"vx","vy","vz","vdx","vdy","vdz","v0","v1","v2"}
     _QUAT = {"qw","qx","qy","qz"}
     _ANGV = {"wx","wy","wz"}
@@ -237,7 +247,14 @@ def _fc(df, *candidates):
 
 def _normalise_solves(df):
     """Rename columns from newer logging schema to the names the rest of the script expects."""
-    renames = {"solve_id": "solve_num", "solve_ms": "solve_time_ms", "t_acc": "t"}
+    renames = {
+        "solve_id": "solve_num",
+        "solve_ms": "solve_time_ms",
+        "t_acc": "t",
+        "drone_x": "x",
+        "drone_y": "y",
+        "drone_z": "z",
+    }
     df = df.rename(columns={k: v for k, v in renames.items() if k in df.columns})
     if "solve_iters" not in df.columns:
         df["solve_iters"] = 0
