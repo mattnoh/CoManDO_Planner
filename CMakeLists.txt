@@ -118,13 +118,33 @@ target_link_libraries(test_poly_ocp
   alipddp_library
 )
 
+add_executable(test_trajectory_replayer
+  test/test_trajectory_replayer.cpp
+)
+target_include_directories(test_trajectory_replayer PRIVATE
+  ${EIGEN3_INCLUDE_DIR}
+  include
+)
 
+add_executable(test_target_frame_warm_start
+  test/test_target_frame_warm_start.cpp
+)
+target_include_directories(test_target_frame_warm_start PRIVATE
+  ${EIGEN3_INCLUDE_DIR}
+  include
+  config
+)
+target_link_libraries(test_target_frame_warm_start
+  alipddp_library
+)
 
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner
     target_publisher
     test_poly_ocp
+    test_trajectory_replayer
+    test_target_frame_warm_start
   DESTINATION lib/${PROJECT_NAME}
 )
 
