@@ -211,11 +211,23 @@ inline Param getSolverParams() {
     return p;
 }
 
+inline void sanitizeControl(Eigen::VectorXd& u) {
+    if (u.size() > 0) {
+        u(0) = std::clamp(u(0), FMIN, FMAX);
+    }
+    for (int i = 1; i <= 3 && i < u.size(); ++i) {
+        u(i) = std::clamp(u(i), -OMEGA_MAX, OMEGA_MAX);
+    }
+    if (u.size() > IDX_THETA) {
+        u(IDX_THETA) = std::clamp(u(IDX_THETA), THL, THH);
+    }
+}
+
 inline std::shared_ptr<OptimalControlProblem<double>> create(
     const Eigen::VectorXd& x0,
     const std::vector<Eigen::VectorXd>& prev_U = {},
-    const std::vector<Eigen::VectorXd>& /*prev_X*/ = {},
-    const std::vector<Eigen::MatrixXd>& /*prev_K*/ = {},
+    const std::vector<Eigen::VectorXd>& prev_X = {},
+    const std::vector<Eigen::MatrixXd>& prev_K = {},
     double th_init = TH_INIT)
 {
     auto problem = std::make_shared<OptimalControlProblem<double>>(HORIZON);
@@ -260,12 +272,22 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     u_hover(IDX_THETA) = th_init;
 
     Eigen::VectorXd xsim = x0ss;
+    const bool use_feedback =
+        static_cast<int>(prev_U.size()) >= HORIZON &&
+        static_cast<int>(prev_X.size()) >= HORIZON &&
+        static_cast<int>(prev_K.size()) >= HORIZON;
     for (int k = 0; k < HORIZON; ++k) {
         Eigen::VectorXd u0 = (has_prev_u && static_cast<int>(prev_U[k].size()) == NU_SS)
                              ? prev_U[k] : u_hover;
-        u0(0) = std::clamp(u0(0), FMIN, FMAX);
-        for (int i = 1; i <= 3; ++i) u0(i) = std::clamp(u0(i), -OMEGA_MAX, OMEGA_MAX);
-        u0(IDX_THETA) = std::clamp(u0(IDX_THETA), THL, THH);
+        if (use_feedback &&
+            static_cast<int>(prev_X[k].size()) == NX_SS &&
+            prev_K[k].rows() == NU_SS &&
+            prev_K[k].cols() == NX_SS &&
+            u0.size() == NU_SS) {
+            const Eigen::VectorXd delta = xsim - prev_X[k];
+            u0 = u0 + prev_K[k] * delta;
+        }
+        sanitizeControl(u0);
         problem->setInitialControl(k, u0);
         xsim = dyn->f(xsim, u0);
         problem->setInitialState(k + 1, xsim);
@@ -280,12 +302,13 @@ inline OCPDescriptor descriptor() {
     d.dt = TH_INIT;
     d.default_n_replay = DEFAULT_N_REPLAY;
     d.default_mass_kg = DEFAULT_MASS_KG;
-    d.warm_start = OCPDescriptor::WarmStart::Shift;
+    d.warm_start = OCPDescriptor::WarmStart::Feedback;
     d.command_mode = OCPDescriptor::CommandMode::CmdBodyRate;
     d.drone_odom_mode = OCPDescriptor::DroneOdomMode::TargetFrameRelative;
     d.skip_altitude_validation = true;
     d.skip_trajectory_validation = true;
     d.variable_dt = true;
+    d.sanitize_warm_control = sanitizeControl;
     d.state_dim = NX;
     d.control_dim = NU;
 
