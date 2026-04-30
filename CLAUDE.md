@@ -11,7 +11,7 @@ cd ~/ros_ws
 colcon build --symlink-install --packages-select comando_planner
 ```
 
-ALIPDDP is compiled as a static library from the sibling directory `../ALIPDDP-main` via `add_subdirectory()`. Optional features (`px4_msgs`, `mocap4r2_msgs`) are detected at build time and guarded by `HAS_PX4_MSGS` / `HAS_MOCAP4R2_MSGS` defines.
+ALIPDDP is compiled as a static library from the sibling directory `../ALIPDDP-main` via `add_subdirectory()`. Optional Qualisys support (`mocap4r2_msgs`) is detected at build time and guarded by `HAS_MOCAP4R2_MSGS`.
 
 ### Standalone validation test (no ROS required)
 
@@ -93,7 +93,6 @@ Controls which topic the planner subscribes to for drone state:
 | Platform | Input | Output | Frame |
 |----------|-------|--------|-------|
 | Crazyflie | `/{name}/pose`, `/{name}/odom` | `/{name}/cmd_full_state` or `/{name}/cmd_bodyrate` | ENU |
-| PX4 (optional) | `/fmu/out/vehicle_odometry` | `/fmu/in/trajectory_setpoint` | NED (auto-converted) |
 
 Crazyflie angular velocity from crazyswarm2 arrives in deg/s and is converted to rad/s internally.
 

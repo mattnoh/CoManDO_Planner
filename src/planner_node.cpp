@@ -10,7 +10,6 @@
 #include "core/quadrotor_mpc.hpp"
 #include "core/ocp_registry.hpp"
 #include "platform/crazyflie.hpp"
-#include "platform/px4.hpp"
 #include "platform/mavros.hpp"
 #include "platform/target_tracker.hpp"
 #include "core/state_monitor.hpp"
@@ -48,7 +47,7 @@ public:
         n_replay_ = runtime_cfg.n_replay;
         mass_kg_ = runtime_cfg.mass_kg;
         // hover_thrust: normalized [0,1] throttle at hover — used by MAVROS platform.
-        // Read from PX4 MPC_THR_HOVER after a calibration flight:
+        // Read from the flight stack hover-thrust estimate after calibration:
         //   ros2 service call /mavros/param/get mavros_msgs/srv/ParamGet "{param_id: MPC_THR_HOVER}"
         this->declare_parameter("hover_thrust", 0.3);
         hover_thrust_param_ = float(this->get_parameter("hover_thrust").as_double());
@@ -106,10 +105,6 @@ public:
             platform::crazyflie::setup(
                 this, sensor_cb_group_, drone_name_, drone_odom_topic_,
                 state_monitor_.crazyflieState(), state_monitor_.stateMutex(), cf_handles_);
-        } else if (platform_ == "px4") {
-            platform::px4::setup(
-                this, sensor_cb_group_,
-                state_monitor_.px4State(), state_monitor_.stateMutex(), px4_handles_);
         } else if (platform_ == "mavros") {
             platform::mavros::setup(
                 this, sensor_cb_group_, hover_thrust_param_,
@@ -302,6 +297,9 @@ private:
     }
 
     bool hasState() const {
+        if (platform_ == "mavros") {
+            return mavros_handles_.odom_received;
+        }
         return state_monitor_.hasState(platform_);
     }
 
@@ -452,6 +450,10 @@ private:
     }
 
     Eigen::VectorXd getCurrentState() const {
+        if (platform_ == "mavros") {
+            std::lock_guard<std::mutex> lk(state_monitor_.stateMutex());
+            return mavros_handles_.current;
+        }
         return state_monitor_.getCurrentState(platform_);
     }
 
@@ -685,8 +687,6 @@ private:
     void publishCommandAbsolute(const Eigen::VectorXd& s_world, const Eigen::VectorXd& u) {
         if (platform_ == "crazyflie") {
             platform::crazyflie::publishCommand(this, cf_handles_, s_world, u, mass_kg_);
-        } else if (platform_ == "px4") {
-            platform::px4::publishCommand(this, px4_handles_, s_world);
         } else if (platform_ == "mavros") {
             platform::mavros::publishFullStateCommand(mavros_handles_, s_world);
         }
@@ -955,13 +955,11 @@ private:
         if (!hasState()) {
             const auto dbg = state_monitor_.getStateDebugSnapshot(platform_);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "Waiting for state... platform=%s has_state=%s cf_pose=%s cf_odom=%s px4_pose=%s px4_odom=%s relative_mode=%s odom_topic='%s'",
+                "Waiting for state... platform=%s has_state=%s pose=%s odom=%s relative_mode=%s odom_topic='%s'",
                 platform_.c_str(),
                 dbg.has_state ? "true" : "false",
                 dbg.cf_pose_received ? "true" : "false",
                 dbg.cf_odom_received ? "true" : "false",
-                dbg.px4_pose_received ? "true" : "false",
-                dbg.px4_odom_received ? "true" : "false",
                 drone_state_is_relative_ ? "true" : "false",
                 drone_odom_topic_.c_str());
             return;
@@ -1032,9 +1030,7 @@ private:
             is_flying_ = true;
             RCLCPP_INFO(this->get_logger(),
                 "State received - starting RH MPC (%s)", solver_type_.c_str());
-            if (platform_ == "px4") {
-                platform::px4::arm(this, px4_handles_);
-            } else if (platform_ == "mavros") {
+            if (platform_ == "mavros") {
                 platform::mavros::markArmed(mavros_handles_);
             }
             if (logging_enabled_ && !logging_initialized_) {
@@ -1307,7 +1303,7 @@ private:
             } else if (platform_ == "mavros") {
                 platform::mavros::publishBodyRateCommand(mavros_handles_, u);
             } else {
-                // Generic fallback (px4 / unknown) — TwistStamped on /drone/cmd_bodyrate
+                // Generic fallback for unsupported body-rate publishers.
                 geometry_msgs::msg::TwistStamped msg;
                 msg.header.stamp    = this->now();
                 msg.twist.linear.z  = u.size() > 0 ? u(0) : 0.0;
@@ -1323,8 +1319,6 @@ private:
                 s_world = desc.reconstruct_world_state(s, last_target_snapshot_);
             }
             platform::crazyflie::publishCommand(this, cf_handles_, s_world, u, mass_kg_);
-        } else if (platform_ == "px4") {
-            platform::px4::publishCommand(this, px4_handles_, s);
         } else if (platform_ == "mavros") {
             platform::mavros::publishFullStateCommand(mavros_handles_, s);
         }
@@ -1362,13 +1356,11 @@ private:
         if (!hasState()) {
             const auto dbg = state_monitor_.getStateDebugSnapshot(platform_);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "[OpenLoop] Waiting for state... platform=%s has_state=%s cf_pose=%s cf_odom=%s px4_pose=%s px4_odom=%s relative_mode=%s odom_topic='%s'",
+                "[OpenLoop] Waiting for state... platform=%s has_state=%s pose=%s odom=%s relative_mode=%s odom_topic='%s'",
                 platform_.c_str(),
                 dbg.has_state ? "true" : "false",
                 dbg.cf_pose_received ? "true" : "false",
                 dbg.cf_odom_received ? "true" : "false",
-                dbg.px4_pose_received ? "true" : "false",
-                dbg.px4_odom_received ? "true" : "false",
                 drone_state_is_relative_ ? "true" : "false",
                 drone_odom_topic_.c_str());
             return;
@@ -1616,7 +1608,6 @@ private:
     std::unique_ptr<QuadrotorMPC> alipddp_mpc_;
 
     platform::crazyflie::Handles cf_handles_;
-    platform::px4::Handles px4_handles_;
     platform::mavros::Handles mavros_handles_;
     platform::target_tracker::Handles target_handles_;
 

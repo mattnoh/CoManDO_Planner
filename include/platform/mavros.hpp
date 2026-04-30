@@ -1,5 +1,5 @@
 /// @file mavros.hpp
-/// @brief MAVROS platform adapter for PX4 via MAVROS2 bridge.
+/// @brief MAVROS platform adapter.
 ///
 /// State input:  /mavros/local_position/odom (nav_msgs/Odometry) → 13D ENU
 /// CmdBodyRate:  /mavros/setpoint_raw/attitude (mavros_msgs/AttitudeTarget)

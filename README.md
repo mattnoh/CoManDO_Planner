@@ -11,7 +11,7 @@
 | Ubuntu 22.04 + ROS2 Humble | Base requirement |
 | ALIPDDP | Clone as sibling directory: `../ALIPDDP-main` |
 | **CrazySim** + **Crazyswarm2** | For Crazyflie SITL workflow |
-| **PX4-Autopilot** + **MAVROS2** | For PX4 SITL + MAVROS workflow |
+| **MAVROS2** | For MAVROS workflow |
 
 ### Build
 
@@ -87,31 +87,18 @@ ros2 launch comando_planner ocp_launch.py \
 
 ---
 
-## PX4 SITL + MAVROS Workflow
+## MAVROS Workflow
 
 ```bash
-# Terminal A — PX4 SITL + Gazebo
-cd ~/PX4-Autopilot
-make px4_sitl gazebo-classic_iris
+# Terminal A — MAVROS bridge for your vehicle/simulator
+ros2 launch mavros <your_vehicle_bridge>.launch.py
 
-# Terminal B — MAVROS2 bridge
-ros2 launch mavros px4.launch.py \
-    fcu_url:="udp://:14540@127.0.0.1:14557" \
-    gcs_url:="udp://:14550@127.0.0.1:14551"
-
-# Terminal C — Read PX4's calibrated hover thrust (once, after first flight)
-ros2 service call /mavros/param/get mavros_msgs/srv/ParamGet \
-    "{param_id: MPC_THR_HOVER}"
-# Note the returned value (e.g. 0.35) — pass it as hover_thrust below.
-# PX4 learns this from flight history; setting it correctly is critical
-# for accurate thrust normalization (T_ms2 → [0,1] throttle).
-
-# Terminal D — CoManDO planner
+# Terminal B — CoManDO planner
 ros2 launch comando_planner planner_launch.py \
     drone_name:=drone platform:=mavros \
     hover_thrust:=0.35
 
-# Terminal E — Target publisher + OCP (same commands as CrazySim section)
+# Terminal C — Target publisher + OCP (same commands as CrazySim section)
 ```
 
 **Pre-arm sequence (automatic):** When `platform:=mavros`, the planner publishes 2 s of neutral setpoints before switching to OFFBOARD mode and sending the ARM command. No manual steps needed after Terminal D starts.
@@ -152,13 +139,11 @@ planner_node ──► StateMonitor  (thread-safe drone + target state)
 | Platform | Input topic | Output topic | Frame |
 |----------|-------------|--------------|-------|
 | `crazyflie` | `/{name}/pose` + `/{name}/odom` | `/{name}/cmd_full_state` or `/{name}/cmd_hover` | ENU |
-| `px4` | `/fmu/out/vehicle_odometry` | `/fmu/in/trajectory_setpoint` | NED (auto-converted) |
 | `mavros` | `/mavros/local_position/odom` | `/mavros/setpoint_raw/attitude` or `/mavros/setpoint_raw/local` | ENU |
 
 **CmdBodyRate dispatch:** The OCP declares `command_mode = CmdBodyRate`. The planner dispatches by platform:
 - **crazyflie** → `extract_hover_cmd` callback converts body-rate output to `[vx, vy, z, yaw_rate]` → `cmd_hover`
 - **mavros** → `AttitudeTarget` (body rates + normalized thrust)
-- **generic** → `TwistStamped` fallback
 
 ---
 

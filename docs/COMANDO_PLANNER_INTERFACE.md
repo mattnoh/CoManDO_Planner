@@ -16,7 +16,7 @@ The planner is decoupled from specific OCP physics via the `OCPRegistry`. This a
 │                          comando_planner                                │
 │                                                                         │
 │  StateMonitor (thread-safe state ownership)                             │
-│  ├─ cf_state_ / px4_state_ ◄── /{drone}/pose, /{drone}/odom            │
+│  ├─ cf_state_ ◄── /{drone}/pose, /{drone}/odom or MAVROS odometry      │
 │  └─ target_state_ ◄── /target/odom, /target/accel (optional), /target/predicted_accel │
 │                                                                         │
 │  OCP Registry                                                           │
@@ -49,7 +49,7 @@ Defined in `launch/planner_launch.py`. These connect the planner to the hardware
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `drone_name` | string | `"cf_1"` | Drone namespace |
-| `platform` | string | `"crazyflie"` | Platform: `"crazyflie"` or `"px4"` |
+| `platform` | string | `"crazyflie"` | Platform: `"crazyflie"` or `"mavros"` |
 | `solver` | string | `"alipddp"` | Solver backend |
 | `enable_logging` | bool | `true` | Enable CSV logging to `./logs/` |
 | `target_odom_topic`| string | `"/target/odom"` | External target tracking topic |

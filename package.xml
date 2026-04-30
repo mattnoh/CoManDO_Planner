@@ -3,7 +3,7 @@
 <package format="3">
   <name>comando_planner</name>
   <version>0.1.0</version>
-  <description>CoManDO MPC planner — ALIPDDP solver, Crazyflie and PX4 platforms</description>
+  <description>CoManDO MPC planner — ALIPDDP solver, Crazyflie and MAVROS platforms</description>
   <maintainer email="your_email@example.com">Your Name</maintainer>
   <license>MIT</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -18,8 +18,6 @@
   <depend>crazyflie_interfaces</depend>
   <!-- mocap4ros2 rigid body messages (optional at build time; needed for qualisys mode) -->
   <exec_depend>mocap4r2_msgs</exec_depend>
-  <!-- PX4 interface messages (optional — build proceeds without it) -->
-  <exec_depend>px4_msgs</exec_depend>
   <!-- MAVROS interface messages (optional — build proceeds without it) -->
   <exec_depend>mavros_msgs</exec_depend>
   <!-- Eigen for linear algebra -->

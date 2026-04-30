@@ -11,7 +11,6 @@
 #include <utility>
 
 #include "platform/crazyflie.hpp"
-#include "platform/px4.hpp"
 #include "platform/target_tracker.hpp"
 #include "core/ocp_registry.hpp"
 
@@ -21,8 +20,6 @@ public:
         bool has_state = false;
         bool cf_pose_received = false;
         bool cf_odom_received = false;
-        bool px4_pose_received = false;
-        bool px4_odom_received = false;
     };
 
     explicit StateMonitor(double target_state_max_age_sec = 0.2)
@@ -32,17 +29,17 @@ public:
     }
 
     platform::crazyflie::State& crazyflieState() { return cf_state_; }
-    platform::px4::State& px4State() { return px4_state_; }
     platform::target_tracker::TargetState& targetState() { return target_state_; }
     std::mutex& stateMutex() { return state_mutex_; }
+    std::mutex& stateMutex() const { return state_mutex_; }
     std::mutex& targetMutex() { return target_mutex_; }
 
     bool hasState(const std::string& platform) const {
         if (platform == "crazyflie") {
             return cf_state_.hasFullState();
         }
-        if (platform == "px4") {
-            return px4_state_.hasFullState();
+        if (platform == "mavros") {
+            return cf_state_.hasFullState();
         }
         return false;
     }
@@ -52,13 +49,9 @@ public:
         StateDebugSnapshot snap;
         snap.cf_pose_received = cf_state_.pose_received;
         snap.cf_odom_received = cf_state_.odom_received;
-        snap.px4_pose_received = px4_state_.hasFullState();
-        snap.px4_odom_received = px4_state_.hasFullState();
 
-        if (platform == "crazyflie") {
+        if (platform == "crazyflie" || platform == "mavros") {
             snap.has_state = cf_state_.hasFullState();
-        } else if (platform == "px4") {
-            snap.has_state = px4_state_.hasFullState();
         }
         return snap;
     }
@@ -113,15 +106,14 @@ public:
         if (platform == "crazyflie") {
             return cf_state_.current;
         }
-        if (platform == "px4") {
-            return px4_state_.current;
+        if (platform == "mavros") {
+            return cf_state_.current;
         }
         return fallback_state_;
     }
 
 private:
     platform::crazyflie::State cf_state_;
-    platform::px4::State px4_state_;
     platform::target_tracker::TargetState target_state_;
 
     mutable std::mutex state_mutex_;
