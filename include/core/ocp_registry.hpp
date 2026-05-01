@@ -19,7 +19,6 @@
 // core types re-exported so existing code using ocp_registry.hpp doesn't need updating
 #include "core/ocp_descriptor.hpp"
 #include "core/target_snapshot.hpp"
-#include "planner_logging.hpp"
 
 #include <map>
 #include <stdexcept>

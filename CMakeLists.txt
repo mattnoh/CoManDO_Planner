@@ -138,6 +138,19 @@ target_link_libraries(test_target_frame_warm_start
   planner_core
 )
 
+add_executable(test_planner_core
+  test/test_planner_core.cpp
+  ${SHARED_SOURCES}
+)
+target_include_directories(test_planner_core PRIVATE
+  ${EIGEN3_INCLUDE_DIR}
+  include
+  config
+)
+target_link_libraries(test_planner_core
+  planner_core
+)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner
@@ -145,6 +158,7 @@ install(TARGETS
     test_poly_ocp
     test_trajectory_replayer
     test_target_frame_warm_start
+    test_planner_core
   DESTINATION lib/${PROJECT_NAME}
 )
 
