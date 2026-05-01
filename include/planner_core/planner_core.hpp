@@ -12,9 +12,9 @@
 #include <string>
 #include <vector>
 
-#include "core/ocp_registry.hpp"
-#include "core/planner_config.hpp"
-#include "core/quadrotor_mpc.hpp"
+#include "planner_core/ocp_registry.hpp"
+#include "planner_core/planner_config.hpp"
+#include "planner_core/quadrotor_mpc.hpp"
 #include "dynamics/quad_6dof_target_frame.h"
 #include "ocp/ocp_tracking_circle_target.hpp"
 #include "planner_core/command_adapter.hpp"

@@ -5,7 +5,7 @@
 
 #include <string>
 
-#include "core/ocp_registry.hpp"
+#include "planner_core/ocp_registry.hpp"
 
 #include "planner_runtime_config_types.hpp"
 

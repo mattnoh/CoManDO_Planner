@@ -2,7 +2,7 @@
 #include <vector>
 #include <string>
 #include <Eigen/Dense>
-#include "core/target_snapshot.hpp"
+#include "planner_core/target_snapshot.hpp"
 
 namespace OCPLoggerDefaults {
 

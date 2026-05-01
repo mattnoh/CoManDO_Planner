@@ -6,7 +6,7 @@
 #include <cmath>
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
-#include "core/ocp_descriptor.hpp"
+#include "planner_core/ocp_descriptor.hpp"
 
 namespace HoverOCP {
 

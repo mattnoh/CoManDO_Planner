@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-#include "core/ocp_descriptor.hpp"
-#include "core/target_snapshot.hpp"
+#include "planner_core/ocp_descriptor.hpp"
+#include "planner_core/target_snapshot.hpp"
 #include "target/target_accel_buffer.hpp"
 
 namespace planner_core {

@@ -9,7 +9,7 @@
 
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
-#include "core/ocp_registry.hpp"
+#include "planner_core/ocp_registry.hpp"
 
 class QuadrotorMPC {
 public:

@@ -13,9 +13,9 @@
 #include <string>
 #include <vector>
 
-#include "core/target_snapshot.hpp"
-#include "core/planner_config.hpp"
-#include "core/ocp_logger_defaults.hpp"
+#include "planner_core/target_snapshot.hpp"
+#include "planner_core/planner_config.hpp"
+#include "planner_core/ocp_logger_defaults.hpp"
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
 

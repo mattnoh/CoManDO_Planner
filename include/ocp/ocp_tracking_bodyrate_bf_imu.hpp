@@ -17,7 +17,7 @@
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
 #include "dynamics/quad_6dof_body_frame.h"
-#include "core/ocp_descriptor.hpp"
+#include "planner_core/ocp_descriptor.hpp"
 
 #include <Eigen/Dense>
 #include <algorithm>

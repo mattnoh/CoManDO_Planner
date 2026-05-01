@@ -6,7 +6,7 @@
 
 #include <algorithm>
 
-#include "core/ocp_descriptor.hpp"
+#include "planner_core/ocp_descriptor.hpp"
 #include "dynamics/quad_6dof_target_frame.h"
 #include "planner_core/types.hpp"
 

@@ -6,7 +6,7 @@
 
 #include <string>
 
-#include "core/ocp_descriptor.hpp"
+#include "planner_core/ocp_descriptor.hpp"
 
 namespace planner_core {
 

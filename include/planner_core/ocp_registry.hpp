@@ -17,8 +17,8 @@
 #include "ocp/ocp_tracking_bodyrate_bf_noimu.hpp"
 
 // core types re-exported so existing code using ocp_registry.hpp doesn't need updating
-#include "core/ocp_descriptor.hpp"
-#include "core/target_snapshot.hpp"
+#include "planner_core/ocp_descriptor.hpp"
+#include "planner_core/target_snapshot.hpp"
 
 #include <map>
 #include <stdexcept>

@@ -8,12 +8,12 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <Eigen/Dense>
 
-#include "core/quadrotor_mpc.hpp"
-#include "core/ocp_registry.hpp"
+#include "planner_core/quadrotor_mpc.hpp"
+#include "planner_core/ocp_registry.hpp"
 #include "platform/crazyflie.hpp"
 #include "platform/mavros.hpp"
 #include "platform/target_tracker.hpp"
-#include "core/state_monitor.hpp"
+#include "platform/state_monitor.hpp"
 #include "trajectory_replayer.hpp"
 #include "planner_runtime_config.hpp"
 #include "planner_logging.hpp"
