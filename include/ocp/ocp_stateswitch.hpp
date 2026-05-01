@@ -7,8 +7,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
-#include "target/target_accel_buffer.hpp"
-#include "target/circular_target.hpp"
+#include <utility>
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
 #include "planner_core/ocp_descriptor.hpp"
@@ -78,57 +77,79 @@ inline Param getSolverParams() {
  return p;
 }
 
-struct StateswitchExtra {
- target_models::TargetAccelBuffer buf;
- double t0_abs = 0.0;
+struct TargetPredictor {
+ Eigen::Vector3d position = Eigen::Vector3d::Zero();
+ Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+ Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
+ Eigen::Vector3d jerk = Eigen::Vector3d::Zero();
+ Eigen::Vector3d snap = Eigen::Vector3d::Zero();
+
+ Eigen::Vector3d predictPos(double dt) const {
+  const double dt2 = dt * dt;
+  const double dt3 = dt2 * dt;
+  const double dt4 = dt3 * dt;
+  return position + velocity * dt + 0.5 * acceleration * dt2
+         + (1.0 / 6.0) * jerk * dt3 + (1.0 / 24.0) * snap * dt4;
+ }
+
+ Eigen::Vector3d predictVel(double dt) const {
+  const double dt2 = dt * dt;
+  const double dt3 = dt2 * dt;
+  return velocity + acceleration * dt + 0.5 * jerk * dt2
+         + (1.0 / 6.0) * snap * dt3;
+ }
+
+ Eigen::Vector3d predictAccel(double dt) const {
+  const double dt2 = dt * dt;
+  return acceleration + jerk * dt + 0.5 * snap * dt2;
+ }
 };
 
-// ── Quad6DOFVarTimeRelativeTV wrapper ───────────────────────────────────────
+struct StateswitchExtra {
+ std::shared_ptr<TargetPredictor> predictor;
+};
+
+// ── Quad6DOFVarTimeRelativePred wrapper ─────────────────────────────────────
 // Time-varying target acceleration variant. Inherits from
-// Quad6DOFVarTimeRelative and overrides f() to sample the accel buffer at the
-// 4 Runge–Kutta sub-steps. Jacobians use the midpoint accel as a frozen
+// Quad6DOFVarTimeRelative and overrides f() to sample the OCP-owned predictor
+// at the 4 Runge–Kutta sub-steps. Jacobians use the midpoint accel as a frozen
 // linearisation point ("frozen Jacobian" MPC pattern).
 //
 // propagate() (13-dim) is intentionally disabled; warm-start rollouts should
 // use propagate14() so that IDX_DT tracks accumulated time within this solve.
 template<typename Scalar>
-class Quad6DOFVarTimeRelativeTV : public Quad6DOFVarTimeRelative<Scalar> {
- target_models::TargetAccelBuffer buf_;
- double t0_abs_;
+class Quad6DOFVarTimeRelativePred : public Quad6DOFVarTimeRelative<Scalar> {
+ std::shared_ptr<TargetPredictor> predictor_;
 
 public:
- explicit Quad6DOFVarTimeRelativeTV(const target_models::TargetAccelBuffer& buf,
-																		double t0_abs)
+ explicit Quad6DOFVarTimeRelativePred(std::shared_ptr<TargetPredictor> predictor)
 	: Quad6DOFVarTimeRelative<Scalar>()
-	, buf_(buf)
-	, t0_abs_(t0_abs) {}
-
- void updateBuffer(const target_models::TargetAccelBuffer& buf) { buf_ = buf; }
+	, predictor_(std::move(predictor)) {}
 
  Vector<Scalar> f(const Vector<Scalar>& x,
 									const Vector<Scalar>& u) const override {
 	auto xd = x.segment(0, this->NX_PHYS).template cast<double>();
 	auto ud = u.segment(0, this->NU_PHYS).template cast<double>();
 	double Th   = static_cast<double>(u(IDX_THETA));
-	double tabs = static_cast<double>(x(IDX_DT)) + t0_abs_;
+	double tabs = static_cast<double>(x(IDX_DT));
 
-	Eigen::Vector3d a1 = buf_.getAccel(tabs);
+	Eigen::Vector3d a1 = predictor_->predictAccel(tabs);
 	auto k1 = this->xdot_impl(xd, ud, a1);
 
-	Eigen::Vector3d a2 = buf_.getAccel(tabs + 0.5*Th);
+	Eigen::Vector3d a2 = predictor_->predictAccel(tabs + 0.5*Th);
 	auto k2 = this->xdot_impl(xd + 0.5*Th*k1, ud, a2);
 
-	Eigen::Vector3d a3 = buf_.getAccel(tabs + 0.5*Th);
+	Eigen::Vector3d a3 = predictor_->predictAccel(tabs + 0.5*Th);
 	auto k3 = this->xdot_impl(xd + 0.5*Th*k2, ud, a3);
 
-	Eigen::Vector3d a4 = buf_.getAccel(tabs + Th);
+	Eigen::Vector3d a4 = predictor_->predictAccel(tabs + Th);
 	auto k4 = this->xdot_impl(xd + Th*k3, ud, a4);
 
 	Eigen::VectorXd xn = xd + (Th/6.0)*(k1 + 2*k2 + 2*k3 + k4);
 	xn.segment(6,4).normalize();
 
-	const_cast<Quad6DOFVarTimeRelativeTV*>(this)
-	 ->setTargetAccel(buf_.getAccel(tabs + 0.5*Th));
+	const_cast<Quad6DOFVarTimeRelativePred*>(this)
+	 ->setTargetAccel(predictor_->predictAccel(tabs + 0.5*Th));
 
 	Vector<Scalar> res(NX_SS);
 	res.segment(0, this->NX_PHYS) = xn.template cast<Scalar>();
@@ -139,23 +160,23 @@ public:
  Eigen::VectorXd propagate(const Eigen::VectorXd&,
 													 const Eigen::VectorXd&,
 													 double) const {
-	assert(false && "Quad6DOFVarTimeRelativeTV: use propagate14(); 13-dim propagate() is disabled");
+	assert(false && "Quad6DOFVarTimeRelativePred: use propagate14(); 13-dim propagate() is disabled");
 	return Eigen::VectorXd();
  }
 
  Eigen::VectorXd propagate14(const Eigen::VectorXd& x14,
 														 const Eigen::VectorXd& u_phys,
 														 double Th) const {
-	double tabs = x14(IDX_DT) + t0_abs_;
+	double tabs = x14(IDX_DT);
 	auto xd = x14.segment(0, this->NX_PHYS);
 
-	Eigen::Vector3d a1 = buf_.getAccel(tabs);
+	Eigen::Vector3d a1 = predictor_->predictAccel(tabs);
 	auto k1 = this->xdot_impl(xd, u_phys, a1);
-	Eigen::Vector3d a2 = buf_.getAccel(tabs + 0.5*Th);
+	Eigen::Vector3d a2 = predictor_->predictAccel(tabs + 0.5*Th);
 	auto k2 = this->xdot_impl(xd + 0.5*Th*k1, u_phys, a2);
-	Eigen::Vector3d a3 = buf_.getAccel(tabs + 0.5*Th);
+	Eigen::Vector3d a3 = predictor_->predictAccel(tabs + 0.5*Th);
 	auto k3 = this->xdot_impl(xd + 0.5*Th*k2, u_phys, a3);
-	Eigen::Vector3d a4 = buf_.getAccel(tabs + Th);
+	Eigen::Vector3d a4 = predictor_->predictAccel(tabs + Th);
 	auto k4 = this->xdot_impl(xd + Th*k3, u_phys, a4);
 
 	Eigen::VectorXd xn14(NX_SS);
@@ -353,25 +374,22 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
  const std::vector<Eigen::VectorXd>& prev_X = {},
  const Eigen::Vector3d& target_accel = Eigen::Vector3d::Zero(),
  const std::vector<Eigen::MatrixXd>& prev_K = {},
- const target_models::TargetAccelBuffer& buf_in = {},
- double t0_abs = 0.0)
+ std::shared_ptr<TargetPredictor> predictor = nullptr)
 {
  auto problem = std::make_shared<OptimalControlProblem<double>>(HORIZON);
 
- // Use externally prepared buffer/time origin when provided. Fall back to a
- // constant target accel so existing callers keep previous behaviour.
- target_models::TargetAccelBuffer buf = buf_in;
- if (buf.accels.empty()) {
-  buf.t_start = t0_abs;
-  buf.dt = TH_INIT;
-  buf.accels = {target_accel};
+ // Use an OCP-owned target predictor, matching the standalone stateswitch
+ // example. Fall back to constant acceleration for legacy callers.
+ if (!predictor) {
+  predictor = std::make_shared<TargetPredictor>();
+  predictor->acceleration = target_accel;
  }
 
- auto dyn = std::make_shared<Quad6DOFVarTimeRelativeTV<double>>(buf, t0_abs);
+ auto dyn = std::make_shared<Quad6DOFVarTimeRelativePred<double>>(predictor);
  dyn->setMass(MASS);
  dyn->setGravity(GRAVITY);
  dyn->setJb(J_B);
- dyn->setTargetAccel(buf.getAccel(t0_abs));
+ dyn->setTargetAccel(predictor->predictAccel(0.0));
 
  auto cost = std::make_shared<TimeCost<double>>(1e-4, 1.0);
  auto tcost = std::make_shared<RelTermCost<double>>(500.0, 50.0);
@@ -428,9 +446,8 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
   } else if (!prev_U.empty() && k < static_cast<int>(prev_U.size())) {
    u0 = prev_U[k];
   } else {
-   // Geometric straight-line warm-start, matching the original stateswitch
-   // behaviour but with an accel offset so that thrust accounts for
-   // target_accel as well as gravity.
+   // Geometric straight-line warm-start, matching the standalone stateswitch
+   // pattern by querying the same target predictor used by the dynamics.
    Eigen::Vector3d p0 = sim14.head(3);
    Eigen::Vector3d v0 = sim14.segment(3,3);
    double T_g = (HORIZON - k) * TH_INIT;
@@ -439,9 +456,8 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
    const double a_req_z_min = (-VZ_LAND_MAX - v0.z()) / T_g;
    a_req.z() = std::max(a_req.z(), a_req_z_min);
 
-   // Subtract target_accel so the warm-start thrust includes centripetal
-   // terms if the planner later supplies a non-zero vector.
-   Eigen::Vector3d fw = MASS*(a_req - target_accel - GRAVITY);
+   Eigen::Vector3d a_tgt_ws = predictor->predictAccel(sim14(IDX_DT));
+   Eigen::Vector3d fw = MASS*(a_req - a_tgt_ws - GRAVITY);
    double fz_g = std::max((double)FMIN, std::min((double)FMAX, fw.norm()));
    u0(0) = fz_g;
    u0(IDX_THETA) = TH_INIT;
@@ -500,19 +516,12 @@ inline OCPDescriptor descriptor() {
             r.target_snapshot_acc.setZero();
         }
     };
-    d.prepare_extra = [](const PlannerConfig& cfg, double t_abs, const TargetSnapshot& tgt_snapshot) {
+    d.prepare_extra = [](const PlannerConfig&, double, const TargetSnapshot& tgt_snapshot) {
         StateswitchExtra ex;
-        ex.t0_abs = t_abs;
-        if (cfg.target_accel_buffer.has_value() && !cfg.target_accel_buffer->accels.empty()) {
-            ex.buf = cfg.target_accel_buffer.value();
-        } else {
-            // Zero-jerk constant-acceleration prediction: a(t) = a_snapshot
-            const double buf_dur = HORIZON * THH + 1.0;
-            const int n_steps = static_cast<int>(buf_dur / TH_INIT) + 2;
-            ex.buf.t_start = t_abs;
-            ex.buf.dt = TH_INIT;
-            ex.buf.accels.assign(n_steps, tgt_snapshot.acceleration);
-        }
+        ex.predictor = std::make_shared<TargetPredictor>();
+        ex.predictor->position = tgt_snapshot.position;
+        ex.predictor->velocity = tgt_snapshot.velocity;
+        ex.predictor->acceleration = tgt_snapshot.acceleration;
         return std::any(ex);
     };
     d.reconstruct_world_state = [](const Eigen::VectorXd& x, const TargetSnapshot& t) {
@@ -532,7 +541,7 @@ inline OCPDescriptor descriptor() {
         }
         return create(a.current_state, a.terminal_state,
                       a.prev_U, a.prev_X, a.target_accel, a.prev_K,
-                      ex.buf, ex.t0_abs);
+                      ex.predictor);
     };
     return d;
 }

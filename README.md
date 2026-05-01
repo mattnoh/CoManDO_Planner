@@ -33,7 +33,7 @@ MAVROS support is detected automatically at build time (`find_package(mavros_msg
 | `hover` | any | `none` | CmdFullState | Fixed-point stabilization |
 | `landing` | any | `none` | CmdFullState | Vertical descent |
 | `stateswitch` | any | `none` | CmdFullState | Moving-target interception |
-| `tracking_circle_target` | any | `none` | CmdFullState | Receding-horizon circle via predicted trajectory |
+| `tracking_circle_target` | any | `none` | CmdFullState | Receding-horizon circle via `/target/predicted_accel` |
 | `tracking_bodyrate_bf_noimu` | crazyflie / mavros | `body_frame` | CmdBodyRate | 10D body-frame; CF→cmd_hover, MAVROS→AttitudeTarget |
 | `tracking_bodyrate_bf_imu` | crazyflie / mavros | `body_frame` | CmdBodyRate | 20D augmented (IMU states) |
 | `tracking_bodyrate_tf_noimu` | crazyflie / mavros | `target_frame` | CmdBodyRate | 10D target-frame (CoNi-MPC) |
@@ -132,6 +132,35 @@ Open the provided layout with:
 rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
 ```
 
+Record RViz-debuggable runs with `ros2 bag`, not RViz itself. A useful Crazyflie
+bag captures transforms, planner visuals, target state, and the command/state
+topics needed to replay the failure:
+
+```bash
+ros2 bag record -o bags/gogogo_debug \
+  /tf /tf_static \
+  /cf_1/planned_trajectory \
+  /cf_1/planner_debug_markers \
+  /target/odom \
+  /target/accel \
+  /target/predicted_accel \
+  /cf_1/pose \
+  /cf_1/odom \
+  /cf_1/cmd_hover \
+  /cf_1/cmd_full_state
+```
+
+Replay it with:
+
+```bash
+ros2 bag play bags/gogogo_debug --clock
+rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
+```
+
+For MAVROS, replace the Crazyflie pose/odom/command topics with the MAVROS
+local-position and setpoint topics used by your bridge. A screen recording is
+fine for sharing, but the bag is the artifact needed for debugging.
+
 ---
 
 ## Architecture
@@ -146,6 +175,13 @@ planner_node ──► StateMonitor  (thread-safe drone + target state)
 ```
 
 **Solve-while-replay pattern:** Solver fires every `n_replay` cycles; replayer fires at OCP DT (e.g. 50 Hz). Command output stays consistent across 100 ms+ solve times.
+
+**Target prediction ownership:** Most OCPs consume the current `TargetSnapshot`
+and let their own dynamics propagate target motion. `stateswitch` follows this
+pattern with an OCP-owned zero-jerk predictor built from target position,
+velocity, and acceleration. `TargetAccelBuffer` and `/target/predicted_accel`
+are only required by OCPs that explicitly request an externally supplied target
+acceleration profile, currently `tracking_circle_target`.
 
 **Platform adapters** (`include/platform/`):
 

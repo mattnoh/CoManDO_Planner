@@ -7,6 +7,9 @@
 ///   `<target_accel_topic>` (optional diagnostics), `<predicted_accel_topic>`
 /// - Typical defaults in launch: `/target/odom`, `/target/accel`,
 ///   `/target/predicted_accel`
+/// - `/target/predicted_accel` is only required by OCPs that explicitly need an
+///   external target-acceleration profile, such as `tracking_circle_target`.
+///   `stateswitch` builds its predictor from the target snapshot instead.
 ///
 /// FIXES vs original:
 ///   BUG 1 — Single shared timestamp for two async topics.

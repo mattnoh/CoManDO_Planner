@@ -153,6 +153,18 @@ target_link_libraries(test_planner_core
   planner_core
 )
 
+add_executable(test_stateswitch_predictor
+  test/test_stateswitch_predictor.cpp
+)
+target_include_directories(test_stateswitch_predictor PRIVATE
+  ${EIGEN3_INCLUDE_DIR}
+  include
+  config
+)
+target_link_libraries(test_stateswitch_predictor
+  planner_core
+)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner
@@ -161,6 +173,7 @@ install(TARGETS
     test_trajectory_replayer
     test_target_frame_warm_start
     test_planner_core
+    test_stateswitch_predictor
   DESTINATION lib/${PROJECT_NAME}
 )
 
