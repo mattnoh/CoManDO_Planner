@@ -5,6 +5,7 @@
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <Eigen/Dense>
 
 #include "core/quadrotor_mpc.hpp"
@@ -27,6 +28,7 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <deque>
 #include <algorithm>
 #include <sstream>
 #include <array>
@@ -127,6 +129,8 @@ public:
 
         traj_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/" + drone_name_ + "/planned_trajectory", 10);
+        debug_marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "/" + drone_name_ + "/planner_debug_markers", 10);
 
         if (is_configured_) {
             createModeTimers();
@@ -247,6 +251,48 @@ private:
 
     static std::array<float, 4> hoverArray(const Eigen::Vector4d& hover) {
         return {float(hover(0)), float(hover(1)), float(hover(2)), float(hover(3))};
+    }
+
+    geometry_msgs::msg::Point pointMsg(const Eigen::Vector3d& p) const {
+        geometry_msgs::msg::Point out;
+        out.x = p.x();
+        out.y = p.y();
+        out.z = p.z();
+        return out;
+    }
+
+    Eigen::Vector3d commandWorldPosition(const Eigen::VectorXd& state,
+                                         const TargetSnapshot& target) const {
+        if (state.size() < 3) {
+            return Eigen::Vector3d::Zero();
+        }
+        const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+        if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::TargetFrameRelative) {
+            return target.position + state.segment(0, 3);
+        }
+        if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyFrameRelative &&
+            state.size() >= 10) {
+            const Eigen::Vector4d q_NB = state.segment(6, 4);
+            const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(target.orientation);
+            const Eigen::Matrix3d R_WB = R_WN * Quad6DOFVarTime<double>::calcC(q_NB);
+            return target.position - R_WB * state.segment(0, 3);
+        }
+        return state.segment(0, 3);
+    }
+
+    visualization_msgs::msg::Marker baseMarker(int id,
+                                               const std::string& ns,
+                                               int type) const {
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "world";
+        marker.header.stamp = this->now();
+        marker.ns = ns;
+        marker.id = id;
+        marker.type = type;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.pose.orientation.w = 1.0;
+        marker.lifetime = rclcpp::Duration::from_seconds(0.5);
+        return marker;
     }
 
     void applyOcpDroneOdomMode(bool rebuild_subscriptions) {
@@ -795,6 +841,96 @@ private:
         }
     }
 
+    void publishDebugMarkers(const planner_core::PlannerCommand& command,
+                             const std::vector<planner_core::PlannerDiagnostic>& diagnostics) {
+        if (!debug_marker_pub_) {
+            return;
+        }
+
+        target_history_.push_back(last_target_snapshot_.position);
+        while (target_history_.size() > 250) {
+            target_history_.pop_front();
+        }
+
+        visualization_msgs::msg::MarkerArray array;
+
+        auto target = baseMarker(0, "target", visualization_msgs::msg::Marker::SPHERE);
+        target.pose.position = pointMsg(last_target_snapshot_.position);
+        target.scale.x = 0.12;
+        target.scale.y = 0.12;
+        target.scale.z = 0.12;
+        target.color.r = 1.0f;
+        target.color.g = 0.82f;
+        target.color.b = 0.10f;
+        target.color.a = 0.95f;
+        array.markers.push_back(target);
+
+        auto target_path = baseMarker(1, "target_path", visualization_msgs::msg::Marker::LINE_STRIP);
+        target_path.scale.x = 0.025;
+        target_path.color.r = 1.0f;
+        target_path.color.g = 0.72f;
+        target_path.color.b = 0.10f;
+        target_path.color.a = 0.75f;
+        for (const auto& p : target_history_) {
+            target_path.points.push_back(pointMsg(p));
+        }
+        array.markers.push_back(target_path);
+
+        if (command.state.size() >= 3) {
+            const Eigen::Vector3d cmd_pos = commandWorldPosition(command.state, last_target_snapshot_);
+            auto cmd = baseMarker(2, "active_command", visualization_msgs::msg::Marker::SPHERE);
+            cmd.pose.position = pointMsg(cmd_pos);
+            cmd.scale.x = 0.10;
+            cmd.scale.y = 0.10;
+            cmd.scale.z = 0.10;
+            cmd.color.r = 0.10f;
+            cmd.color.g = 0.50f;
+            cmd.color.b = 1.0f;
+            cmd.color.a = 0.95f;
+            array.markers.push_back(cmd);
+        }
+
+        for (const auto& d : diagnostics) {
+            if (d.code != "handoff" || d.state_a.size() < 3 || d.state_b.size() < 3) {
+                continue;
+            }
+            const Eigen::Vector3d old_pos = commandWorldPosition(d.state_a, last_target_snapshot_);
+            const Eigen::Vector3d new_pos = commandWorldPosition(d.state_b, last_target_snapshot_);
+            auto line = baseMarker(3, "handoff_jump", visualization_msgs::msg::Marker::LINE_LIST);
+            line.scale.x = 0.04;
+            line.color.r = 1.0f;
+            line.color.g = 0.15f;
+            line.color.b = 0.05f;
+            line.color.a = 0.95f;
+            line.points.push_back(pointMsg(old_pos));
+            line.points.push_back(pointMsg(new_pos));
+            line.lifetime = rclcpp::Duration::from_seconds(3.0);
+            array.markers.push_back(line);
+
+            const Eigen::Vector3d mid = 0.5 * (old_pos + new_pos);
+            auto text = baseMarker(4, "handoff_text", visualization_msgs::msg::Marker::TEXT_VIEW_FACING);
+            text.pose.position = pointMsg(mid + Eigen::Vector3d(0.0, 0.0, 0.15));
+            text.scale.z = 0.12;
+            text.color.r = 1.0f;
+            text.color.g = 0.20f;
+            text.color.b = 0.05f;
+            text.color.a = 1.0f;
+            const auto value = [&](const char* key) {
+                const auto it = d.values.find(key);
+                return (it == d.values.end()) ? 0.0 : it->second;
+            };
+            std::ostringstream label;
+            label << "handoff dx=" << std::fixed << std::setprecision(3)
+                  << value("state_jump_norm")
+                  << " du=" << value("control_jump_norm");
+            text.text = label.str();
+            text.lifetime = rclcpp::Duration::from_seconds(3.0);
+            array.markers.push_back(text);
+        }
+
+        debug_marker_pub_->publish(array);
+    }
+
     planner_core::PlannerCoreInput makeCoreInput(const Eigen::VectorXd& state,
                                                  const TargetSnapshot& target_snapshot) {
         planner_core::PlannerCoreInput input;
@@ -1134,6 +1270,7 @@ private:
         }
 
         publishCommand(replay.command);
+        publishDebugMarkers(replay.command, replay.diagnostics);
 
         if (logging_enabled_ && logging_initialized_) {
             // Always log the raw sensor state (13D from cf_1 topics) regardless of
@@ -1545,9 +1682,11 @@ private:
     rclcpp::TimerBase::SharedPtr open_loop_hold_timer_;
 
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_marker_pub_;
 
     planner_core::PlannerCore planner_core_;
     bool planner_core_configured_ = false;
+    std::deque<Eigen::Vector3d> target_history_;
 
     StateMonitor state_monitor_;
 

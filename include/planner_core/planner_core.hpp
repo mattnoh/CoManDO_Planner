@@ -243,6 +243,10 @@ public:
                 {"state_jump_norm", diag->state_jump_norm},
                 {"control_jump_norm", diag->control_jump_norm},
             };
+            d.state_a = diag->old_state_cmd;
+            d.state_b = diag->new_state_cmd;
+            d.control_a = diag->old_control_cmd;
+            d.control_b = diag->new_control_cmd;
             out.diagnostics.push_back(std::move(d));
         }
         return out;

@@ -15,6 +15,7 @@ find_package(tf2_ros REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(crazyflie_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 
@@ -79,6 +80,7 @@ macro(configure_target TARGET_NAME)
     geometry_msgs
     nav_msgs
     trajectory_msgs
+    visualization_msgs
     crazyflie_interfaces
   )
   if(COMANDO_ENABLE_QUALISYS AND mocap4r2_msgs_FOUND)
@@ -164,6 +166,10 @@ install(TARGETS
 
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
+)
+
+install(DIRECTORY rviz/
+  DESTINATION share/${PROJECT_NAME}/rviz
 )
 
 install(PROGRAMS

@@ -119,6 +119,19 @@ python animate_body.py --dir <log_dir>
 
 Both scripts auto-detect the column schema from the CSV headers. No hardcoded column lists.
 
+For live RViz2 debugging, the planner publishes:
+
+| Topic | Type | Contents |
+|-------|------|----------|
+| `/{drone}/planned_trajectory` | `nav_msgs/msg/Path` | Current accepted horizon in `world` |
+| `/{drone}/planner_debug_markers` | `visualization_msgs/msg/MarkerArray` | Target point/trail, active command point, handoff jump marker/text |
+
+Open the provided layout with:
+
+```bash
+rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
+```
+
 ---
 
 ## Architecture

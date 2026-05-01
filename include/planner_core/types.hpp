@@ -72,6 +72,10 @@ struct PlannerDiagnostic {
     std::string code;
     std::string message;
     std::map<std::string, double> values;
+    Eigen::VectorXd state_a;
+    Eigen::VectorXd state_b;
+    Eigen::VectorXd control_a;
+    Eigen::VectorXd control_b;
 };
 
 struct PlannerCoreConfig {
