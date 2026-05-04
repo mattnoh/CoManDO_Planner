@@ -13,12 +13,11 @@
 #include <vector>
 
 #include "planner_core/ocp_registry.hpp"
-#include "planner_core/planner_config.hpp"
+#include "planner_core/types.hpp"
 #include "planner_core/quadrotor_mpc.hpp"
 #include "dynamics/quad_6dof_target_frame.h"
 #include "ocp/ocp_tracking_circle_target.hpp"
-#include "planner_core/command_adapter.hpp"
-#include "planner_core/frame_adapter.hpp"
+#include "planner_core/adapters.hpp"
 #include "planner_core/types.hpp"
 #include "trajectory_replayer.hpp"
 

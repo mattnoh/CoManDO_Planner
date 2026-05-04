@@ -3,8 +3,7 @@
 #include <Eigen/Dense>
 #include <rclcpp/rclcpp.hpp>
 
-#include "planner_core/target_snapshot.hpp"
-#include "planner_core/ocp_descriptor.hpp"
+#include "planner_core/types.hpp"
 #include "platform/crazyflie.hpp"
 
 #include <chrono>

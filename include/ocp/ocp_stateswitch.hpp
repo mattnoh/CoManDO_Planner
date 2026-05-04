@@ -10,7 +10,7 @@
 #include <utility>
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
-#include "planner_core/ocp_descriptor.hpp"
+#include "planner_core/types.hpp"
 
 namespace StateswitchOCP {
 

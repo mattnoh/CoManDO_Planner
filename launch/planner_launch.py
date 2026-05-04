@@ -1,6 +1,7 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -35,6 +36,9 @@ def generate_launch_description():
         DeclareLaunchArgument('terminal_freeze_enter_vel', default_value='0.10'),
         DeclareLaunchArgument('terminal_freeze_require_vel', default_value='false'),
         DeclareLaunchArgument('terminal_freeze_exit_pos', default_value='0.20'),
+
+        DeclareLaunchArgument('record_bag', default_value='false'),
+        DeclareLaunchArgument('bag_output', default_value='bags/comando_debug'),
     ]
 
     node = Node(
@@ -68,4 +72,31 @@ def generate_launch_description():
         }]
     )
 
-    return LaunchDescription(args + [node])
+    drone_topic = lambda suffix: PythonExpression([
+        "'/' + '", LaunchConfiguration('drone_name'), "' + '", suffix, "'"
+    ])
+
+    rosbag = ExecuteProcess(
+        condition=IfCondition(LaunchConfiguration('record_bag')),
+        cmd=[
+            'ros2', 'bag', 'record',
+            '-o', LaunchConfiguration('bag_output'),
+            '/tf',
+            '/tf_static',
+            drone_topic('/planned_trajectory'),
+            drone_topic('/planner_debug_markers'),
+            '/target/odom',
+            '/target/accel',
+            '/target/predicted_accel',
+            drone_topic('/pose'),
+            drone_topic('/odom'),
+            drone_topic('/cmd_hover'),
+            drone_topic('/cmd_full_state'),
+            '/mavros/local_position/odom',
+            '/mavros/setpoint_raw/attitude',
+            '/mavros/setpoint_raw/local',
+        ],
+        output='screen',
+    )
+
+    return LaunchDescription(args + [node, rosbag])

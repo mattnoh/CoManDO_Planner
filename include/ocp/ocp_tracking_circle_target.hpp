@@ -40,7 +40,7 @@
 #pragma once
 
 #include "target/target_accel_buffer.hpp"
-#include "planner_core/ocp_descriptor.hpp"
+#include "planner_core/types.hpp"
 
 #include "optimal_control_problem.h"
 #include "dynamics/discrete_dynamics_base.h"

@@ -157,6 +157,14 @@ ros2 bag play bags/gogogo_debug --clock
 rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
 ```
 
+The planner launch file can start that recorder automatically:
+
+```bash
+ros2 launch comando_planner planner_launch.py \
+  drone_name:=cf_1 platform:=crazyflie \
+  record_bag:=true bag_output:=bags/gogogo_debug
+```
+
 For MAVROS, replace the Crazyflie pose/odom/command topics with the MAVROS
 local-position and setpoint topics used by your bridge. A screen recording is
 fine for sharing, but the bag is the artifact needed for debugging.
@@ -182,6 +190,13 @@ pattern with an OCP-owned zero-jerk predictor built from target position,
 velocity, and acceleration. `TargetAccelBuffer` and `/target/predicted_accel`
 are only required by OCPs that explicitly request an externally supplied target
 acceleration profile, currently `tracking_circle_target`.
+
+**ROS wrapper boundary:** `include/planner_core/` is kept free of ROS message
+types and logging macros. ROS2 support lives in `src/planner_node.cpp` plus the
+ROS2 platform adapters. A future ROS1/MAVROS wrapper should reuse
+`PlannerCore`, `QuadrotorMPC`, `TrajectoryReplayer`, and the OCP descriptors,
+then implement only ROS1 params, subscribers, publishers, timers, rosbag launch
+helpers, and message conversion.
 
 **Platform adapters** (`include/platform/`):
 

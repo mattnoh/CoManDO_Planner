@@ -17,8 +17,7 @@
 #include "trajectory_replayer.hpp"
 #include "planner_runtime_config.hpp"
 #include "planner_logging.hpp"
-#include "planner_core/command_adapter.hpp"
-#include "planner_core/frame_adapter.hpp"
+#include "planner_core/adapters.hpp"
 #include "planner_core/planner_core.hpp"
 #include "hover_controller.hpp"
 

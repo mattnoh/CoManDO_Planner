@@ -4,7 +4,7 @@
 
 #include <optional>
 
-#include "planner_core/planner_config.hpp"
+#include "planner_core/types.hpp"
 #include "target/target_accel_buffer.hpp"
 
 struct PlannerRuntimeConfig {
