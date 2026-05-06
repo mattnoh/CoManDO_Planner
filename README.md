@@ -58,11 +58,9 @@ ros2 launch comando_planner planner_launch.py \
   drone_name:=cf_1 platform:=crazyflie record_bag:=false
 
 # Terminal B: optional target publisher for tracking OCPs
-ros2 run comando_planner target_publisher --ros-args \
-  -p target_mode:=circle \
-  -p drone_odom_mode:=body_frame \
-  -p drone_odom_topic:=/cf_1/odom \
-  -p drone_pose_topic:=/cf_1/pose
+ros2 launch comando_planner target_launch.py \
+  target_source:=model target_trajectory:=circle planning_frame:=body_frame \
+  drone_odom_topic:=/cf_1/odom drone_pose_topic:=/cf_1/pose
 
 # Terminal C: hover at 1 m
 ros2 launch comando_planner ocp_launch.py \
@@ -72,13 +70,13 @@ ros2 launch comando_planner ocp_launch.py \
 
 # Terminal C: body-frame tracking after target_publisher is running
 ros2 launch comando_planner ocp_launch.py \
-  ocp_type:=tracking_bodyrate_bf_noimu mode:=mpc n_replay:=7 command_seq:=2
+  ocp_type:=bf_noimu mode:=mpc n_replay:=7 command_seq:=2
 ```
 
-For target-frame body-rate OCPs, start `target_publisher` with
-`drone_odom_mode:=target_frame`. For `stateswitch`, use `drone_odom_mode:=none`
-because the planner reads the drone in the absolute frame and subtracts the
-target snapshot internally.
+For target-frame body-rate OCPs, start the target publisher with
+`planning_frame:=target_frame` and select `ocp_type:=tf_imu` or `tf_noimu`.
+For `stateswitch`, use `planning_frame:=world` because the planner reads the
+drone in the absolute frame and subtracts the target snapshot internally.
 
 ## MAVROS Workflow
 
@@ -89,7 +87,7 @@ ros2 launch comando_planner planner_launch.py \
   drone_name:=drone platform:=mavros record_bag:=false
 
 ros2 launch comando_planner ocp_launch.py \
-  ocp_type:=tracking_bodyrate_tf_noimu mode:=mpc n_replay:=7 command_seq:=1
+  ocp_type:=tf_noimu mode:=mpc n_replay:=7 command_seq:=1
 ```
 
 The MAVROS adapter subscribes to `/mavros/local_position/odom`, publishes
@@ -108,18 +106,34 @@ expose it as a launch argument.
 | `/target/odom` | `nav_msgs/msg/Odometry` | Target position, velocity, orientation, angular velocity |
 | `/target/accel` | `geometry_msgs/msg/AccelStamped` | Target linear and angular acceleration |
 
+Target source, target trajectory, planning frame, and OCP selection are separate:
+
+```bash
+# Synthetic circular target, target-frame relative odometry for tf_imu/tf_noimu.
+ros2 launch comando_planner target_launch.py \
+  target_source:=model target_trajectory:=circle planning_frame:=target_frame
+
+# Synthetic figure-8 target, body-frame relative odometry for bf_imu/bf_noimu.
+ros2 launch comando_planner target_launch.py \
+  target_source:=model target_trajectory:=figure8 planning_frame:=body_frame
+
+# Qualisys target truth, world-frame state for stateswitch.
+ros2 launch comando_planner target_launch.py \
+  target_source:=qualisys rigid_body_name:=stmini planning_frame:=world
+```
+
 It can also publish relative drone odometry:
 
-| `drone_odom_mode` | Extra topic | Used by |
+| `planning_frame` | Extra topic | Used by |
 | --- | --- | --- |
-| `none` | none | Absolute OCPs and target-relative OCPs that transform internally |
+| `world` | none | Absolute OCPs and target-relative OCPs that transform internally |
 | `body_frame` | `/drone/body_relative_odom` | `tracking_bodyrate_bf_*` |
 | `target_frame` | `/drone/target_frame_odom` | `tracking_bodyrate_tf_*` |
-| `shifted_world` | `/drone/relative_odometry` | Diagnostic/historical output; not selected by current OCP descriptors |
+| `shifted` | `/drone/relative_odometry` | Diagnostic/historical output; not selected by current OCP descriptors |
 
-The synthetic circle currently uses constants in `include/target/circular_target.hpp`
-(`center={0,0,0.2}`, `R=1.0`, `omega=0.4`, `phi0=0.0`). Runtime shape
-parameters such as `radius` or `center_z` are not declared by the current node.
+Legacy `target_mode:=circle|qualisys` and `drone_odom_mode:=none|shifted_world|target_frame|body_frame`
+still work as aliases. OCP aliases are also available: `tf_imu`, `tf_noimu`,
+`bf_imu`, `bf_noimu`, `state_switch`, and `circle_target`.
 
 ## Runtime Parameters
 

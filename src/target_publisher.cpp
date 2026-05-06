@@ -1,22 +1,24 @@
 /// @file target_publisher.cpp
 /// @brief Standalone ROS2 node that publishes the target state for the CoManDO planner.
 ///
-/// Two modes (target_mode parameter):
+/// Target source:
 ///
-///   "circle"   — Fully synthetic circular orbit. No external input.
-///                Phase is driven by wall-clock time and phi0.
+///   "model"    — Fully synthetic trajectory. No external input.
+///                The target_trajectory parameter selects circle, figure8, etc.
 ///
 ///   "qualisys" — Real vehicle pose from a Qualisys-sourced rigid-bodies topic.
 ///                Position comes from the observed pose. Velocity and acceleration
 ///                are estimated by finite-differencing a short pose history window.
-///                No circular model assumed — works for any target trajectory.
+///                No synthetic model assumed; works for any target trajectory.
 ///
 /// Publishes on:
 ///   /target/odom   (nav_msgs/msg/Odometry)
 ///   /target/accel  (geometry_msgs/msg/AccelStamped)
 ///
 /// Parameters:
-///   target_mode         — "circle" or "qualisys"           default: "circle"
+///   target_source       — "model" or "qualisys"            default: "model"
+///   target_trajectory   — "circle" or "figure8"            default: "circle"
+///   target_mode         — legacy alias for older commands
 ///   center_x/y/z        — orbit center [m]                 default: 0, 0, 0.2
 ///   omega               — angular speed [rad/s]            default: 0.4
 ///   phi0                — initial phase, circle mode [rad] default: 0.0
@@ -25,13 +27,14 @@
 ///   frame_id            — header frame                     default: "world"
 ///   qualisys_pose_topic — input pose topic, qualisys mode  default: "/stmini/pose"
 ///   drone_odom_topic    — drone odom for relative odom     default: "/gogogo/odom"
-///   relative_odom_topic — relative odom output topic       default: "/drone/relative_odometry"
-///   enable_relative_odom — publish drone relative odom     default: true
+///   planning_frame      — "world", "shifted", "target_frame", or "body_frame"
+///   drone_odom_mode     — legacy alias for planning_frame
 ///
 /// Usage:
-///   ros2 run comando_planner target_publisher --ros-args -p target_mode:=circle
 ///   ros2 run comando_planner target_publisher --ros-args
-///       -p target_mode:=qualisys -p rigid_body_name:=stmini
+///       -p target_source:=model -p target_trajectory:=circle
+///   ros2 run comando_planner target_publisher --ros-args
+///       -p target_source:=qualisys -p rigid_body_name:=stmini
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -52,55 +55,115 @@
 
 namespace {
 constexpr double DEG2RAD = M_PI / 180.0;
+
+std::string normalizeTargetSource(const std::string& requested,
+                                  const std::string& legacy_mode,
+                                  std::string* target_trajectory)
+{
+    if (!requested.empty()) {
+        return requested;
+    }
+    if (legacy_mode == "qualisys") {
+        return "qualisys";
+    }
+    if (legacy_mode == "circle" || legacy_mode == "figure8") {
+        *target_trajectory = legacy_mode;
+    }
+    return "model";
+}
+
+std::string normalizePlanningFrame(const std::string& requested,
+                                   const std::string& legacy_mode)
+{
+    const std::string raw = !requested.empty() ? requested : legacy_mode;
+    if (raw.empty() || raw == "none" || raw == "world") {
+        return "world";
+    }
+    if (raw == "shifted_world") {
+        return "shifted";
+    }
+    return raw;
+}
 }
 
 class BenchmarkTargetPublisher : public rclcpp::Node
 {
 public:
-    BenchmarkTargetPublisher() : Node("circular_target_publisher")
+    BenchmarkTargetPublisher() : Node("target_publisher")
     {
         // ── Parameters ──────────────────────────────────────────────────────
-        // Circle trajectory shape is configured in include/target/circular_target.hpp
-        target_mode_ = declare_parameter<std::string>("target_mode", "circle");
+        // target_mode and drone_odom_mode are kept as aliases for older launch commands.
+        std::string target_trajectory = declare_parameter<std::string>("target_trajectory", "circle");
+        const std::string legacy_target_mode = declare_parameter<std::string>("target_mode", "");
+        target_source_ = normalizeTargetSource(
+            declare_parameter<std::string>("target_source", ""),
+            legacy_target_mode,
+            &target_trajectory);
+        target_trajectory_ = target_trajectory;
         target_yaw_rate_ = declare_parameter<double>("target_yaw_rate", 0.3);
         publish_hz_  = declare_parameter<double>("publish_hz", 100.0);
         frame_id_    = declare_parameter<std::string>("frame_id", "world");
         qualisys_pose_topic_  = declare_parameter<std::string>("rigid_body_name", "stmini");
         drone_odom_topic_     = declare_parameter<std::string>("drone_odom_topic", "/cf_1/odom");
-        // drone_odom_mode: which relative odometry to publish alongside /target/odom
-        //   "none"         — no drone relative output (absolute OCPs)
-        //   "shifted_world" — /drone/relative_odometry: p_drone-p_tgt, v_drone-v_tgt in world
+        const std::string legacy_drone_odom_mode = declare_parameter<std::string>("drone_odom_mode", "");
+        planning_frame_ = normalizePlanningFrame(
+            declare_parameter<std::string>("planning_frame", ""),
+            legacy_drone_odom_mode);
+        // Internal normalized mode:
+        //   "world"        — no drone relative output
+        //   "shifted"      — /drone/relative_odometry: p_drone-p_tgt, v_drone-v_tgt in world
         //   "target_frame" — /drone/target_frame_odom: p_B^N, v_B^N, q_NB
         //   "body_frame"   — /drone/body_relative_odom: p_T^B, v_rel^B, q_NB
-        drone_odom_mode_ = declare_parameter<std::string>("drone_odom_mode", "none");
+        drone_odom_mode_ = planning_frame_;
         drone_pose_topic_ = declare_parameter<std::string>("drone_pose_topic", "/cf_1/pose");
         debug_body_relative_trace_ = declare_parameter<bool>("debug_body_relative_trace", false);
         body_relative_angular_unit_ = declare_parameter<std::string>(
             "body_relative_input_angular_unit", "deg_s");
 
-#ifndef HAS_MOCAP4R2_MSGS
-        if (target_mode_ == "qualisys") {
+        if (target_source_ != "model" && target_source_ != "qualisys") {
             RCLCPP_WARN(get_logger(),
-                "[TargetPublisher] target_mode=qualisys requested, but this build has no "
-                "mocap4r2_msgs support. Falling back to circle mode.");
-            target_mode_ = "circle";
+                "[TargetPublisher] Unknown target_source='%s'; using model.",
+                target_source_.c_str());
+            target_source_ = "model";
+        }
+        if (target_trajectory_ != "circle" && target_trajectory_ != "figure8") {
+            RCLCPP_WARN(get_logger(),
+                "[TargetPublisher] Unknown target_trajectory='%s'; using circle.",
+                target_trajectory_.c_str());
+            target_trajectory_ = "circle";
+        }
+        if (drone_odom_mode_ != "world" && drone_odom_mode_ != "shifted" &&
+            drone_odom_mode_ != "target_frame" && drone_odom_mode_ != "body_frame") {
+            RCLCPP_WARN(get_logger(),
+                "[TargetPublisher] Unknown planning_frame='%s'; using world.",
+                drone_odom_mode_.c_str());
+            drone_odom_mode_ = "world";
+            planning_frame_ = "world";
+        }
+
+#ifndef HAS_MOCAP4R2_MSGS
+        if (target_source_ == "qualisys") {
+            RCLCPP_WARN(get_logger(),
+                "[TargetPublisher] target_source=qualisys requested, but this build has no "
+                "mocap4r2_msgs support. Falling back to model source.");
+            target_source_ = "model";
         }
 #endif
 
-        t0_ = now().seconds();  // circle mode uses relative time from here
+        t0_ = now().seconds();  // model source uses relative time from here
 
         // ── Publishers ───────────────────────────────────────────────────────
         odom_pub_  = create_publisher<nav_msgs::msg::Odometry>("/target/odom", 10);
         accel_pub_ = create_publisher<geometry_msgs::msg::AccelStamped>("/target/accel", 10);
 
-        if (drone_odom_mode_ == "shifted_world") {
+        if (drone_odom_mode_ == "shifted") {
             abs_rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/relative_odometry", 10);
         } else if (drone_odom_mode_ == "body_frame") {
             body_rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/body_relative_odom", 10);
         } else if (drone_odom_mode_ == "target_frame") {
             target_frame_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/target_frame_odom", 10);
         }
-        if (drone_odom_mode_ != "none") {
+        if (drone_odom_mode_ != "world") {
             drone_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
                 drone_odom_topic_, 10,
                 [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -121,7 +184,7 @@ public:
 
         // ── Qualisys rigid bodies subscriber (qualisys mode only) ───────────
 #ifdef HAS_MOCAP4R2_MSGS
-        if (target_mode_ == "qualisys") {
+        if (target_source_ == "qualisys") {
             rigid_bodies_sub_ = create_subscription<mocap4r2_msgs::msg::RigidBodies>(
                 "/rigid_bodies", 10,
                 [this](const mocap4r2_msgs::msg::RigidBodies::SharedPtr msg) {
@@ -146,37 +209,39 @@ public:
                     }
                 });
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] mode=qualisys  body_name=%s",
+                "[TargetPublisher] source=qualisys  body_name=%s",
                 qualisys_pose_topic_.c_str());
         } else {
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] mode=circle  center=(%.2f,%.2f,%.2f)  "
-                "R=%.2f  ω=%.2f rad/s  %.0f Hz",
+                "[TargetPublisher] source=model trajectory=%s  circle_center=(%.2f,%.2f,%.2f)  "
+                "circle_R=%.2f  circle_omega=%.2f rad/s  %.0f Hz",
+                target_trajectory_.c_str(),
                 circle_model_.center.x(), circle_model_.center.y(), circle_model_.center.z(),
                 circle_model_.R, circle_model_.omega, publish_hz_);
         }
 #else
         RCLCPP_INFO(get_logger(),
-            "[TargetPublisher] mode=circle  center=(%.2f,%.2f,%.2f)  "
-            "R=%.2f  ω=%.2f rad/s  %.0f Hz",
+            "[TargetPublisher] source=model trajectory=%s  circle_center=(%.2f,%.2f,%.2f)  "
+            "circle_R=%.2f  circle_omega=%.2f rad/s  %.0f Hz",
+            target_trajectory_.c_str(),
             circle_model_.center.x(), circle_model_.center.y(), circle_model_.center.z(),
             circle_model_.R, circle_model_.omega, publish_hz_);
 #endif
 
-        if (drone_odom_mode_ == "shifted_world") {
+        if (drone_odom_mode_ == "shifted") {
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] drone_odom_mode=shifted_world → /drone/relative_odometry (drone-target in world frame)");
+                "[TargetPublisher] planning_frame=shifted -> /drone/relative_odometry (drone-target in world frame)");
         } else if (drone_odom_mode_ == "body_frame") {
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] drone_odom_mode=body_frame → /drone/body_relative_odom (target in drone body frame)");
+                "[TargetPublisher] planning_frame=body_frame -> /drone/body_relative_odom (target in drone body frame)");
             RCLCPP_INFO(get_logger(),
                 "[TargetPublisher] Angular unit='%s' (set body_relative_input_angular_unit:=rad_s if upstream publishes rad/s)",
                 body_relative_angular_unit_.c_str());
         } else if (drone_odom_mode_ == "target_frame") {
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] drone_odom_mode=target_frame → /drone/target_frame_odom (drone in target N frame)");
+                "[TargetPublisher] planning_frame=target_frame -> /drone/target_frame_odom (drone in target N frame)");
         } else {
-            RCLCPP_INFO(get_logger(), "[TargetPublisher] drone_odom_mode=none — no relative odometry output");
+            RCLCPP_INFO(get_logger(), "[TargetPublisher] planning_frame=world - no relative odometry output");
         }
 
         // ── Timer ────────────────────────────────────────────────────────────
@@ -205,7 +270,7 @@ private:
 
         Kinematics k{};
 
-        if (target_mode_ == "qualisys") {
+        if (target_source_ == "qualisys") {
             // ── qualisys mode: finite-differenced velocity and acceleration ──
             std::lock_guard<std::mutex> lk(pose_mutex_);
             if (pose_history_.empty()) {
@@ -262,11 +327,20 @@ private:
             }
 
         } else {
-            // ── circle mode: fully synthetic, trajectory defined in circular_target.hpp
+            // ── model source: fully synthetic, trajectory selected by target_trajectory.
             const double t_rel = t - t0_;
-            const Eigen::Vector3d p = circle_model_.pos(t_rel);
-            const Eigen::Vector3d v = circle_model_.vel(t_rel);
-            const Eigen::Vector3d a = circle_model_.accel(t_rel);
+            Eigen::Vector3d p = Eigen::Vector3d::Zero();
+            Eigen::Vector3d v = Eigen::Vector3d::Zero();
+            Eigen::Vector3d a = Eigen::Vector3d::Zero();
+            if (target_trajectory_ == "figure8") {
+                p = figure8_model_.pos(t_rel);
+                v = figure8_model_.vel(t_rel);
+                a = figure8_model_.accel(t_rel);
+            } else {
+                p = circle_model_.pos(t_rel);
+                v = circle_model_.vel(t_rel);
+                a = circle_model_.accel(t_rel);
+            }
             k = {p.x(), p.y(), p.z(), v.x(), v.y(), v.z(), a.x(), a.y(), a.z(), 0.0, 0.0, target_yaw_rate_, 0.0, 0.0, 0.0, Eigen::Quaterniond::Identity()};
             
             // Yaw model
@@ -332,7 +406,7 @@ private:
             }
         }
 
-        if (drone_odom_mode_ == "shifted_world" && abs_rel_odom_pub_ && have_drone_odom) {
+        if (drone_odom_mode_ == "shifted" && abs_rel_odom_pub_ && have_drone_odom) {
             nav_msgs::msg::Odometry rel = drone_odom_copy;
             rel.header.stamp    = drone_odom_copy.header.stamp;
             rel.header.frame_id = frame_id_;
@@ -475,15 +549,18 @@ private:
     }
 
     // ── Parameters ─────────────────────────────────────────────────────────
-    std::string target_mode_;
+    std::string target_source_;
+    std::string target_trajectory_;
     double target_yaw_rate_;
     double publish_hz_;
     std::string frame_id_;
-    target_models::CircularTarget circle_model_;  // trajectory defined in circular_target.hpp
-    double t0_ = 0.0;  // wall-clock time at startup, for relative time in circle mode
+    target_models::CircularTarget circle_model_;  // circle model defaults live in circular_target.hpp
+    target_models::Figure8Target figure8_model_;  // figure-8 model defaults live in figure8_target.hpp
+    double t0_ = 0.0;  // wall-clock time at startup, for relative time in model source
     std::string qualisys_pose_topic_;
     std::string drone_odom_topic_;
-    std::string drone_odom_mode_;  // "none" | "shifted_world" | "body_frame" | "target_frame"
+    std::string planning_frame_;
+    std::string drone_odom_mode_;  // "world" | "shifted" | "body_frame" | "target_frame"
     std::string drone_pose_topic_;
     bool debug_body_relative_trace_ = false;
     std::string body_relative_angular_unit_ = "deg_s";

@@ -30,11 +30,17 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
         {"hover",                          HoverOCP::descriptor()},
         {"landing",                        LandingOCP::descriptor()},
         {"stateswitch",                    StateswitchOCP::descriptor()},
+        {"state_switch",                   StateswitchOCP::descriptor()},
         {"tracking_circle_target",         TrackingCircleTargetOCP::descriptor()},
+        {"circle_target",                  TrackingCircleTargetOCP::descriptor()},
         {"tracking_bodyrate_tf_noimu",     TrackingBodyrateTfNoImuOCP::descriptor()},
         {"tracking_bodyrate_tf_imu",       TrackingBodyrateTfImuOCP::descriptor()},
+        {"tf_noimu",                       TrackingBodyrateTfNoImuOCP::descriptor()},
+        {"tf_imu",                         TrackingBodyrateTfImuOCP::descriptor()},
         {"tracking_bodyrate_bf_imu",       TrackingBodyrateBfImuOCP::descriptor()},
         {"tracking_bodyrate_bf_noimu",     TrackingBodyrateBfNoImuOCP::descriptor()},
+        {"bf_imu",                         TrackingBodyrateBfImuOCP::descriptor()},
+        {"bf_noimu",                       TrackingBodyrateBfNoImuOCP::descriptor()},
     };
     return table;
 }
