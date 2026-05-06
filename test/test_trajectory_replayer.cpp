@@ -84,6 +84,22 @@ void testPendingPlanWaitsForActivation() {
             "pending activation: new plan not sampled from activation time");
 }
 
+void testLatePendingPlanSamplesFromActivationOrigin() {
+    TrajectoryReplayer replayer;
+    const auto base = Clock::now();
+    replayer.updatePlan(makeFixedPlan(0.0), makeControls(0.0), 10.0, 0,
+                        base, base, 0.1, 2, false, 3);
+    replayer.updatePlan(makeFixedPlan(100.0), makeControls(10.0), 80.0, 1,
+                        base + std::chrono::milliseconds(200),
+                        base + std::chrono::milliseconds(200),
+                        0.1, 2, false, 3);
+
+    const auto sample = replayer.sample(base + std::chrono::milliseconds(250), 0.1);
+    require(sample.active_solve_num == 1, "late pending activation: did not swap");
+    require(std::abs(sample.x_cmd(0) - 100.5) < 1e-6,
+            "late pending activation: new plan was not sampled from activation origin");
+}
+
 void testVariableDtUsesStateDtSlot() {
     TrajectoryReplayer replayer;
     const auto base = Clock::now();
@@ -120,6 +136,7 @@ int main() {
     try {
         testFirstPlanActivationStartsAtNodeZero();
         testPendingPlanWaitsForActivation();
+        testLatePendingPlanSamplesFromActivationOrigin();
         testVariableDtUsesStateDtSlot();
         testJumpDiagnostics();
     } catch (const std::exception& e) {

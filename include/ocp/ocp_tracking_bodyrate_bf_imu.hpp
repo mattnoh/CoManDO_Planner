@@ -348,10 +348,12 @@ inline OCPDescriptor descriptor() {
         const int n = std::min(static_cast<int>(x_drone.size()), 10);
         x.head(n) = x_drone.head(n);  // [p_T^B, v_rel^B, q_NB]
         const Eigen::Vector4d q_NB = x.segment(IDX_Q, 4);
-        const Eigen::Matrix3d R_WB = Quad6DOFVarTime<double>::calcC(q_NB);
-        x.segment(IDX_OMN, 3) = tgt.angular_velocity;
+        const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(tgt.orientation);
+        const Eigen::Matrix3d R_NW = R_WN.transpose();
+        const Eigen::Matrix3d R_WB = R_WN * Quad6DOFVarTime<double>::calcC(q_NB);
+        x.segment(IDX_OMN, 3) = R_NW * tgt.angular_velocity;
         x.segment(IDX_AT,  3) = R_WB.transpose() * tgt.acceleration;  // a_T^B
-        x.segment(IDX_BN,  3) = tgt.angular_acceleration;
+        x.segment(IDX_BN,  3) = R_NW * tgt.angular_acceleration;
         return x;
     };
     d.validate_target = [](const TargetSnapshot& t, double, double) { return t.valid; };

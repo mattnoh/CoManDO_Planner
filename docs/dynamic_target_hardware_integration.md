@@ -1,111 +1,149 @@
-# CoManDO Planner: Dynamic Target Hardware Integration
+# Dynamic Target Hardware Integration
 
-When integrating an actual hardware target (e.g., a real moving robot tracked by a Vicon system or an onboard Kalman Filter), your target estimator node must publish specific ROS messages for the `comando_planner` to track it successfully.
+This guide describes what an external target estimator or predictor must publish
+for the current `comando_planner` implementation.
 
-## Required ROS Topics
+The planner separates live target feedback from future target prediction:
 
-For `tracking_circle_target`, the planner treats your target estimator/predictor as an external ROS producer. It does **not** assume any internal circular model.
+| Stream | Default topic | Required by | Purpose |
+| --- | --- | --- | --- |
+| Target odometry | `/target/odom` | all target-tracking OCPs | Current target position, velocity, orientation, angular velocity |
+| Target acceleration | `/target/accel` | body-rate OCP freshness, `stateswitch` acceleration snapshot | Current target linear and angular acceleration |
+| Predicted acceleration | `/target/predicted_accel` | `tracking_circle_target` | Future linear acceleration samples over the planning horizon |
 
-Your target estimator should publish on the following topics. By default, the planner expects:
+## Target Odometry
 
-| Topic | Message Type | Rate | Purpose |
-|---|---|---|---|
-| `/target/odom` | `nav_msgs/msg/Odometry` | Fast (~50-100Hz) | Immediate feedback. Provides the target's current position and velocity. |
-| `/target/predicted_accel` | `trajectory_msgs/msg/MultiDOFJointTrajectory` | Slow (~1-10Hz) | Future prediction. Required by `tracking_circle_target`; planner consumes `header.stamp`, `time_from_start`, and `accelerations[0].linear`. |
-| `/target/accel` | `geometry_msgs/msg/AccelStamped` | Fast (~50-100Hz) | Optional diagnostics stream. Not required by `tracking_circle_target`. |
+Publish `nav_msgs/msg/Odometry` in the planner world frame, normally ENU:
 
----
+| Field | Meaning |
+| --- | --- |
+| `header.stamp` | Measurement time. Use ROS time; do not leave zero unless you intentionally want the planner callback to substitute `now()` |
+| `header.frame_id` | `world` or your local ENU equivalent |
+| `pose.pose.position` | Target position |
+| `pose.pose.orientation` | Target orientation as quaternion |
+| `twist.twist.linear` | Target linear velocity |
+| `twist.twist.angular` | Target angular velocity |
 
-## 1. Setting up the Target Estimator Node
+The planner treats target odom older than about `0.2 s` as stale for OCPs that
+need target feedback.
 
-### The `Odometry` Stream (required) and `AccelStamped` Stream (optional diagnostics)
+## Target Acceleration
 
-These two topics are standard. When you observe the moving target via your Kalman Filter or Motion Capture:
+Publish `geometry_msgs/msg/AccelStamped`:
 
-1. **Stamp properly**: Set `header.stamp = now()`. The planner uses these timestamps to enforce freshness checks. If `now() - stamp > 0.2s`, the planner considers the target "lost" and will pause the solver to hover safely.
-2. **Coordinate Frame**: Set `header.frame_id = "world"` (or your local ENU equivalent).
-3. **Values**: 
-   - `odom.pose.pose.position` -> Target (x, y, z)
-   - `odom.twist.twist.linear` -> Target velocity (vx, vy, vz)
-   - `accel.accel.linear` -> Target acceleration (ax, ay, az)
+| Field | Meaning |
+| --- | --- |
+| `header.stamp` | Acceleration measurement time |
+| `accel.linear` | Target linear acceleration |
+| `accel.angular` | Target angular acceleration, if available |
 
-### The `MultiDOFJointTrajectory` Predicted-Acceleration Stream
+If `accel.angular` is not available, `target_tracker` estimates angular
+acceleration from odometry finite differences and lets this stream override it
+when present.
 
-This is the most critical for dynamic planning. You must predict where the target *will be* over the next few seconds (the planner horizon is roughly 4 seconds). 
+## Predicted Acceleration
 
-Even if you assume constant velocity/acceleration in your estimator, you must explicitly publish this array so the planner can reconstruct future target position/velocity from current target odom plus future acceleration samples.
+`tracking_circle_target` is the only current OCP that requires the predicted
+acceleration stream. It is open-loop only in `planner_node.cpp`.
 
-**Requirements for the Trajectory message:**
-1. Let `N` be the number of predicted points (e.g., 80 to 400).
-2. The `header.stamp` of the message MUST be the absolute ROS time (`t=0` for the prediction).
-3. Populate the `points` array where each point has a `time_from_start` offset.
-4. **Crucial:** Populate `accelerations[0].linear` for each point. This is the field consumed by the `tracking_circle_target` solver path.
-5. `transforms` and `velocities` are currently ignored by `tracking_circle_target` (safe to leave empty for first-pass integration).
+Publish `trajectory_msgs/msg/MultiDOFJointTrajectory`:
 
-#### Minimal C++ Example (publishing a constant-acceleration prediction)
+| Field | Requirement |
+| --- | --- |
+| `header.stamp` | Absolute ROS time for prediction origin |
+| `points[i].time_from_start` | Monotonic offset from `header.stamp` |
+| `points[i].accelerations[0].linear` | Future target acceleration consumed by the planner |
+| `points[i].transforms` | Optional; ignored by the current OCP path |
+| `points[i].velocities` | Optional; ignored by the current OCP path |
+
+The planner stores these samples in a `TargetAccelBuffer` with a nominal `dt`
+computed from the first two trajectory points. The buffer is considered fresh
+for two seconds from `header.stamp`.
+
+Minimal C++ publisher pattern:
 
 ```cpp
 trajectory_msgs::msg::MultiDOFJointTrajectory traj;
-traj.header.stamp = this->now();
+traj.header.stamp = node->now();
 traj.header.frame_id = "world";
 traj.joint_names.push_back("target");
 
-const double dt = 0.05; // 50ms resolution 
-const int N = 100;      // 5 seconds into the future
-
-// Assuming you have current pos (p), vel (v), and accel (a)
-for (int i = 0; i < N; ++i) {
+const double dt = 0.05;
+const int n = 100;
+for (int i = 0; i < n; ++i) {
     trajectory_msgs::msg::MultiDOFJointTrajectoryPoint pt;
     pt.time_from_start = rclcpp::Duration::from_seconds(i * dt);
-    
-    // Constant acceleration integration
-    double t = i * dt;
-    auto pt_pos = p + v*t + 0.5*a*t*t;
-    auto pt_vel = v + a*t;
-    auto pt_acc = a;
-    
-    geometry_msgs::msg::Transform trans;
-    trans.translation.x = pt_pos.x();
-    trans.translation.y = pt_pos.y();
-    trans.translation.z = pt_pos.z();
-    pt.transforms.push_back(trans);
-    
-    geometry_msgs::msg::Twist vel;
-    vel.linear.x = pt_vel.x();
-    vel.linear.y = pt_vel.y();
-    vel.linear.z = pt_vel.z();
-    pt.velocities.push_back(vel);
-    
+
     geometry_msgs::msg::Twist acc;
-    acc.linear.x = pt_acc.x();
-    acc.linear.y = pt_acc.y();
-    acc.linear.z = pt_acc.z();
+    acc.linear.x = ax;
+    acc.linear.y = ay;
+    acc.linear.z = az;
     pt.accelerations.push_back(acc);
-    
+
     traj.points.push_back(pt);
 }
-traj_pub_->publish(traj);
+predicted_accel_pub->publish(traj);
 ```
 
----
+## Relative Drone Odometry
 
-## 2. Planner Safe-Mode Gating Behavior
+The planner can read different drone-state frames depending on the active OCP.
+For real hardware you can either publish these directly from your estimator or
+use `target_publisher` as a development helper.
 
-The planner features a robust state machine when waiting for hardware data.
+| OCP family | Drone state required by planner | Helper output |
+| --- | --- | --- |
+| `hover`, `landing`, `stateswitch`, `tracking_circle_target` | Absolute drone pose/odom | none |
+| `tracking_bodyrate_bf_*` | Target position in drone body frame, relative velocity in body frame, relative attitude | `/drone/body_relative_odom` |
+| `tracking_bodyrate_tf_*` | Drone position/velocity in target frame, relative attitude | `/drone/target_frame_odom` |
 
-**If the OCP needs future target data (e.g., `tracking_circle_target`):**
-1. The planner will power on and immediately check for the `/target/predicted_accel` topic.
-2. If it is empty, or the message's `header.stamp` is older than `2.0` seconds, the planner enters **Wait Mode**. 
-3. The drone will maintain a local position hold (hover), rejecting the open-loop command, and log: `[OpenLoop] IDLE — waiting for /target/predicted_accel...`.
-4. As soon as a fresh trajectory message arrives, the solver fires instantly, initializes the variables, and dispatches the tracking maneuver.
+`target_publisher` creates the helper outputs when launched with
+`drone_odom_mode:=body_frame` or `drone_odom_mode:=target_frame` and supplied
+with `drone_odom_topic` plus `drone_pose_topic`.
 
-This guarantees your drone will never blindly fly into undefined space waiting for a telemetry uplink.
+## Built-In Target Publisher Modes
 
----
+`target_publisher` supports:
 
-## 3. `tracking_circle_target` Interface Contract (Current)
+| `target_mode` | Behavior |
+| --- | --- |
+| `circle` | Synthetic circular target using constants in `include/target/circular_target.hpp` |
+| `qualisys` | Reads `/rigid_bodies`, selects `rigid_body_name`, and finite-differences pose history |
 
-- Solver-side OCP input is `x0_rel + t0_abs + TargetAccelBuffer`.
-- OCP dynamics consume only future target acceleration samples.
-- Planner keeps target pose/velocity from `/target/odom` so it can reconstruct world-frame target motion for command publishing and logging.
-- Reconstruction is interface plumbing, not part of the optimal-control model.
+Runtime parameters currently declared by the node:
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `target_mode` | `circle` | `circle` or `qualisys` |
+| `target_yaw_rate` | `0.3` | Synthetic yaw rate in circle mode |
+| `publish_hz` | `100.0` | Output rate |
+| `frame_id` | `world` | Header frame for target messages |
+| `rigid_body_name` | `stmini` | Qualisys rigid body name |
+| `drone_odom_topic` | `/cf_1/odom` | Drone odom input for helper relative odometry |
+| `drone_pose_topic` | `/cf_1/pose` | Drone pose input for helper relative odometry |
+| `drone_odom_mode` | `none` | `none`, `shifted_world`, `body_frame`, or `target_frame` |
+| `body_relative_input_angular_unit` | `deg_s` | Set `rad_s` if the source odom angular velocity is already radians per second |
+| `debug_body_relative_trace` | `false` | Throttled state conversion logs |
+
+The source comments still mention runtime circle shape parameters, but the
+current implementation does not declare them. Change `include/target/circular_target.hpp`
+or replace the publisher if you need runtime-selectable trajectories.
+
+## Startup and Gating Behavior
+
+For target-tracking OCPs, the planner waits until required streams are fresh
+before solving.
+
+`tracking_circle_target` startup in open loop:
+
+1. Wait for drone state.
+2. Wait for valid target odometry.
+3. Wait for fresh `/target/predicted_accel`.
+4. Solve once.
+5. Reconstruct the world-frame command trajectory from target odom plus the
+   predicted acceleration buffer.
+6. Replay the trajectory, then transition to hover hold.
+
+For body-rate MPC OCPs, stale target data prevents new solves. The replay path
+continues using the last accepted plan until it becomes stale, then the node
+holds/pauses according to the normal MPC stale-plan behavior.

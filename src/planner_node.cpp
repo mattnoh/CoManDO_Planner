@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <sstream>
 #include <array>
+#include <limits>
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
@@ -57,6 +58,14 @@ public:
         hover_thrust_param_ = float(this->get_parameter("hover_thrust").as_double());
         this->declare_parameter("skip_trajectory_validation", false);
         skip_trajectory_validation_ = this->get_parameter("skip_trajectory_validation").as_bool();
+        this->declare_parameter("max_first_solve_age_sec", 1.0);
+        max_first_solve_age_sec_ = this->get_parameter("max_first_solve_age_sec").as_double();
+        this->declare_parameter("max_relative_position_norm", 10.0);
+        max_relative_position_norm_ = this->get_parameter("max_relative_position_norm").as_double();
+        this->declare_parameter("max_relative_vertical_abs", 5.0);
+        max_relative_vertical_abs_ = this->get_parameter("max_relative_vertical_abs").as_double();
+        this->declare_parameter("max_relative_velocity_norm", 8.0);
+        max_relative_velocity_norm_ = this->get_parameter("max_relative_velocity_norm").as_double();
         open_loop_abort_on_divergence_ = runtime_cfg.open_loop_abort_on_divergence;
         open_loop_abort_max_z_error_m_ = runtime_cfg.open_loop_abort_max_z_error_m;
         open_loop_abort_max_vz_error_mps_ = runtime_cfg.open_loop_abort_max_vz_error_mps;
@@ -267,7 +276,8 @@ private:
         }
         const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
         if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::TargetFrameRelative) {
-            return target.position + state.segment(0, 3);
+            const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(target.orientation);
+            return target.position + R_WN * state.segment(0, 3);
         }
         if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyFrameRelative &&
             state.size() >= 10) {
@@ -526,18 +536,16 @@ private:
         return state_monitor_.getCurrentState(platform_);
     }
 
-    // In BodyRelative mode the planner has no world-frame information — state is already
-    // in body frame and must stay that way.  Only AbsoluteMinusTarget OCPs (stateswitch,
-    // tracking_circle*) do the world→relative transform via transform_state at solve time
-    // and store a relative plan that is later re-combined with live target position in
-    // mpcReplayTick.  For BodyRelative mode the state is passed through unchanged.
+    // Convert only sensor states that are explicitly published in shifted coordinates.
+    // Stateswitch receives world-frame drone state and shifts it only inside the OCP
+    // transform_state callback, so adding the live target here would create a bogus
+    // hover/full-state command after terminal freeze.
     Eigen::VectorXd convertStateToAbsoluteFrame(const Eigen::VectorXd& state) const {
-        if (drone_state_is_relative_ || state.size() < state_dim_) {
-            // BodyRelative: return as-is — caller must label the frame correctly.
+        if (drone_state_is_relative_ || state.size() < state_dim_ ||
+            drone_odom_mode_ != OCPDescriptor::DroneOdomMode::AbsoluteShiftedTarget) {
             return state;
         }
 
-        // AbsoluteMinusTarget relative plan: re-add live target position/velocity.
         Eigen::VectorXd x_abs = state;
         const auto [tgt_pos, tgt_vel] = state_monitor_.getTargetPositionVelocity();
         x_abs.segment(0, 3) += tgt_pos;
@@ -570,7 +578,13 @@ private:
                 const Eigen::Vector3d tgt_p = result.target_world_pos_trajectory[i];
                 const Eigen::Vector3d tgt_v = result.target_world_vel_trajectory[i];
                 const Eigen::Vector4d q_NB = s.segment(6, 4);
-                const Eigen::Matrix3d R_WB = Quad6DOFVarTime<double>::calcC(q_NB);
+                const double t_node = stateNodeTime(s, i);
+                const Eigen::AngleAxisd yaw_step(
+                    result.target_snapshot_omega.z() * t_node, Eigen::Vector3d::UnitZ());
+                const Eigen::Matrix3d R_WN =
+                    Quad6DOFVarTime<double>::calcC(result.target_snapshot_quat) *
+                    yaw_step.toRotationMatrix();
+                const Eigen::Matrix3d R_WB = R_WN * Quad6DOFVarTime<double>::calcC(q_NB);
                 const Eigen::Vector3d p_T_B = s.segment(0, 3);
                 const Eigen::Vector3d v_rel_B = s.segment(3, 3);
 
@@ -592,8 +606,22 @@ private:
                 if (s.size() < state_dim_) {
                     continue;
                 }
-                s.segment(0, 3) += result.target_world_pos_trajectory[i];
-                s.segment(3, 3) += result.target_world_vel_trajectory[i];
+                if (drone_odom_mode_ == OCPDescriptor::DroneOdomMode::TargetFrameRelative) {
+                    const double t_node = stateNodeTime(s, i);
+                    const Eigen::AngleAxisd yaw_step(
+                        result.target_snapshot_omega.z() * t_node, Eigen::Vector3d::UnitZ());
+                    const Eigen::Matrix3d R_WN =
+                        Quad6DOFVarTime<double>::calcC(result.target_snapshot_quat) *
+                        yaw_step.toRotationMatrix();
+                    const Eigen::Vector3d p_N = s.segment(0, 3);
+                    const Eigen::Vector3d v_N = s.segment(3, 3);
+                    s.segment(0, 3) = result.target_world_pos_trajectory[i] + R_WN * p_N;
+                    s.segment(3, 3) = result.target_world_vel_trajectory[i] +
+                                      R_WN * (v_N + result.target_snapshot_omega.cross(p_N));
+                } else {
+                    s.segment(0, 3) += result.target_world_pos_trajectory[i];
+                    s.segment(3, 3) += result.target_world_vel_trajectory[i];
+                }
             }
             return traj_abs;
         }
@@ -680,6 +708,10 @@ private:
         core_cfg.terminal_state = terminal_state_;
         core_cfg.body_relative_odom_topic = body_relative_odom_topic_;
         core_cfg.target_frame_odom_topic = target_frame_odom_topic_;
+        core_cfg.max_first_solve_age_sec = max_first_solve_age_sec_;
+        core_cfg.max_relative_position_norm = max_relative_position_norm_;
+        core_cfg.max_relative_vertical_abs = max_relative_vertical_abs_;
+        core_cfg.max_relative_velocity_norm = max_relative_velocity_norm_;
         planner_core_.configure(core_cfg);
         planner_core_configured_ = true;
     }
@@ -765,14 +797,12 @@ private:
             [this](const auto& x, const auto& u) { publishCommandAbsolute(x, u); }
         );
         if (ocp_active_.load()) {
-            const Eigen::VectorXd x_now = x_now_abs;
-            Eigen::VectorXd x_hold = (paused_hover_state_.size() >= state_dim_)
-                ? paused_hover_state_
-                : hover_controller::makeHoverState(x_now, state_dim_, custom_make_hover_state_);
-            Eigen::VectorXd u_hover = hover_controller::makeHoverControl(mass_kg_);
-            const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
-            logger_.logActualState(x_now, -1, tgt_pos_now, tgt_vel_now, "absolute");
-            logger_.logCommandedState(x_hold, u_hover, -1);
+            planner_logging::SolverEventLogRow row;
+            row.solve_num = -1;
+            row.event = "stale";
+            row.reason = "paused_hover_hold_tick";
+            row.coord_mode = "absolute";
+            logger_.logSolverEvent(row);
         }
     }
 
@@ -820,10 +850,34 @@ private:
                     return (it == d.values.end()) ? 0.0 : it->second;
                 };
                 RCLCPP_INFO(this->get_logger(),
-                    "[handoff] solve %.0f -> %.0f age=%.3fs latency=%.3fs state_jump=%.4f control_jump=%.4f",
+                    "[handoff] solve %.0f -> %.0f age=%.3fs latency=%.3fs state_jump=%.4f control_jump=%.4f hover_z_jump=%.4f",
                     value("previous_solve_num"), value("new_solve_num"),
                     value("active_plan_age_sec"), value("solve_latency_sec"),
-                    value("state_jump_norm"), value("control_jump_norm"));
+                    value("state_jump_norm"), value("control_jump_norm"),
+                    value("hover_z_jump"));
+                continue;
+            }
+            if (d.code == "solve_rejected") {
+                const auto value = [&](const char* key) {
+                    const auto it = d.values.find(key);
+                    return (it == d.values.end()) ? 0.0 : it->second;
+                };
+                RCLCPP_WARN(this->get_logger(),
+                    "[PlannerCore][solve_rejected] %s solve=%.1fms constraint=%.3g "
+                    "max_rel_p=%.3f(node %.0f)/limit %.3f max_rel_z=%.3f(node %.0f)/limit %.3f "
+                    "max_rel_v=%.3f(node %.0f)/limit %.3f",
+                    d.message.c_str(),
+                    value("solve_time_ms"),
+                    value("constraint_error"),
+                    value("max_relative_position_norm"),
+                    value("max_relative_position_node"),
+                    value("relative_position_limit"),
+                    value("max_relative_vertical_abs"),
+                    value("max_relative_vertical_node"),
+                    value("relative_vertical_limit"),
+                    value("max_relative_velocity_norm"),
+                    value("max_relative_velocity_node"),
+                    value("relative_velocity_limit"));
                 continue;
             }
             if (d.severity == planner_core::DiagnosticSeverity::Error) {
@@ -838,6 +892,24 @@ private:
             }
             (void)diagnosticSeverityName(d.severity);
         }
+    }
+
+    bool ensureLoggingInitialized() {
+        if (!logging_enabled_) {
+            return false;
+        }
+        if (logging_initialized_) {
+            return true;
+        }
+        if (!is_configured_ || ocp_type_.empty() || mode_.empty()) {
+            return false;
+        }
+        auto dec = OCPRegistry::getDescriptor(ocp_type_);
+        logging_initialized_ = logger_.initialize(
+            drone_name_, ocp_type_, mode_, solver_type_, this->get_logger(), mass_kg_,
+            state_dim_, dec.state_names, dec.control_names, dec.log_state_headers,
+            command_mode_, dec.extract_actual_state_row);
+        return logging_initialized_;
     }
 
     void publishDebugMarkers(const planner_core::PlannerCommand& command,
@@ -968,6 +1040,128 @@ private:
         return meta;
     }
 
+    static double diagnosticValue(const planner_core::PlannerDiagnostic& d,
+                                  const std::string& key,
+                                  double fallback = std::numeric_limits<double>::quiet_NaN()) {
+        const auto it = d.values.find(key);
+        return (it == d.values.end()) ? fallback : it->second;
+    }
+
+    static const planner_core::PlannerDiagnostic* findDiagnostic(
+        const std::vector<planner_core::PlannerDiagnostic>& diagnostics,
+        const std::string& code) {
+        for (const auto& d : diagnostics) {
+            if (d.code == code) {
+                return &d;
+            }
+        }
+        return nullptr;
+    }
+
+    void logSolverEvents(const planner_core::PlannerCoreStepResult& result) {
+        if (!logging_enabled_ || !logging_initialized_) {
+            return;
+        }
+
+        auto coord_mode = [&]() -> std::string {
+            if (!result.solve_log.coord_mode.empty()) {
+                return result.solve_log.coord_mode;
+            }
+            return currentFrameLabel();
+        };
+
+        if (result.solve_accepted) {
+            planner_logging::SolverEventLogRow row;
+            row.solve_num = result.solve_num;
+            row.event = "accepted";
+            row.coord_mode = coord_mode();
+            row.x0_source = result.x0_source;
+            row.solve_time_ms = result.solve_result.solve_time_ms;
+            row.solve_iters = static_cast<double>(result.solve_result.solve_iters);
+            row.constraint_error = result.solve_result.constraint_error;
+            row.active_elapsed_now_sec = result.active_elapsed_now_sec;
+            row.activation_elapsed_sec = result.activation_elapsed_sec;
+            row.activation_wall_time_sec = result.activation_wall_time_sec;
+            row.solve_lead_sec = result.solve_lead_sec;
+            row.solve_finish_late_by_sec = result.solve_finish_late_by_sec;
+            row.handoff_pos_err = result.handoff_pos_err;
+            row.handoff_vel_err = result.handoff_vel_err;
+            row.replan_delay_sec = result.replan_delay_sec;
+            logger_.logSolverEvent(row);
+        } else if (result.solve_attempted) {
+            planner_logging::SolverEventLogRow row;
+            row.solve_num = result.solve_num;
+            row.event = "rejected";
+            row.reason = result.rejection_reason;
+            row.coord_mode = coord_mode();
+            row.x0_source = result.x0_source;
+            row.solve_time_ms = result.solve_result.solve_time_ms;
+            row.solve_iters = static_cast<double>(result.solve_result.solve_iters);
+            row.constraint_error = result.solve_result.constraint_error;
+            row.active_elapsed_now_sec = result.active_elapsed_now_sec;
+            row.activation_elapsed_sec = result.activation_elapsed_sec;
+            row.activation_wall_time_sec = result.activation_wall_time_sec;
+            row.solve_lead_sec = result.solve_lead_sec;
+            row.solve_finish_late_by_sec = result.solve_finish_late_by_sec;
+            row.handoff_pos_err = result.handoff_pos_err;
+            row.handoff_vel_err = result.handoff_vel_err;
+            if (const auto* d = findDiagnostic(result.diagnostics, "solve_rejected")) {
+                row.extra_values = d->values;
+            }
+            logger_.logSolverEvent(row);
+        }
+
+        for (const auto& d : result.diagnostics) {
+            if (d.code != "handoff_recovery_live") {
+                continue;
+            }
+            planner_logging::SolverEventLogRow row;
+            row.solve_num = result.solve_num;
+            row.event = "recovery";
+            row.reason = d.message;
+            row.coord_mode = coord_mode();
+            row.x0_source = result.x0_source;
+            row.handoff_pos_err = diagnosticValue(d, "handoff_pos_err_now");
+            row.handoff_vel_err = diagnosticValue(d, "handoff_vel_err_now");
+            row.activation_elapsed_sec = diagnosticValue(d, "activation_elapsed");
+            row.extra_values = d.values;
+            logger_.logSolverEvent(row);
+        }
+    }
+
+    void logReplaySolverEvents(const planner_core::PlannerCoreStepResult& replay) {
+        if (!logging_enabled_ || !logging_initialized_) {
+            return;
+        }
+        if (replay.stale) {
+            planner_logging::SolverEventLogRow row;
+            row.solve_num = replay.solve_num;
+            row.event = "stale";
+            row.reason = "trajectory_stale";
+            row.coord_mode = currentFrameLabel();
+            if (const auto* d = findDiagnostic(replay.diagnostics, "trajectory_stale")) {
+                row.extra_values = d->values;
+            }
+            logger_.logSolverEvent(row);
+        }
+        for (const auto& d : replay.diagnostics) {
+            if (d.code != "handoff") {
+                continue;
+            }
+            planner_logging::SolverEventLogRow row;
+            row.solve_num = static_cast<int>(diagnosticValue(d, "new_solve_num", replay.solve_num));
+            row.event = "handoff";
+            row.reason = d.message;
+            row.coord_mode = currentFrameLabel();
+            row.state_jump_norm = diagnosticValue(d, "state_jump_norm");
+            row.control_jump_norm = diagnosticValue(d, "control_jump_norm");
+            row.hover_z_jump = diagnosticValue(d, "hover_z_jump");
+            row.solve_time_ms = diagnosticValue(d, "solve_latency_sec") * 1000.0;
+            row.extra_values = d.values;
+            logger_.logSolverEvent(row);
+        }
+    }
+
     rcl_interfaces::msg::SetParametersResult onSetParameters(
     const std::vector<rclcpp::Parameter>& params) {
         std::lock_guard<std::mutex> lk(command_mutex_);
@@ -1080,6 +1274,7 @@ private:
                 ocp_type_.c_str(), mode_.c_str(), n_replay_,
                 hover_target_.x(), hover_target_.y(), hover_target_.z(), mass_kg_,
                 commandModeName(command_mode_));
+            ensureLoggingInitialized();
             RCLCPP_INFO(this->get_logger(),
                 "Profile applied. Set command_seq to start this command.");
         }
@@ -1174,21 +1369,17 @@ private:
             if (platform_ == "mavros") {
                 platform::mavros::markArmed(mavros_handles_);
             }
-            if (logging_enabled_ && !logging_initialized_) {
-                auto dec = OCPRegistry::getDescriptor(ocp_type_);
-                logging_initialized_ = logger_.initialize(
-                    drone_name_, ocp_type_, mode_, solver_type_, this->get_logger(), mass_kg_,
-                    state_dim_, dec.state_names, dec.control_names, dec.log_state_headers,
-                    command_mode_, dec.extract_actual_state_row);
-            }
+            ensureLoggingInitialized();
         }
 
         auto core_result = planner_core_.trySolve(makeCoreInput(x0_abs, target_snapshot));
         if (!core_result.diagnostics.empty() &&
             core_result.rejection_reason != "waiting_for_handoff_time" &&
+            core_result.rejection_reason != "waiting_for_pending_handoff" &&
             core_result.rejection_reason != "terminal_freeze_active") {
             logCoreDiagnostics(core_result.diagnostics);
         }
+        logSolverEvents(core_result);
         if (!core_result.solve_accepted) {
             if (core_result.terminal_freeze_engaged) {
                 terminal_freeze_.store(true);
@@ -1204,7 +1395,7 @@ private:
         last_replan_delay_sec_ = core_result.replan_delay_sec;
 
         RCLCPP_INFO(this->get_logger(),
-            "[RH %d] %.1fms iters=%d x0=[%.3f,%.3f,%.3f] source=%s handoff_err(p=%.3f,v=%.3f) replan_delay=%.3fs",
+            "[RH %d] %.1fms iters=%d x0=[%.3f,%.3f,%.3f] source=%s handoff_err(p=%.3f,v=%.3f) active=%.3fs activation=%.3fs activation_wall=%.3fs lead=%.3fs late=%.3fs replan_delay=%.3fs",
             core_result.solve_num,
             core_result.solve_result.solve_time_ms,
             core_result.solve_result.solve_iters,
@@ -1214,6 +1405,11 @@ private:
             core_result.x0_source.c_str(),
             core_result.handoff_pos_err,
             core_result.handoff_vel_err,
+            core_result.active_elapsed_now_sec,
+            core_result.activation_elapsed_sec,
+            core_result.activation_wall_time_sec,
+            core_result.solve_lead_sec,
+            core_result.solve_finish_late_by_sec,
             last_replan_delay_sec_);
 
         is_primed_.store(true);
@@ -1248,12 +1444,9 @@ private:
             return;
         }
         logCoreDiagnostics(replay.diagnostics);
+        logReplaySolverEvents(replay);
 
         replay_ticks_since_solve_.fetch_add(1);
-
-        const int active_solve_num = replay.solve_num;
-        const Eigen::VectorXd x_cmd = replay.command.state;
-        const Eigen::VectorXd u_cmd = replay.command.control;
 
         if (replay.stale) {
             ++stale_warning_count_;
@@ -1270,28 +1463,6 @@ private:
 
         publishCommand(replay.command);
         publishDebugMarkers(replay.command, replay.diagnostics);
-
-        if (logging_enabled_ && logging_initialized_) {
-            // Always log the raw sensor state (13D from cf_1 topics) regardless of
-            // OCP mode. For body-relative OCPs this is still the 13D physical state
-            // [p_T_body, v_rel_body, q_NB, omega_B] as published by target_publisher.
-            // convertStateToAbsoluteFrame is NOT applied so the log is consistent
-            // with the sensor input, and the coord_mode label tells downstream tools
-            // how to interpret it.
-            const Eigen::VectorXd act_raw = getCurrentState();
-            const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
-            logger_.logActualState(act_raw, active_solve_num, tgt_pos_now, tgt_vel_now,
-                                   currentFrameLabel());
-            if (command_mode_ == OCPDescriptor::CommandMode::CmdFullState) {
-                logger_.logCommandedState(x_cmd, u_cmd, active_solve_num);
-            } else {
-                if (replay.command.kind == planner_core::CommandKind::Hover) {
-                    logger_.logCommandedHoverState(hoverArray(replay.command.hover), active_solve_num);
-                } else {
-                    logger_.logCommandedBodyRateState(u_cmd, active_solve_num);
-                }
-            }
-        }
     }
 
     bool validateTrajectory(const std::vector<Eigen::VectorXd>& X, const std::vector<Eigen::VectorXd>& U) {
@@ -1533,6 +1704,15 @@ private:
                 }
 
                 logger_.logSolveTrajectory(ol_ref_X_, ol_ref_U_, meta);
+                planner_logging::SolverEventLogRow row;
+                row.solve_num = 0;
+                row.event = "accepted";
+                row.reason = "open_loop";
+                row.coord_mode = meta.coord_mode;
+                row.solve_time_ms = result.solve_time_ms;
+                row.solve_iters = static_cast<double>(result.solve_iters);
+                row.constraint_error = result.constraint_error;
+                logger_.logSolverEvent(row);
             }
         }
         publishTrajectory(makeTrajectoryForPublishing(result));
@@ -1600,26 +1780,6 @@ private:
         last_target_snapshot_ = getTargetSnapshot();
         publishCommand(x_cmd, u_cmd);
 
-        if (logging_enabled_ && logging_initialized_) {
-            const Eigen::VectorXd act = drone_state_is_relative_
-                ? getCurrentState()
-                : convertStateToAbsoluteFrame(getCurrentState());
-            const auto [tgt_pos_now, tgt_vel_now] = state_monitor_.getTargetPositionVelocity();
-            logger_.logActualState(act, 0, tgt_pos_now, tgt_vel_now, currentFrameLabel());
-            if (command_mode_ == OCPDescriptor::CommandMode::CmdFullState) {
-                logger_.logCommandedState(x_cmd, u_cmd, 0);
-            } else {
-                const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
-                const auto cmd = planner_core::makePlannerCommand(
-                    corePlatform(), desc, x_cmd, u_cmd, last_target_snapshot_);
-                if (cmd.kind == planner_core::CommandKind::Hover) {
-                    logger_.logCommandedHoverState(hoverArray(cmd.hover), 0);
-                } else {
-                    logger_.logCommandedBodyRateState(u_cmd, 0);
-                }
-            }
-        }
-
         ++ol_replay_step_;
     }
 
@@ -1657,6 +1817,10 @@ private:
     int n_replay_ = 4;
     double max_constraint_error_ = 1.0;
     bool skip_trajectory_validation_ = false;
+    double max_first_solve_age_sec_ = 1.0;
+    double max_relative_position_norm_ = 10.0;
+    double max_relative_vertical_abs_ = 5.0;
+    double max_relative_velocity_norm_ = 8.0;
     OCPDescriptor::CommandMode command_mode_ = OCPDescriptor::CommandMode::CmdFullState;
     int state_dim_ = 13;
     int control_dim_ = 4;

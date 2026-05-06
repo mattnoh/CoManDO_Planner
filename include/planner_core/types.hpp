@@ -378,6 +378,14 @@ struct PlannerCoreConfig {
     Eigen::VectorXd terminal_state;
     std::string body_relative_odom_topic = "/drone/body_relative_odom";
     std::string target_frame_odom_topic = "/drone/target_frame_odom";
+    double solve_lead_guard_sec = 0.05;
+    double initial_solve_lead_sec = 0.20;
+    double recovery_pos_err = 0.50;
+    double recovery_vel_err = 2.00;
+    double max_first_solve_age_sec = 1.00;
+    double max_relative_position_norm = 10.0;
+    double max_relative_vertical_abs = 5.0;
+    double max_relative_velocity_norm = 8.0;
 };
 
 struct PlannerCoreInput {
@@ -420,6 +428,11 @@ struct PlannerCoreStepResult {
     double handoff_pos_err = 0.0;
     double handoff_vel_err = 0.0;
     double replan_delay_sec = 0.0;
+    double active_elapsed_now_sec = 0.0;
+    double activation_elapsed_sec = 0.0;
+    double activation_wall_time_sec = 0.0;
+    double solve_lead_sec = 0.0;
+    double solve_finish_late_by_sec = 0.0;
     int solve_num = -1;
     SolverResult solve_result;
     PlannerPath path;

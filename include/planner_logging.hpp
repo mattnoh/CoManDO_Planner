@@ -4,7 +4,6 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include "planner_core/types.hpp"
-#include "platform/crazyflie.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -12,6 +11,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -42,6 +42,29 @@ struct SolveLogMeta {
     std::vector<Eigen::Vector3d> target_world_vel_trajectory;
 };
 
+struct SolverEventLogRow {
+    int solve_num = -1;
+    std::string event;
+    std::string reason;
+    std::string coord_mode;
+    std::string x0_source;
+    double solve_time_ms = std::numeric_limits<double>::quiet_NaN();
+    double solve_iters = std::numeric_limits<double>::quiet_NaN();
+    double constraint_error = std::numeric_limits<double>::quiet_NaN();
+    double active_elapsed_now_sec = std::numeric_limits<double>::quiet_NaN();
+    double activation_elapsed_sec = std::numeric_limits<double>::quiet_NaN();
+    double activation_wall_time_sec = std::numeric_limits<double>::quiet_NaN();
+    double solve_lead_sec = std::numeric_limits<double>::quiet_NaN();
+    double solve_finish_late_by_sec = std::numeric_limits<double>::quiet_NaN();
+    double handoff_pos_err = std::numeric_limits<double>::quiet_NaN();
+    double handoff_vel_err = std::numeric_limits<double>::quiet_NaN();
+    double replan_delay_sec = std::numeric_limits<double>::quiet_NaN();
+    double state_jump_norm = std::numeric_limits<double>::quiet_NaN();
+    double control_jump_norm = std::numeric_limits<double>::quiet_NaN();
+    double hover_z_jump = std::numeric_limits<double>::quiet_NaN();
+    std::map<std::string, double> extra_values;
+};
+
 class CsvLogger {
 public:
     /// Initialize logger.
@@ -65,12 +88,13 @@ public:
             return true;
         }
 
+        (void)log_state_headers;
+        (void)command_mode;
+        (void)extract_actual_state;
         mass_kg_      = mass_kg;
         state_dim_    = state_dim;
         state_names_  = state_names;
         control_names_ = control_names;
-        command_mode_ = command_mode;
-        extract_actual_state_row_ = extract_actual_state;
 
         auto now = std::chrono::system_clock::now();
         auto t = std::chrono::system_clock::to_time_t(now);
@@ -115,47 +139,21 @@ public:
                            << ",tgt_alfx,tgt_alfy,tgt_alfz\n";
         }
 
-        // ── commanded_state.csv (CmdFullState only) ──────────────────────────
-        commanded_state_log_.open(folder + "/commanded_state.csv");
-        if (commanded_state_log_.is_open()) {
-            commanded_state_log_ << "timestamp,solve_num";
-            if (!log_state_headers.empty() && log_state_headers.size() >= static_cast<size_t>(state_dim_)) {
-                for (int i = 0; i < state_dim_; ++i) commanded_state_log_ << "," << log_state_headers[i];
-            } else {
-                for (int i = 0; i < state_dim_; ++i) commanded_state_log_ << ",x" << i;
-            }
-            commanded_state_log_ << ",fz,mx,my,mz,acc_x,acc_y,acc_z\n";
-        }
-
-        // ── commanded_hover_state.csv (CmdBodyRate + platform=crazyflie) ────────
-        commanded_hover_log_.open(folder + "/commanded_hover_state.csv");
-        if (commanded_hover_log_.is_open()) {
-            commanded_hover_log_
-                << "timestamp,solve_num,vx,vy,z_distance,yaw_rate\n";
-        }
-
-        // ── commanded_bodyrate_state.csv (CmdBodyRate + platform=mavros) ─
-        commanded_bodyrate_log_.open(folder + "/commanded_bodyrate_state.csv");
-        if (commanded_bodyrate_log_.is_open()) {
-            commanded_bodyrate_log_
-                << "timestamp,solve_num,T_ms2,omega_x,omega_y,omega_z\n";
-        }
-
-        // ── actual_state.csv ─────────────────────────────────────────────────
-        actual_state_log_.open(folder + "/actual_state.csv");
-        if (actual_state_log_.is_open()) {
-            actual_state_log_ << "timestamp,solve_num,coord_mode";
-            for (const auto& h : log_state_headers) {
-                actual_state_log_ << "," << h;
-            }
-            actual_state_log_ << "\n";
+        // ── solver_events.csv ────────────────────────────────────────────────
+        solver_events_log_.open(folder + "/solver_events.csv");
+        if (solver_events_log_.is_open()) {
+            solver_events_log_
+                << "timestamp,solve_num,event,reason,coord_mode,x0_source"
+                << ",solve_time_ms,solve_iters,constraint_error"
+                << ",active_elapsed_now_sec,activation_elapsed_sec,activation_wall_time_sec"
+                << ",solve_lead_sec,solve_finish_late_by_sec"
+                << ",handoff_pos_err,handoff_vel_err,replan_delay_sec"
+                << ",state_jump_norm,control_jump_norm,hover_z_jump"
+                << ",extra_values\n";
         }
 
         initialized_ = all_solves_log_.is_open() &&
-                       commanded_state_log_.is_open() &&
-                       commanded_hover_log_.is_open() &&
-                       commanded_bodyrate_log_.is_open() &&
-                       actual_state_log_.is_open();
+                       solver_events_log_.is_open();
         RCLCPP_INFO(ros_logger, "Logging to: %s", folder.c_str());
         return initialized_;
     }
@@ -256,88 +254,36 @@ public:
         all_solves_log_.flush();
     }
 
-    void logActualState(const Eigen::VectorXd& state,
-                        int solve_num,
-                        const Eigen::Vector3d& target_pos = Eigen::Vector3d::Zero(),
-                        const Eigen::Vector3d& target_vel = Eigen::Vector3d::Zero(),
-                        const std::string& coord_mode = "absolute") {
+    void logSolverEvent(const SolverEventLogRow& row) {
         std::lock_guard<std::mutex> lk(mutex_);
-        if (!initialized_ || !actual_state_log_.is_open()) {
+        if (!initialized_ || !solver_events_log_.is_open()) {
             return;
         }
 
-        actual_state_log_ << std::fixed << std::setprecision(6)
-                          << wallTimeSec() << "," << solve_num << "," << coord_mode;
-
-        if (extract_actual_state_row_) {
-            TargetSnapshot ts;
-            ts.position = target_pos;
-            ts.velocity = target_vel;
-            auto row = extract_actual_state_row_(state, ts, coord_mode);
-            for (double v : row) {
-                actual_state_log_ << "," << v;
-            }
-        }
-        actual_state_log_ << "\n";
-        actual_state_log_.flush();
-    }
-
-    /// Log hover command [vx, vy, z_cmd, yaw_rate] (CmdBodyRate + platform=crazyflie).
-    void logCommandedHoverState(const std::array<float, 4>& cmd, int solve_num) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (!initialized_ || !commanded_hover_log_.is_open()) {
-            return;
-        }
-        commanded_hover_log_ << std::fixed << std::setprecision(6)
-                             << wallTimeSec() << "," << solve_num << ","
-                             << cmd[0] << "," << cmd[1] << ","
-                             << cmd[2] << "," << cmd[3] << "\n";
-        commanded_hover_log_.flush();
-    }
-
-    /// Log body-rate command [T_ms2, ωx, ωy, ωz] (CmdBodyRate + platform=mavros).
-    void logCommandedBodyRateState(const Eigen::VectorXd& u, int solve_num) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (!initialized_ || !commanded_bodyrate_log_.is_open()) return;
-        commanded_bodyrate_log_ << std::fixed << std::setprecision(6)
-                                << wallTimeSec() << "," << solve_num << ","
-                                << (u.size() > 0 ? u(0) : 0.0) << ","   // T_ms2
-                                << (u.size() > 1 ? u(1) : 0.0) << ","   // omega_x
-                                << (u.size() > 2 ? u(2) : 0.0) << ","   // omega_y
-                                << (u.size() > 3 ? u(3) : 0.0)          // omega_z
-                                << "\n";
-        commanded_bodyrate_log_.flush();
-    }
-
-    /// Log full commanded state (CmdFullState mode only — skipped if CmdHover).
-    void logCommandedState(const Eigen::VectorXd& state, const Eigen::VectorXd& control, int solve_num) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (!initialized_ || !commanded_state_log_.is_open()) {
-            return;
-        }
-        if (command_mode_ != OCPDescriptor::CommandMode::CmdFullState) {
-            return;  // self-filter: only write for CmdFullState OCPs
-        }
-
-        const double fz = (control.size() >= 1) ? control(0) : 0.0;
-        const Eigen::Vector3d acc = platform::crazyflie::computeAcc(state, fz, mass_kg_);
-
-        commanded_state_log_ << std::fixed << std::setprecision(6)
-                             << wallTimeSec() << "," << solve_num;
-        for (int i = 0; i < state_dim_; ++i) {
-            commanded_state_log_ << "," << state(i);
-        }
-        if (control.size() >= 4) {
-            commanded_state_log_ << ","
-                                 << control(0) << ","
-                                 << control(1) << ","
-                                 << control(2) << ","
-                                 << control(3);
-        } else {
-            commanded_state_log_ << ",0,0,0,0";
-        }
-        commanded_state_log_ << "," << acc.x() << "," << acc.y() << "," << acc.z() << "\n";
-        commanded_state_log_.flush();
+        solver_events_log_ << std::fixed << std::setprecision(6)
+                           << wallTimeSec() << ","
+                           << row.solve_num << ","
+                           << csvEscape(row.event) << ","
+                           << csvEscape(row.reason) << ","
+                           << csvEscape(row.coord_mode) << ","
+                           << csvEscape(row.x0_source) << ","
+                           << row.solve_time_ms << ","
+                           << row.solve_iters << ","
+                           << row.constraint_error << ","
+                           << row.active_elapsed_now_sec << ","
+                           << row.activation_elapsed_sec << ","
+                           << row.activation_wall_time_sec << ","
+                           << row.solve_lead_sec << ","
+                           << row.solve_finish_late_by_sec << ","
+                           << row.handoff_pos_err << ","
+                           << row.handoff_vel_err << ","
+                           << row.replan_delay_sec << ","
+                           << row.state_jump_norm << ","
+                           << row.control_jump_norm << ","
+                           << row.hover_z_jump << ","
+                           << csvEscape(formatExtraValues(row.extra_values))
+                           << "\n";
+        solver_events_log_.flush();
     }
 
 private:
@@ -346,20 +292,39 @@ private:
         return std::chrono::duration<double>(SteadyClock::now().time_since_epoch()).count();
     }
 
+    static std::string csvEscape(const std::string& s) {
+        if (s.find_first_of(",\"\n\r") == std::string::npos) {
+            return s;
+        }
+        std::string out = "\"";
+        for (char c : s) {
+            if (c == '"') out += "\"\"";
+            else out += c;
+        }
+        out += "\"";
+        return out;
+    }
+
+    static std::string formatExtraValues(const std::map<std::string, double>& values) {
+        std::ostringstream ss;
+        bool first = true;
+        for (const auto& [key, value] : values) {
+            if (!first) ss << ";";
+            first = false;
+            ss << key << "=" << value;
+        }
+        return ss.str();
+    }
+
     mutable std::mutex mutex_;
     bool initialized_ = false;
     double mass_kg_ = 0.0282;
     int state_dim_ = 13;
     std::vector<std::string> state_names_;
     std::vector<std::string> control_names_;
-    OCPDescriptor::CommandMode command_mode_ = OCPDescriptor::CommandMode::CmdFullState;
-    std::function<std::vector<double>(const Eigen::VectorXd&, const TargetSnapshot&, const std::string&)> extract_actual_state_row_;
     std::string log_folder_;
     std::ofstream all_solves_log_;
-    std::ofstream commanded_state_log_;
-    std::ofstream commanded_hover_log_;
-    std::ofstream commanded_bodyrate_log_;
-    std::ofstream actual_state_log_;
+    std::ofstream solver_events_log_;
 };
 
 }  // namespace planner_logging

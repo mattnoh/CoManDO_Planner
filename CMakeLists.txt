@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.10)
 project(comando_planner)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -165,6 +169,11 @@ target_link_libraries(test_stateswitch_predictor
   planner_core
 )
 
+if(BUILD_TESTING)
+  add_test(NAME test_trajectory_replayer COMMAND test_trajectory_replayer)
+  add_test(NAME test_planner_core COMMAND test_planner_core)
+endif()
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner
@@ -187,6 +196,7 @@ install(DIRECTORY rviz/
 
 install(PROGRAMS
     scripts/test_bodyrate_cmd.py
+    logs/plot_bag_circle.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

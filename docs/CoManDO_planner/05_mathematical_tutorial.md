@@ -1,89 +1,146 @@
-# Chapter 5: Relative Dynamics & Intercept Math
+# Chapter 5: Frames, Relative Dynamics, and Tracking Math
 
-This tutorial explains the **Relative Mathematical Model** used by the CoManDO Planner for dynamic target tracking and intercept maneuvers. Understanding the transition from absolute to relative frames is key to achieving precision intercepts.
+The planner supports several OCP state frames. The descriptor's
+`drone_odom_mode`, `transform_state`, and command adapter define how measured
+state becomes an OCP state and how replay state becomes a platform command.
 
----
+## Absolute 13D State
 
-## 1. Relative State Representation ($x_{rel}$)
+Absolute OCPs use the world-frame drone state:
 
-For dynamic maneuvers like `stateswitch` or `tracking_circle`, the planner works in a **Target-Relative Frame**. This simplifies the problem by treating the target as the origin of the world.
+```text
+x = [p_W, v_W, q_WB, omega_B]
+```
 
-### 1.1 The Relative Vector
-The relative state $x_{rel} \in \mathbb{R}^{13}$ (or $\mathbb{R}^{14}$ in variable-time OCPs) is defined as:
+where:
 
-$$
-x_{rel} = \begin{bmatrix} p_{rel} \\ v_{rel} \\ q \\ \omega \end{bmatrix} = \begin{bmatrix} p_{drone} - p_{target} \\ v_{drone} - v_{target} \\ q_{BW} \\ \omega_{body} \end{bmatrix}
-$$
+| Segment | Meaning |
+| --- | --- |
+| `p_W` | Drone position in world/ENU |
+| `v_W` | Drone velocity in world/ENU |
+| `q_WB` | Quaternion stored as `[qw, qx, qy, qz]` |
+| `omega_B` | Body angular velocity in rad/s |
 
-- **$p_{rel}$**: Relative position (the vector from target to drone).
-- **$v_{rel}$**: Relative velocity (the rate at which the distance is changing).
-- **$q_{BW}$**: The drone's attitude remains in the **Absolute World Frame** to keep gravity alignment simple.
+The translational acceleration model is:
 
----
+```text
+v_dot = R(q) * [0, 0, fz / m] + [0, 0, -g]
+```
 
-## 2. Relative System Dynamics
+## Target-Relative Absolute Form
 
-The dynamics of the drone in the relative frame must account for the **Target's Acceleration**.
+`stateswitch` and `tracking_circle_target` read absolute drone state and target
+state, then subtract target position and velocity before solving:
 
-### 2.1 The Relative Equation of Motion
-$$
-\dot{p}_{rel} = v_{rel}
-$$
-$$
-\dot{v}_{rel} = \dot{v}_{drone} - \dot{v}_{target}
-$$
+```text
+p_rel = p_drone - p_target
+v_rel = v_drone - v_target
+```
 
-Expanding the drone's acceleration (from Chapter 3/5):
-$$
-\dot{v}_{rel} = \left( \frac{1}{m} R(q) f_{body} + \mathbf{g} \right) - \mathbf{a}_{target}(t)
-$$
+Attitude and angular velocity remain drone attitude/rate. Target acceleration is
+provided to the OCP through the target snapshot or an acceleration buffer.
 
-- **$\mathbf{a}_{target}(t)$**: This is the most critical term. It represents the acceleration of the moving platform. 
-- If the target is stationary (landing), $a_{target} = 0$, and the equations reduce to standard absolute dynamics.
-- If the target is moving in a circle, $a_{target}$ is the centripetal acceleration.
+The relative acceleration relation is:
 
----
+```text
+v_rel_dot = v_drone_dot - a_target
+```
 
-## 3. Variable-Time OCPs ($x \in \mathbb{R}^{14}$)
+After solving, replay commands must be reconstructed into world coordinates:
 
-Some OCPs (like `tracking_circle`) don't just optimize thrust; they optimize **Time** itself. These use an augmented 14-dimensional state.
+```text
+p_cmd_world = p_cmd_rel + p_target(t)
+v_cmd_world = v_cmd_rel + v_target(t)
+```
 
-### 3.1 The 14th State: $\theta$
-In these problems, the time-step $\Delta t$ is treated as a decision variable $\theta$.
+`stateswitch` uses the target snapshot and a zero-jerk predictor built from
+position, velocity, and acceleration. `tracking_circle_target` uses the current
+target odometry plus `/target/predicted_accel` integration.
 
-- **Decision Variable**: $u_{14} = \theta$ (The duration of the current step).
-- **Time Evolution**: $x_{14, k+1} = x_{14, k} + \theta_k$.
+## Body-Frame Relative State
 
-This allows the MPC to "stretch" or "compress" the flight time to ensure the drone reaches the intercept point exactly when the target is there, while satisfying motor limits.
+Body-frame OCPs read `/drone/body_relative_odom`, usually produced by
+`target_publisher`.
 
----
+The helper publisher computes:
 
-## 4. Target Models & Integration
+```text
+p_T^B = R_BW * (p_target_W - p_drone_W)
+v_rel^B = R_BW * (v_drone_W - v_target_W)
+q_NB = q_target^-1 * q_drone
+```
 
-CoManDO provides target acceleration data to the solver via specialized OCP classes like `Quad6DOFVarTimeRelativeTV`.
+The OCP state stores the target position in the drone body frame. During
+Crazyflie command conversion, the planner derives:
 
-- **Analytical Model**: For `tracking_circle`, the target acceleration $a_{target}(t)$ is calculated analytically using sine/cosine functions of time.
-- **Predicted Model**: For hardware integration, the planner subscribes to a `PredictedTrajectory` message, providing a discrete sequence of $a_{target}$ for the solver's horizon.
+```text
+vx_body = state[3]
+vy_body = state[4]
+z_world = target_z - (R_WB * p_T^B).z
+```
 
-The solver uses **RK4 (Runge-Kutta 4th Order)** integration to evaluate these time-varying accelerations accurately at every sub-step of the plan.
+Then it publishes Crazyflie `cmd_hover`.
 
----
+## Target-Frame Relative State
 
-## 5. Relative Constraints
+Target-frame OCPs read `/drone/target_frame_odom`.
 
-### 5.1 Intercept Constraint (Terminal)
-The goal of a tracking OCP is to achieve "Soft Intercept":
-$$
-p_{rel} = [0, 0, 0]^T
-$$
-$$
-v_{rel, xy} = [0, 0]^T
-$$
-We often leave $v_{rel, z}$ unconstrained to allow the drone to descend vertically onto the target at a safe velocity (e.g., $v_{ref} = -0.15$ m/s).
+The helper publisher computes:
 
-### 5.2 Relative Glideslope
-During a relative approach, the glideslope ensures the drone stays in a "Safe Cone" *relative to the target's position*, even if the target is moving at high speed:
-$$
-\tan(\phi) \cdot p_{rel, z} \ge \sqrt{p_{rel, x}^2 + p_{rel, y}^2}
-$$
-This prevents "side-swiping" the target platform.
+```text
+p_B^N = R_NW * (p_drone_W - p_target_W)
+v_B^N = R_NW * (v_drone_W - v_target_W) - Omega_N x p_B^N
+q_NB = q_target^-1 * q_drone
+```
+
+`N` is the target frame. The Coriolis-like `Omega_N x p_B^N` term accounts for a
+rotating target frame in the reported relative velocity.
+
+For Crazyflie command conversion:
+
+```text
+v_body = R_NB^T * v_B^N
+z_world = target_z + p_B^N.z
+```
+
+## Variable Time
+
+Variable-time OCPs append cumulative time to the state and segment duration to
+the control:
+
+```text
+x_aug = [x_physical, DT]
+u_aug = [u_physical, Theta]
+DT_{k+1} = DT_k + Theta_k
+```
+
+The `TrajectoryReplayer` uses the cumulative `DT` slot as the node timestamp
+when `descriptor.variable_dt` is true. This lets the OCP optimize timing while
+the replay sampler still interpolates by wall-clock time.
+
+## Glideslope and Safety Constraints
+
+Several tracking OCPs encode a cone-like approach constraint. In target-relative
+form, a typical glideslope condition is:
+
+```text
+sqrt(px_rel^2 + py_rel^2) <= tan(phi) * pz_rel
+```
+
+The exact constants and constraint forms live in the OCP headers. Some relative
+OCPs set `skip_trajectory_validation` because generic world-frame checks such as
+negative altitude are not meaningful for raw body-relative or target-relative
+state vectors.
+
+## Target Prediction Ownership
+
+Target prediction is deliberately OCP-specific:
+
+| OCP | Target prediction source |
+| --- | --- |
+| `stateswitch` | Snapshot position, velocity, and acceleration through an OCP-owned predictor |
+| `tracking_circle_target` | `/target/predicted_accel` buffer plus solve-start target odometry |
+| `tracking_bodyrate_*` | Current target snapshot and OCP state augmentation |
+| `hover`, `landing` | No target prediction |
+
+[Next Chapter: Online Replanning and Trajectory Replay](06_online_replanning.md)

@@ -1,64 +1,131 @@
-# Chapter 4: Quadrotor MPC Debugging Log – Full Timeline
+# Chapter 4: Logging, RViz, Bags, and Debugging
 
-This report documents every attempted fix, observed problem, and outcome in chronological order. It is meant as a reference to avoid revisiting dead ends and to provide context for ongoing work.
+The current planner has three main debugging surfaces: CSV logs, RViz
+visualization topics, and optional rosbag recording from `planner_launch.py`.
 
----
+## CSV Logs
 
-## ... (Previous Entries 1-10) ...
+Enable logging with:
 
----
+```bash
+ros2 launch comando_planner planner_launch.py enable_logging:=true
+```
 
-## 11. Registry-Based Architecture Refactor
+The logger writes under the current working directory of the node:
 
-**Problem:** Adding new OCP types (like `stateswitch` or `tracking_circle`) required modifying `src/planner_node.cpp` and `src/quadrotor_mpc.cpp` in multiple places. This led to a "switch-case explosion" and made the code hard to maintain.
+```text
+./logs/{drone}_{ocp}_{mode}_{solver}_{YYYYMMDD_HHMMSS}/
+```
 
-**Fix:**
-- Implemented `OCPRegistry` and `OCPDescriptor` in `include/ocp_registry.hpp`.
-- Decoupled the `PlannerNode` from specific OCP headers.
-- Added callbacks for `transform_state` (pre-solve) and `post_process_result` (post-solve).
-- Centralized all OCP-specific parameters (dt, mass, solver params) within the registry.
+| File | Purpose |
+| --- | --- |
+| `all_solves.csv` | One row per solve node; includes solve metadata, OCP state/control, node time, `theta`, and target snapshot/reconstruction columns |
+| `commanded_state.csv` | Full-state command rows; includes command state, `[fz,mx,my,mz]`, and computed acceleration feedforward |
+| `commanded_hover_state.csv` | Crazyflie body-rate OCP dispatch after conversion to `cmd_hover` |
+| `commanded_bodyrate_state.csv` | MAVROS body-rate OCP dispatch as specific thrust and angular rates |
+| `actual_state.csv` | Raw measured state rows with a coordinate-mode label |
 
-**Result:** Adding a new OCP now only requires adding a single entry to the registry map. Core logic remains untouched.
+The coordinate-mode column indicates how to interpret actual-state rows:
 
----
+| Label | Meaning |
+| --- | --- |
+| `absolute` | World-frame drone state |
+| `absolute_shifted` | Absolute drone input for an OCP that solves target-relative internally |
+| `body_relative` | Body-frame relative odometry input |
+| `target_frame_relative` | Target-frame relative odometry input |
 
-## 12. Circular Target Tracking (`tracking_circle`)
+`all_solves.csv` includes target columns even for absolute OCPs. For relative
+plans, target node positions and velocities are either reconstructed by the OCP
+post-processing path or integrated from the target snapshot.
 
-**Problem:** Landing on a circular moving target required a way to track a time-varying trajectory without a high-latency external tracker (since the circle is predictable).
+## RViz Topics
 
-**Fix:**
-- Developed `ocp_tracking_circle.hpp`.
-- **Pre-baked Dynamics**: The target's circular motion is built directly into the OCP state transition.
-- **Relative-to-Absolute Conversion**: To keep the solver efficient, it solves in a fixed relative frame. The result is transformed back to world-frame coordinates using the `post_process_result` callback.
-- **Time-varying Accel**: The OCP now correctly accounts for centripetal acceleration of the target.
+The planner publishes:
 
-**Result:** Smooth landing on a 1.0 rad/s circular target achieved in simulation and initial flight tests.
+| Topic | Type | Notes |
+| --- | --- | --- |
+| `/{drone_name}/planned_trajectory` | `nav_msgs/msg/Path` | Last accepted horizon, reconstructed in world frame when possible |
+| `/{drone_name}/planner_debug_markers` | `visualization_msgs/msg/MarkerArray` | Target sphere/trail, active command marker, handoff jump marker/text |
 
----
+Open the bundled RViz layout from the workspace root after build:
 
-## 13. Logging Enhancements
+```bash
+rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
+```
 
-**Problem:** Debugging relative-frame OCPs was difficult because `all_solves.csv` only contained the drone's predicted state, not the target's state at the moment of solving.
+## Bag Recording
 
-**Fix:**
-- Updated `PlannerLogging` to include `target_snapshot_pos/vel/acc` in the solve metadata.
-- Added `is_relative_plan` flag to CSVs to distinguish between absolute and relative log types.
-- Included circular target parameters (Center, R, Omega) in the solve header.
+`planner_launch.py` can start `ros2 bag record` automatically:
 
-**Result:** `all_solves.csv` now provides a complete picture of the "Drone vs Target" relationship for every solve iteration.
+```bash
+ros2 launch comando_planner planner_launch.py \
+  drone_name:=cf_1 platform:=crazyflie \
+  record_bag:=true
+```
 
----
+It records TF, planner visualization, target streams, Crazyflie command/state
+topics, and MAVROS local-position/setpoint topics. Set `record_bag:=false` for
+normal development if you do not want bag files created every launch. By
+default, the bag is saved inside the matching run log folder as
+`bags/comando_debug`.
 
-## 14. Acceleration Feedforward Fix
+Manual replay:
 
-**Problem:** Finite-differencing velocity to get acceleration was noisy and often caused "double-counting" of gravity in the lower-level controller.
+```bash
+ros2 bag play logs/RUN_FOLDER/bags/comando_debug --clock
+rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
+```
 
-**Fix:**
-- Changed `publishCommand` to compute acceleration directly from the predicted thrust $f_z$ and current attitude $q$.
-- Formula: $a_{ff} = R(q) \cdot [0, 0, f_z/m]^T - [0, 0, g]^T$ (in world frame).
+## Common Runtime Warnings
 
-**Result:** Tracking error reduced by ~30% in high-speed maneuvers.
+| Message fragment | Meaning | Usual fix |
+| --- | --- | --- |
+| `Planner started UNCONFIGURED` | Node has no `ocp_type` and `mode` yet | Run `ocp_launch.py` with a profile |
+| `Waiting for state` | Required drone state has not arrived | Check platform, drone namespace, relative odom mode, and topic names |
+| `Waiting for fresh target state` | OCP target gate failed | Check `/target/odom` and `/target/accel` timestamps/rates |
+| `waiting for /target/predicted_accel` | `tracking_circle_target` has no fresh future acceleration buffer | Publish `MultiDOFJointTrajectory` predicted acceleration |
+| `frame_contract` | Descriptor expected a different active odom mode/topic | Check active `ocp_type` and target_publisher `drone_odom_mode` |
+| `Trajectory stale` | Replay sampled beyond accepted horizon | Check solver failures, target freshness, and constraint/validation rejects |
+| `tracking_circle_target is open_loop-only` | Runtime requested `mpc` for that OCP | Use `mode:=open_loop` |
 
----
+## Body-Relative Debugging
 
-[Back to Chapter 3: How the MPC Works](03_mpc.md)
+Enable target-publisher conversion logs:
+
+```bash
+ros2 run comando_planner target_publisher --ros-args \
+  -p drone_odom_mode:=body_frame \
+  -p debug_body_relative_trace:=true
+```
+
+If upstream drone odometry angular velocity is already in rad/s, pass:
+
+```bash
+-p body_relative_input_angular_unit:=rad_s
+```
+
+The default is `deg_s`, matching the Crazyflie/Crazyswarm2 convention used by
+the helper publisher. Planner-side `debug_body_relative_trace` exists in runtime
+config, but the current `planner_launch.py` does not expose it as a launch
+argument.
+
+## Validation Targets
+
+After building, run installed validation executables with:
+
+```bash
+ros2 run comando_planner test_poly_ocp
+ros2 run comando_planner test_trajectory_replayer
+ros2 run comando_planner test_target_frame_warm_start
+ros2 run comando_planner test_planner_core
+ros2 run comando_planner test_stateswitch_predictor
+```
+
+For a direct Crazyflie command-path check:
+
+```bash
+ros2 run comando_planner test_bodyrate_cmd.py --ros-args \
+  -p drone_name:=cf_1 -p thrust:=9.81 -p wz:=0.52 -p duration:=3.0
+```
+
+[Next Chapter: Frames, Relative Dynamics, and Tracking Math](05_mathematical_tutorial.md)

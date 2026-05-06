@@ -13,6 +13,13 @@
 
 class QuadrotorMPC {
 public:
+    struct WarmStartSnapshot {
+        std::vector<Eigen::VectorXd> prev_X;
+        std::vector<Eigen::VectorXd> prev_U;
+        std::vector<Eigen::MatrixXd> prev_K;
+        double last_solve_ms = 0.0;
+    };
+
     struct Config {
         std::string ocp_type = "hover";
 
@@ -62,6 +69,9 @@ public:
     bool hasPreviousTrajectory() const { return !prev_X_.empty(); }
     /// Read-only access to the last solved state trajectory (size N+1, each NX_SS-dim).
     const std::vector<Eigen::VectorXd>& getPrevX() const { return prev_X_; }
+    WarmStartSnapshot snapshotWarmStart() const;
+    void restoreWarmStart(const WarmStartSnapshot& snapshot);
+    void keepLatestAsUnexecutedWarmStart();
 
 private:
     void setupProblem(const OCPCreateArgs& args);
@@ -79,4 +89,5 @@ private:
     std::vector<Eigen::VectorXd> prev_U_;
     std::vector<Eigen::MatrixXd> prev_K_;
     Eigen::Vector3d              target_accel_ = Eigen::Vector3d::Zero();
+    bool                         next_warm_start_unshifted_ = false;
 };

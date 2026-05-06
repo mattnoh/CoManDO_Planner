@@ -1,224 +1,213 @@
 # CoManDO Planner
 
-**CoManDO** (COnic-COnstrained Manifold Dynamic Optimizer) is a ROS2 receding-horizon MPC planner for quadrotor control. It solves aerial manipulation and dynamic target-tracking problems using the **ALIPDDP** solver (Augmented Lagrangian Interior Point Differential Dynamic Programming).
+`comando_planner` is a ROS 2 Humble MPC planner for Crazyflie and MAVROS-based
+quadrotors. It wraps ALIPDDP optimal-control problems behind a registry, keeps
+state and target tracking in ROS adapters, and streams either full-state or
+body-rate commands depending on the active OCP.
 
----
+The current workflow is two-step:
 
-## Prerequisites
+1. Start the planner infrastructure in a paused state with `planner_launch.py`.
+2. Push an OCP profile and increment `command_seq` with `ocp_launch.py`.
+
+## Package Layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/planner_node.cpp` | ROS 2 node, launch/runtime parameter handling, timers, logging, platform dispatch |
+| `include/planner_core/` | ROS-free planner contracts, OCP registry, command adapters, replay orchestration |
+| `include/ocp/` | Registered ALIPDDP OCP formulations |
+| `include/platform/` | Crazyflie, MAVROS, state monitor, and target-tracker adapters |
+| `src/target_publisher.cpp` | Synthetic circle or Qualisys target publisher plus optional relative odometry |
+| `launch/` | Infrastructure launch and runtime OCP trigger launch |
+| `rviz/comando_debug.rviz` | RViz layout for planned paths and debug markers |
+| `docs/` | Detailed interface, architecture, math, and target-integration notes |
+
+## Requirements
 
 | Component | Notes |
-|-----------|-------|
-| Ubuntu 22.04 + ROS2 Humble | Base requirement |
-| ALIPDDP | Clone as sibling directory: `../ALIPDDP-main` |
-| **CrazySim** + **Crazyswarm2** | For Crazyflie SITL workflow |
-| **MAVROS2** | For MAVROS workflow |
+| --- | --- |
+| Ubuntu 22.04 and ROS 2 Humble | Base ROS environment |
+| ALIPDDP | Expected as sibling directory `../ALIPDDP-main` from this package |
+| `crazyflie_interfaces` | Required; used by the Crazyflie adapter |
+| `mavros_msgs` | Optional at build time; enables `platform:=mavros` when found |
+| `mocap4r2_msgs` | Optional at build time; enables `target_mode:=qualisys` when found |
+| Eigen3 | Required by planner, OCPs, and target helpers |
 
-### Build
+Build from the workspace root:
 
 ```bash
 source /opt/ros/humble/setup.zsh
-source ~/ros_ws/install/setup.zsh
-cd ~/ros_ws
+cd /home/lab/projects/cf/online/ros_ws
 colcon build --symlink-install --packages-select comando_planner
+source install/setup.zsh
 ```
 
-MAVROS support is detected automatically at build time (`find_package(mavros_msgs QUIET)`). The package compiles without it; MAVROS features are guarded by `HAS_MAVROS_MSGS`.
+MAVROS and Qualisys support are detected by CMake. If `mavros_msgs` is missing,
+the package still builds but `platform:=mavros` is unavailable. If
+`mocap4r2_msgs` is missing, `target_publisher` falls back from `qualisys` to
+`circle`.
 
----
+## Crazyflie Workflow
 
-## OCP Catalog
-
-| OCP | Platform | `drone_odom_mode` | Command | Notes |
-|-----|----------|-------------------|---------|-------|
-| `hover` | any | `none` | CmdFullState | Fixed-point stabilization |
-| `landing` | any | `none` | CmdFullState | Vertical descent |
-| `stateswitch` | any | `none` | CmdFullState | Moving-target interception |
-| `tracking_circle_target` | any | `none` | CmdFullState | Receding-horizon circle via `/target/predicted_accel` |
-| `tracking_bodyrate_bf_noimu` | crazyflie / mavros | `body_frame` | CmdBodyRate | 10D body-frame; CF→cmd_hover, MAVROS→AttitudeTarget |
-| `tracking_bodyrate_bf_imu` | crazyflie / mavros | `body_frame` | CmdBodyRate | 20D augmented (IMU states) |
-| `tracking_bodyrate_tf_noimu` | crazyflie / mavros | `target_frame` | CmdBodyRate | 10D target-frame (CoNi-MPC) |
-| `tracking_bodyrate_tf_imu` | crazyflie / mavros | `target_frame` | CmdBodyRate | 20D augmented (IMU states) |
-
----
-
-## CrazySim SITL Workflow
+Start CrazySim/Crazyswarm2 as usual, then run:
 
 ```bash
-# Terminal A — CrazySim (CF firmware SITL + Gazebo)
-cd ~/crazysim
-bash launch_crazysim.sh
-
-# Terminal B — Crazyswarm2 (ROS2 ↔ CrazySim bridge)
-ros2 launch crazyflie launch.py
-
-# Terminal C — CoManDO planner
+# Terminal A: planner infrastructure
 ros2 launch comando_planner planner_launch.py \
-    drone_name:=cf_1 platform:=crazyflie
+  drone_name:=cf_1 platform:=crazyflie record_bag:=false
 
-# Terminal D — Target publisher (required for tracking OCPs)
+# Terminal B: optional target publisher for tracking OCPs
 ros2 run comando_planner target_publisher --ros-args \
-    -p target_mode:=circle \
-    -p drone_odom_mode:=body_frame \
-    -p center_z:=0.4 -p radius:=0.8 -p omega:=0.3
+  -p target_mode:=circle \
+  -p drone_odom_mode:=body_frame \
+  -p drone_odom_topic:=/cf_1/odom \
+  -p drone_pose_topic:=/cf_1/pose
 
-# Terminal E — Trigger an OCP
-#   Hover at 1 m:
+# Terminal C: hover at 1 m
 ros2 launch comando_planner ocp_launch.py \
-    ocp_type:=hover mode:=mpc \
-    hover_target_x:=0 hover_target_y:=0 hover_target_z:=1.0 command_seq:=1
+  ocp_type:=hover mode:=mpc n_replay:=4 \
+  hover_target_x:=0.0 hover_target_y:=0.0 hover_target_z:=1.0 \
+  command_seq:=1
 
-#   Body-frame circular tracking (no IMU augmentation):
+# Terminal C: body-frame tracking after target_publisher is running
 ros2 launch comando_planner ocp_launch.py \
-    ocp_type:=tracking_bodyrate_bf_noimu mode:=mpc command_seq:=1
-
-#   Target-frame tracking (start target_publisher with drone_odom_mode:=target_frame):
-ros2 launch comando_planner ocp_launch.py \
-    ocp_type:=tracking_bodyrate_tf_noimu mode:=mpc command_seq:=1
+  ocp_type:=tracking_bodyrate_bf_noimu mode:=mpc n_replay:=7 command_seq:=2
 ```
 
-**`drone_odom_mode` values for `target_publisher`:**
-
-| Value | Topic published | Used with |
-|-------|----------------|-----------|
-| `none` | — | absolute OCPs (hover, landing, …) |
-| `shifted_world` | `/drone/relative_odometry` | `stateswitch`, `tracking_circle_target` |
-| `body_frame` | `/drone/body_relative_odom` | `tracking_bodyrate_bf_*` |
-| `target_frame` | `/drone/target_frame_odom` | `tracking_bodyrate_tf_*` |
-
----
+For target-frame body-rate OCPs, start `target_publisher` with
+`drone_odom_mode:=target_frame`. For `stateswitch`, use `drone_odom_mode:=none`
+because the planner reads the drone in the absolute frame and subtracts the
+target snapshot internally.
 
 ## MAVROS Workflow
 
-```bash
-# Terminal A — MAVROS bridge for your vehicle/simulator
-ros2 launch mavros <your_vehicle_bridge>.launch.py
-
-# Terminal B — CoManDO planner
-ros2 launch comando_planner planner_launch.py \
-    drone_name:=drone platform:=mavros \
-    hover_thrust:=0.35
-
-# Terminal C — Target publisher + OCP (same commands as CrazySim section)
-```
-
-**Pre-arm sequence (automatic):** When `platform:=mavros`, the planner publishes 2 s of neutral setpoints before switching to OFFBOARD mode and sending the ARM command. No manual steps needed after Terminal D starts.
-
----
-
-## Analysis & Visualization
-
-```bash
-cd src/CoManDO_planner/logs
-
-# Static PDF report — works with any OCP (13D or 10D/20D bodyrate)
-python plot_circle.py --dir <log_dir>
-
-# Animated body-frame view
-python animate_body.py --dir <log_dir>
-```
-
-Both scripts auto-detect the column schema from the CSV headers. No hardcoded column lists.
-
-For live RViz2 debugging, the planner publishes:
-
-| Topic | Type | Contents |
-|-------|------|----------|
-| `/{drone}/planned_trajectory` | `nav_msgs/msg/Path` | Current accepted horizon in `world` |
-| `/{drone}/planner_debug_markers` | `visualization_msgs/msg/MarkerArray` | Target point/trail, active command point, handoff jump marker/text |
-
-Open the provided layout with:
-
-```bash
-rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
-```
-
-Record RViz-debuggable runs with `ros2 bag`, not RViz itself. A useful Crazyflie
-bag captures transforms, planner visuals, target state, and the command/state
-topics needed to replay the failure:
-
-```bash
-ros2 bag record -o bags/gogogo_debug \
-  /tf /tf_static \
-  /cf_1/planned_trajectory \
-  /cf_1/planner_debug_markers \
-  /target/odom \
-  /target/accel \
-  /target/predicted_accel \
-  /cf_1/pose \
-  /cf_1/odom \
-  /cf_1/cmd_hover \
-  /cf_1/cmd_full_state
-```
-
-Replay it with:
-
-```bash
-ros2 bag play bags/gogogo_debug --clock
-rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
-```
-
-The planner launch file can start that recorder automatically:
+Build with `mavros_msgs` available, start your MAVROS bridge, then run:
 
 ```bash
 ros2 launch comando_planner planner_launch.py \
-  drone_name:=cf_1 platform:=crazyflie \
-  record_bag:=true bag_output:=bags/gogogo_debug
+  drone_name:=drone platform:=mavros record_bag:=false
+
+ros2 launch comando_planner ocp_launch.py \
+  ocp_type:=tracking_bodyrate_tf_noimu mode:=mpc n_replay:=7 command_seq:=1
 ```
 
-For MAVROS, replace the Crazyflie pose/odom/command topics with the MAVROS
-local-position and setpoint topics used by your bridge. A screen recording is
-fine for sharing, but the bag is the artifact needed for debugging.
+The MAVROS adapter subscribes to `/mavros/local_position/odom`, publishes
+full-state OCPs to `/mavros/setpoint_raw/local`, and publishes body-rate OCPs to
+`/mavros/setpoint_raw/attitude`. It sends two seconds of neutral setpoints before
+requesting `OFFBOARD` and `ARM`. The node has a constructor parameter
+`hover_thrust` with default `0.3`; the current `planner_launch.py` does not
+expose it as a launch argument.
 
----
+## Target Publisher
 
-## Architecture
+`target_publisher` always publishes:
 
-Two-step launch: infrastructure first, OCP hot-switch second.
+| Topic | Type | Purpose |
+| --- | --- | --- |
+| `/target/odom` | `nav_msgs/msg/Odometry` | Target position, velocity, orientation, angular velocity |
+| `/target/accel` | `geometry_msgs/msg/AccelStamped` | Target linear and angular acceleration |
 
+It can also publish relative drone odometry:
+
+| `drone_odom_mode` | Extra topic | Used by |
+| --- | --- | --- |
+| `none` | none | Absolute OCPs and target-relative OCPs that transform internally |
+| `body_frame` | `/drone/body_relative_odom` | `tracking_bodyrate_bf_*` |
+| `target_frame` | `/drone/target_frame_odom` | `tracking_bodyrate_tf_*` |
+| `shifted_world` | `/drone/relative_odometry` | Diagnostic/historical output; not selected by current OCP descriptors |
+
+The synthetic circle currently uses constants in `include/target/circular_target.hpp`
+(`center={0,0,0.2}`, `R=1.0`, `omega=0.4`, `phi0=0.0`). Runtime shape
+parameters such as `radius` or `center_z` are not declared by the current node.
+
+## Runtime Parameters
+
+`planner_launch.py` declares infrastructure parameters:
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `drone_name` | `cf_1` | Drone namespace for Crazyflie topics and planner output topics |
+| `platform` | `crazyflie` | `crazyflie` or `mavros` |
+| `solver` | `alipddp` | Only implemented backend |
+| `enable_logging` | `true` | Writes CSV logs under `./logs` |
+| `target_odom_topic` | `/target/odom` | Target odometry input |
+| `target_accel_topic` | `/target/accel` | Target acceleration input |
+| `target_predicted_accel_topic` | `/target/predicted_accel` | Future acceleration buffer for `tracking_circle_target` |
+| `body_relative_odom_topic` | `/drone/body_relative_odom` | Body-relative drone-state input |
+| `record_bag` | `true` | Starts `ros2 bag record`; set false if you do not want a bag |
+| `bag_output` | empty | Optional override; by default bags are written under the active run log folder |
+
+`ocp_launch.py` sets the active profile and triggers it:
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `ocp_type` | `landing` | Must be one of the registered keys above |
+| `mode` | `mpc` | `mpc` or `open_loop`; `tracking_circle_target` rejects `mpc` |
+| `n_replay` | `7` | Minimum replay steps before a new MPC plan can swap in |
+| `hover_target_x/y/z` | `0.0` | Terminal point for absolute full-state OCPs |
+| `command_seq` | `1` | Must increase to start a new command profile |
+
+## Logging and RViz
+
+When `enable_logging:=true`, each run creates:
+
+```text
+./logs/{drone}_{ocp}_{mode}_{solver}_{timestamp}/
 ```
-planner_node ──► StateMonitor  (thread-safe drone + target state)
-             ──► OCPRegistry   (factory pattern — add OCP without touching planner_node)
-             ──► QuadrotorMPC  (ALIPDDP wrapper, warmstart management)
-             ──► TrajectoryReplayer  (streams commands between solves at OCP DT rate)
-```
 
-**Solve-while-replay pattern:** Solver fires every `n_replay` cycles; replayer fires at OCP DT (e.g. 50 Hz). Command output stays consistent across 100 ms+ solve times.
-
-**Target prediction ownership:** Most OCPs consume the current `TargetSnapshot`
-and let their own dynamics propagate target motion. `stateswitch` follows this
-pattern with an OCP-owned zero-jerk predictor built from target position,
-velocity, and acceleration. `TargetAccelBuffer` and `/target/predicted_accel`
-are only required by OCPs that explicitly request an externally supplied target
-acceleration profile, currently `tracking_circle_target`.
-
-**ROS wrapper boundary:** `include/planner_core/` is kept free of ROS message
-types and logging macros. ROS2 support lives in `src/planner_node.cpp` plus the
-ROS2 platform adapters. A future ROS1/MAVROS wrapper should reuse
-`PlannerCore`, `QuadrotorMPC`, `TrajectoryReplayer`, and the OCP descriptors,
-then implement only ROS1 params, subscribers, publishers, timers, rosbag launch
-helpers, and message conversion.
-
-**Platform adapters** (`include/platform/`):
-
-| Platform | Input topic | Output topic | Frame |
-|----------|-------------|--------------|-------|
-| `crazyflie` | `/{name}/pose` + `/{name}/odom` | `/{name}/cmd_full_state` or `/{name}/cmd_hover` | ENU |
-| `mavros` | `/mavros/local_position/odom` | `/mavros/setpoint_raw/attitude` or `/mavros/setpoint_raw/local` | ENU |
-
-**CmdBodyRate dispatch:** The OCP declares `command_mode = CmdBodyRate`. The planner core command adapter dispatches by platform:
-- **crazyflie** → converts body-rate output to `[vx_body, vy_body, z_world, yaw_rate]` → `cmd_hover`
-- **mavros** → `AttitudeTarget` (body rates + normalized thrust)
-
----
-
-## Logging
-
-When `enable_logging:=true`, logs go to `./logs/{drone}_{ocp}_{mode}_{solver}_{timestamp}/`:
+with:
 
 | File | Contents |
-|------|---------|
-| `all_solves.csv` | Per-solve metadata + full state/control trajectories |
-| `commanded_state.csv` | Per-command output (CmdFullState only) |
-| `commanded_hover_state.csv` | Per-command `[vx, vy, z, yaw_rate]` (CmdBodyRate + crazyflie) |
-| `commanded_bodyrate_state.csv` | Per-command `[T_ms2, ωx, ωy, ωz]` (CmdBodyRate + mavros) |
-| `actual_state.csv` | Raw sensor measurements |
+| --- | --- |
+| `all_solves.csv` | Solver metadata plus every OCP state/control node and target snapshot data |
+| `commanded_state.csv` | Full-state commands and computed acceleration feedforward |
+| `commanded_hover_state.csv` | Crazyflie body-rate OCP dispatch as `[vx, vy, z_distance, yaw_rate]` |
+| `commanded_bodyrate_state.csv` | MAVROS body-rate dispatch as `[T_ms2, omega_x, omega_y, omega_z]` |
+| `actual_state.csv` | Raw measured state rows labelled by coordinate mode |
+| `bags/comando_debug/` | ROS bag recorded for the same run when `record_bag:=true` |
+
+Live visualization topics:
+
+| Topic | Type |
+| --- | --- |
+| `/{drone}/planned_trajectory` | `nav_msgs/msg/Path` |
+| `/{drone}/planner_debug_markers` | `visualization_msgs/msg/MarkerArray` |
+
+Open the provided layout from the workspace root after building:
+
+```bash
+source /opt/ros/humble/setup.zsh
+source install/setup.zsh
+ros2 bag play src/CoManDO_planner/logs/RUN_FOLDER/bags/comando_debug --clock
+
+source /opt/ros/humble/setup.zsh
+source install/setup.zsh
+rviz2 -d install/comando_planner/share/comando_planner/rviz/comando_debug.rviz
+
+```
+
+Automatic bag recording is per `planner_launch.py` process, not per
+`ocp_launch.py` trigger. If you run four OCP profiles while one planner stays
+alive, they are all in the same bag. Restart the planner, or pass a different
+`bag_output:=...`, when you want a separate bag per test.
+
+## Validation Targets
+
+The package installs small executable test targets:
+
+```bash
+ros2 run comando_planner test_poly_ocp
+ros2 run comando_planner test_trajectory_replayer
+ros2 run comando_planner test_target_frame_warm_start
+ros2 run comando_planner test_planner_core
+ros2 run comando_planner test_stateswitch_predictor
+```
+
+`scripts/test_bodyrate_cmd.py` is also installed as `test_bodyrate_cmd.py` for
+manual Crazyflie body-rate command checks.
+
+## More Documentation
+
+Start with `docs/COMANDO_PLANNER_INTERFACE.md` for the full ROS interface and
+`docs/CoManDO_planner/index.md` for the chapter-style architecture notes.

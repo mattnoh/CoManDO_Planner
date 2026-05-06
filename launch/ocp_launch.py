@@ -1,6 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 
 
 def _set_param(node, name, value):
@@ -36,6 +36,7 @@ def generate_launch_description():
         DeclareLaunchArgument('open_loop_abort_on_divergence', default_value='false'),
         DeclareLaunchArgument('open_loop_abort_max_z_error_m', default_value='0.50'),
         DeclareLaunchArgument('open_loop_abort_max_vz_error_mps', default_value='1.00'),
+        DeclareLaunchArgument('command_delay_after_profile', default_value='1.00'),
         DeclareLaunchArgument('command_seq', default_value='1'),
     ]
 
@@ -58,6 +59,11 @@ def generate_launch_description():
     actions = []
     for i, act in enumerate(set_params):
         actions.append(TimerAction(period=0.15 * i, actions=[act]))
-    actions.append(TimerAction(period=0.15 * len(set_params) + 0.2, actions=[trigger]))
+    actions.append(TimerAction(
+        period=PythonExpression([
+            str(0.15 * len(set_params)), " + ", LaunchConfiguration('command_delay_after_profile')
+        ]),
+        actions=[trigger]
+    ))
 
     return LaunchDescription(args + actions)

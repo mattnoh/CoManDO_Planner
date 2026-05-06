@@ -1,80 +1,148 @@
-# Chapter 3: How the MPC Works
+# Chapter 3: MPC, OCP Registry, and Command Modes
 
-This chapter describes the internal mechanics of `QuadrotorMPC`, the `OCPRegistry` architecture, and the mathematical foundations of the problem formulations.
+The planner uses ALIPDDP through `QuadrotorMPC` and OCP descriptors. Runtime
+code chooses an OCP by string key, then uses descriptor fields and callbacks to
+configure state frames, target validation, command dispatch, logging headers,
+and solve construction.
 
----
+## Core State and Control Families
 
-## 1. Problem Formulation
+### 13D Full-State OCPs
 
-The MPC solves an **Optimal Control Problem (OCP)** over a finite horizon of $N$ steps, producing an optimal state trajectory $X$ and control sequence $U$.
+Used by `hover`, `landing`, `stateswitch`, and `tracking_circle_target`.
 
-### 1.1 State Space (13D)
-The state vector $x \in \mathbb{R}^{13}$ is defined as:
-- **0–2**: Position $p_W$ (World frame, ENU)
-- **3–5**: Velocity $v_W$ (World frame, ENU)
-- **6–9**: Unit Quaternion $q_{BW}$ ($w, x, y, z$)
-- **10–12**: Angular Rate $\omega_B$ (Body frame, rad/s)
+```text
+x = [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
+u = [fz, mx, my, mz]
+```
 
-### 1.2 Control Space (4D)
-The control vector $u \in \mathbb{R}^4$ is defined as:
-- **0**: Total Thrust $f_z$ (along body-z axis)
-- **1–3**: Body Moments $M_x, M_y, M_z$
+`fz` is body-z thrust in Newtons for full-state Crazyflie command conversion.
+Moments are OCP controls and are logged, but the Crazyflie `FullState` command
+uses position, velocity, attitude, angular velocity, and acceleration
+feedforward.
 
-> [!NOTE]
-> Previous iterations used 6 controls. This was reduced to 4 to match the physical actuators of a quadrotor, which cannot produce independent lateral forces.
+### Body-Rate OCPs Without Augmentation
 
----
+Used by `tracking_bodyrate_bf_noimu` and `tracking_bodyrate_tf_noimu`.
 
-## 2. The OCP Registry Architecture
+Physical state is 10D plus a cumulative DT slot used by variable-time dynamics:
 
-To support diverse flight behaviors (Hover, Landing, Moving Target Tracking) without bloating the core planner code, we use a **Registry Pattern**.
+```text
+target-frame: [p_B^N, v_B^N, q_NB, DT]
+body-frame:   [p_T^B, v_rel^B, q_NB, DT]
+u = [T_ms2, omega_x, omega_y, omega_z, Theta]
+```
 
-### 2.1 OCPDescriptor
-Each OCP is defined by an `OCPDescriptor` in `include/ocp_registry.hpp`, containing:
-- **`dt`**: The time-step for this specific formulation.
-- **`transform_state`**: A callback to modify the current state before solving (e.g., converting world-frame position to relative-frame for `stateswitch`).
-- **`post_process_result`**: A callback to modify the solver's output (e.g., converting a relative trajectory back to absolute world coordinates for `tracking_circle`).
-- **`create`**: A factory function that instantiates the concrete `OptimalControlProblem`.
+`T_ms2` is specific thrust. `Theta` is the optimized time segment duration.
 
----
+### Body-Rate OCPs With Augmentation
 
-## 3. Advanced OCP Formulations
+Used by `tracking_bodyrate_bf_imu` and `tracking_bodyrate_tf_imu`.
 
-### 3.1 `stateswitch` (Moving Target)
-- **Frame**: Relative (Drone - Target).
-- **Dynamics**: Includes target velocity in the relative state transition.
-- **Variable Time**: Includes a time-step $\theta$ as a decision variable to optimize landing timing.
+Physical state is 19D plus DT:
 
-### 3.2 `tracking_circle` (Circular Target)
-- **Problem**: Pre-calculates a circular target trajectory.
-- **Baking**: The relative dynamics are "baked-in" using `TargetSnapshot` parameters (Center, Radius, Omega).
-- **Output**: The solver returns a relative-frame solution, which the Registry's `post_process_result` converts back to an absolute world-frame trajectory using the known target motion model.
+```text
+base 10D state
++ target angular velocity Omega_N
++ target linear acceleration estimate
++ target angular acceleration beta_N
++ DT
+```
 
----
+The exact acceleration-state interpretation differs by body-frame versus
+target-frame OCP headers, but both carry target kinematics through the solve.
 
-## 4. Receding Horizon & Warm-Starting
+## OCP Registry
 
-The planner uses **Warm-Starting** to achieve real-time performance.
+Source: `include/planner_core/ocp_registry.hpp`
 
-### 4.1 The Shift Count (`n_shift`)
-Between two solves, the drone moves forward by `n_shift` steps of the previous plan.
-To provide a good initial guess for the next solve, the previous solution $(X, U, K)$ is shifted forward:
-- $U_{warm}[k] = U_{prev}[k + n\_shift]$
-- $X_{warm}[k] = X_{prev}[k + n\_shift]$
-- $K_{warm}[k] = K_{prev}[k + n\_shift]$ (Feedback gains)
+Each OCP exposes a `descriptor()` function. The registry table maps keys to
+descriptors:
 
-### 4.2 Handling Ambiguity
-Warm-starting feedback gains ($K$) is critical when using ALIPDDP. It ensures the first backward pass of the new solve starts from a nearly optimal control law, often reducing the iteration count by 50-80% compared to a cold start.
+```cpp
+{"hover", HoverOCP::descriptor()}
+{"landing", LandingOCP::descriptor()}
+{"stateswitch", StateswitchOCP::descriptor()}
+{"tracking_circle_target", TrackingCircleTargetOCP::descriptor()}
+{"tracking_bodyrate_tf_noimu", TrackingBodyrateTfNoImuOCP::descriptor()}
+{"tracking_bodyrate_tf_imu", TrackingBodyrateTfImuOCP::descriptor()}
+{"tracking_bodyrate_bf_imu", TrackingBodyrateBfImuOCP::descriptor()}
+{"tracking_bodyrate_bf_noimu", TrackingBodyrateBfNoImuOCP::descriptor()}
+```
 
----
+The node and `PlannerCore` use the descriptor rather than switching on OCP names
+for most behavior.
 
-## 5. Solver: ALIPDDP
+## Descriptor Fields That Affect Runtime
 
-The backend solver is **ALIPDDP (Augmented Lagrangian Iterative Parabolic Differential Dynamic Programming)**.
-- **Dynamics**: Second-order rigid-body dynamics.
-- **Constraints**: Handles thrust limits, tilt constraints, and glideslope constraints via the Augmented Lagrangian method.
-- **Hot-Swap**: The solver object is recreated on every solve to ensure a clean internal workspace, while the `OptimalControlProblem` is reused to preserve the objective function landscape.
+| Field | Runtime effect |
+| --- | --- |
+| `dt` | Replay timer period and nominal OCP step |
+| `default_n_replay` | Default replan handoff spacing |
+| `default_mass_kg` | Command conversion and hover-control mass |
+| `command_mode` | `CmdFullState` or `CmdBodyRate` |
+| `drone_odom_mode` | Selects absolute, body-relative, or target-frame state input |
+| `variable_dt` | Reads cumulative node time from state index `state_dim` |
+| `needs_target_trajectory` | Requires fresh predicted acceleration before open-loop solve |
+| `skip_trajectory_validation` | Bypasses generic physical bound checks for OCPs whose raw state is not world absolute |
+| `transform_state` | Converts sensor state to OCP state before solving |
+| `validate_target` | OCP-specific target freshness gate |
+| `post_process_result` | Adds relative-plan metadata and target reconstruction data after solving |
+| `prepare_extra` | Builds OCP-specific extra data passed to `create()` |
+| `reconstruct_world_state` | Converts replay state to world state for full-state command publication |
 
----
+## Current OCP Behavior Summary
 
-[Next Chapter: Debugging Log](04_debugging_log.md)
+| OCP | Important descriptor behavior |
+| --- | --- |
+| `hover` | Absolute 13D, full-state command, fixed `dt=0.05`, default mass `0.0282 kg` |
+| `landing` | Absolute 13D, full-state command, fixed `dt=0.05`, default mass `0.027 kg` |
+| `stateswitch` | Absolute sensor input, subtracts target position/velocity in `transform_state`, variable DT, full-state command reconstructed to world |
+| `tracking_circle_target` | Absolute sensor input, subtracts target odom, needs predicted acceleration, open-loop only in node |
+| `tracking_bodyrate_bf_*` | Reads `/drone/body_relative_odom`, variable DT, command mode `CmdBodyRate` |
+| `tracking_bodyrate_tf_*` | Reads `/drone/target_frame_odom`, variable DT, command mode `CmdBodyRate` |
+
+## MPC Solve Path
+
+In `mpc` mode:
+
+1. `planner_node` gathers current drone state and `TargetSnapshot`.
+2. `PlannerCore::trySolve()` validates the frame contract.
+3. Descriptor `transform_state` prepares the OCP state.
+4. Warm-start data from the previous accepted solve is selected.
+5. Descriptor `prepare_extra` builds OCP-specific data.
+6. `QuadrotorMPC::solve()` creates the concrete OCP and calls ALIPDDP.
+7. Descriptor `post_process_result` adds target-relative metadata.
+8. Generic acceptance checks validate success, constraint error, and physical
+   bounds unless skipped by configuration or descriptor.
+9. Accepted plans are handed to `TrajectoryReplayer` and logged.
+
+## Warm Starting and Handoff
+
+`PlannerCore` maintains the last accepted plan and uses the replayer to avoid
+command gaps. New solves do not instantly replace the active plan. They are
+stored as pending plans and swapped only after:
+
+```text
+now >= pending_earliest_activation_time
+and active plan has replayed at least n_replay steps
+```
+
+For variable-DT OCPs, node time comes from the cumulative DT state slot instead
+of `k * dt`.
+
+## Command Dispatch
+
+`planner_core/adapters.hpp` converts replay samples to `PlannerCommand`.
+
+| Descriptor command mode | Platform | ROS command |
+| --- | --- | --- |
+| `CmdFullState` | Crazyflie | `FullState` on `/{drone}/cmd_full_state` |
+| `CmdFullState` | MAVROS | `PositionTarget` on `/mavros/setpoint_raw/local` |
+| `CmdBodyRate` | Crazyflie | Converted hover command on `/{drone}/cmd_hover` |
+| `CmdBodyRate` | MAVROS | `AttitudeTarget` on `/mavros/setpoint_raw/attitude` |
+
+This is why body-rate OCPs can share one OCP output while using different
+platform command APIs.
+
+[Next Chapter: Logging, RViz, Bags, and Debugging](04_debugging_log.md)

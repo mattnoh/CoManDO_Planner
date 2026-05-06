@@ -19,14 +19,44 @@ double QuadrotorMPC::getOcpDt() const {
     return OCPRegistry::getDT(config_.ocp_type);
 }
 
+QuadrotorMPC::WarmStartSnapshot QuadrotorMPC::snapshotWarmStart() const {
+    WarmStartSnapshot snapshot;
+    snapshot.prev_X = prev_X_;
+    snapshot.prev_U = prev_U_;
+    snapshot.prev_K = prev_K_;
+    snapshot.last_solve_ms = last_solve_ms_;
+    return snapshot;
+}
+
+void QuadrotorMPC::restoreWarmStart(const WarmStartSnapshot& snapshot) {
+    prev_X_ = snapshot.prev_X;
+    prev_U_ = snapshot.prev_U;
+    prev_K_ = snapshot.prev_K;
+    last_solve_ms_ = snapshot.last_solve_ms;
+    next_warm_start_unshifted_ = false;
+}
+
+void QuadrotorMPC::keepLatestAsUnexecutedWarmStart() {
+    next_warm_start_unshifted_ = true;
+}
+
 std::vector<Eigen::VectorXd> QuadrotorMPC::makeUwarm(int n_shift) const {
     if (prev_U_.empty()) return {};
 
     const int N = static_cast<int>(prev_U_.size());
     if (N == 1) return prev_U_;
 
-    const int NEX = std::max(1, std::min(n_shift, N - 1));
+    const int NEX = std::max(0, std::min(n_shift, N - 1));
     const auto desc = OCPRegistry::getDescriptor(config_.ocp_type);
+    if (NEX == 0) {
+        std::vector<Eigen::VectorXd> uw = prev_U_;
+        for (auto& u : uw) {
+            if (desc.sanitize_warm_control) {
+                desc.sanitize_warm_control(u);
+            }
+        }
+        return uw;
+    }
 
     Eigen::VectorXd u_tail = prev_U_[N - 1 - NEX];
     if (u_tail.size() >= 4) {
@@ -56,7 +86,7 @@ std::vector<Eigen::VectorXd> QuadrotorMPC::makeXshifted(int n_shift) const {
     if (prev_X_.empty()) return {};
 
     const int Nx = static_cast<int>(prev_X_.size());
-    const int NEX = std::max(1, n_shift);
+    const int NEX = std::max(0, n_shift);
 
     std::vector<Eigen::VectorXd> xs(Nx);
     for (int i = 0; i < Nx; ++i) {
@@ -69,7 +99,7 @@ std::vector<Eigen::MatrixXd> QuadrotorMPC::makeKshifted(int n_shift) const {
     if (prev_K_.empty()) return {};
 
     const int Nk = static_cast<int>(prev_K_.size());
-    const int NEX = std::max(1, n_shift);
+    const int NEX = std::max(0, n_shift);
 
     std::vector<Eigen::MatrixXd> ks(Nk);
     for (int i = 0; i < Nk; ++i) {
@@ -108,14 +138,15 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
 
         if (!prev_U_.empty()) {
             auto desc = OCPRegistry::getDescriptor(config_.ocp_type);
+            const int warm_shift = next_warm_start_unshifted_ ? 0 : config_.n_shift;
             if (desc.warm_start == OCPDescriptor::WarmStart::Feedback) {
-                warm_u = makeUwarm(config_.n_shift);
-                warm_x = makeXshifted(config_.n_shift);
-                warm_k = makeKshifted(config_.n_shift);
+                warm_u = makeUwarm(warm_shift);
+                warm_x = makeXshifted(warm_shift);
+                warm_k = makeKshifted(warm_shift);
             } else {
                 const int Nu = static_cast<int>(prev_U_.size());
                 const int Nx = static_cast<int>(prev_X_.size());
-                const int shift = std::max(1, std::min(config_.n_shift, std::max(1, Nu - 1)));
+                const int shift = std::max(0, std::min(warm_shift, std::max(1, Nu - 1)));
 
                 std::vector<Eigen::VectorXd> su(Nu);
                 for (int i = 0; i < Nu; ++i) {
@@ -181,6 +212,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
             prev_X_ = X_result;
             prev_U_ = U_result;
             prev_K_ = K_result;
+            next_warm_start_unshifted_ = false;
 
             std::cout << "[MPC] solve " << result.solve_time_ms
                       << "ms iters=" << result.solve_iters

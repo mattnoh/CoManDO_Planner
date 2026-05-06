@@ -1,83 +1,143 @@
-# Chapter 1: Crazyflie ROS Nodes & Interface
+# Chapter 1: Crazyflie, MAVROS, and Target ROS Interfaces
 
-## 1. Overview
+`planner_node.cpp` delegates platform-specific message conversion to headers in
+`include/platform/`. The planner core works with Eigen vectors and descriptor
+metadata; platform adapters turn those vectors into ROS messages.
 
-The `comando_planner` node acts as a direct bridge to the **Crazyswarm2** ecosystem. Unlike previous versions that used intermediate bridge nodes, this version subscribes directly to Crazyflie telemetry and publishes `FullState` commands to minimize latency and synchronization jitter.
+## Crazyflie Adapter
 
-## 2. Subscribers (Data from Crazyflie)
+Source: `include/platform/crazyflie.hpp`
 
-The planner fuses two high-rate topics to assemble the 13-dimensional state vector **x**.
+### Absolute State Input
 
-### 2.1 State Vector Assembly
+For absolute OCPs, the Crazyflie adapter subscribes directly to:
 
-| Index | Field | Source Topic | Frame | Notes |
-|-------|-------|--------------|-------|-------|
-| 0-2 | Position | `/{drone}/pose` | World (ENU) | From MoCap |
-| 3-5 | Velocity | `/{drone}/odom` | World (ENU) | From onboard Kalman |
-| 6-9 | Quaternion | `/{drone}/pose` | World (ENU) | [w, x, y, z] |
-| 10-12 | Angular Rate| `/{drone}/odom` | Body (FLU) | Converted to rad/s |
+| Topic | Type | State fields |
+| --- | --- | --- |
+| `/{drone_name}/pose` | `geometry_msgs/msg/PoseStamped` | `px, py, pz, qw, qx, qy, qz` |
+| `/{drone_name}/odom` | `nav_msgs/msg/Odometry` | `vx, vy, vz, wx, wy, wz` |
 
-### 2.2 Callback Logic
+The resulting 13D state is:
 
-The `platform::crazyflie` abstraction handles these updates.
-
-- **Pose Callback**: Updates position and orientation.
-- **Odometry Callback**: Updates linear and angular velocity.
-  - **CRITICAL**: Crazyswarm2 logs angular velocity in **deg/s**. The planner automatically converts this to **rad/s** before storing it in the state vector.
-
-```cpp
-// internal conversion in crazyflie.hpp
-current_state(10) = msg->twist.twist.angular.x * (M_PI / 180.0);
+```text
+[px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
 ```
 
-### 2.3 Target Tracking
+Crazyswarm2 angular velocity is converted from degrees per second to radians per
+second in this absolute-input path.
 
-When using relative OCPs (`stateswitch`), the planner also subscribes to:
-- `target_odom_topic` (Default: `/target/odom`)
-- `target_accel_topic` (Default: `/target/accel`)
+### Relative State Input
 
-These are managed by the `TargetTracker` component and passed to the solver via `TargetSnapshot`.
+When the active OCP descriptor requests a relative drone odometry mode, the
+planner rebuilds the Crazyflie subscriptions and reads a single odometry topic:
 
----
+| Descriptor mode | Topic |
+| --- | --- |
+| `BodyFrameRelative` | `body_relative_odom_topic`, default `/drone/body_relative_odom` |
+| `TargetFrameRelative` | `/drone/target_frame_odom` |
 
-## 3. Publishers (Commands to Crazyflie)
+Relative odometry override topics are assumed to already use SI units and
+radians per second. They are not converted again.
 
-The planner primarily uses the **Mellinger Controller** interface for high-performance tracking.
+### Crazyflie Command Output
 
-### 3.1 Topic: `/{drone}/cmd_full_state`
+| OCP command mode | Topic | Type |
+| --- | --- | --- |
+| `CmdFullState` | `/{drone_name}/cmd_full_state` | `crazyflie_interfaces/msg/FullState` |
+| `CmdBodyRate` | `/{drone_name}/cmd_hover` | `crazyflie_interfaces/msg/Hover` |
 
-This topic accepts the `crazyflie_interfaces/msg/FullState` message, which includes position, velocity, orientation, angular rates, and acceleration feedforward.
+For `CmdFullState`, the adapter computes acceleration feedforward from the OCP
+thrust and commanded attitude:
 
-### 3.2 Acceleration Feedforward (a_ff)
-
-A key finding in the CoManDO project was that **acceleration feedforward is required** for stable tracking. Without it, the lower-level controller lags behind the MPC plan.
-
-The planner computes $a_{ff}$ directly from the predicted thrust $f_z$ and the commanded orientation $q$:
-
-$$a_{world} = R(q) \cdot \begin{bmatrix} 0 \\ 0 \\ f_z/m \end{bmatrix} + \begin{bmatrix} 0 \\ 0 \\ -g \end{bmatrix}$$
-
-This is more stable than numerical differentiation of the velocity trajectory and ensures the feedforward term is consistent with the physics used by the solver.
-
----
-
-## 4. Visualization & Debugging
-
-### 4.1 Trajectory Visualization
-
-The planner publishes the predicted horizon to `/{drone}/planned_trajectory` (`nav_msgs/msg/Path`).
-- **Green/Blue Path**: The future states the MPC is aiming for.
-- Use RViz2 to visualize this path alongside the drone's current pose.
-
-### 4.2 ROS Graph Summary
-
-```mermaid
-graph LR
-    CS[Crazyswarm2 Server] -- "/tf, /pose, /odom" --> CP[comando_planner]
-    GT[External Tracker] -- "/target/odom" --> CP
-    CP -- "/cmd_full_state" --> CS
-    CP -- "/planned_trajectory" --> RViz[RViz2]
+```text
+a_world = R(q) * [0, 0, fz / mass] + [0, 0, -9.81]
 ```
 
----
+For `CmdBodyRate`, the planner converts the OCP state/control to Crazyflie hover
+commands:
+
+```text
+[vx_body, vy_body, z_world, yaw_rate]
+```
+
+The command adapter clamps `vx_body` and `vy_body` to `[-1, 1]` and `z_world` to
+`[0.1, 3.0]`.
+
+## MAVROS Adapter
+
+Source: `include/platform/mavros.hpp`
+
+The MAVROS adapter is compiled only when `mavros_msgs` is found by CMake.
+
+| Direction | Topic | Type |
+| --- | --- | --- |
+| Input | `/mavros/local_position/odom` | `nav_msgs/msg/Odometry` |
+| Full-state output | `/mavros/setpoint_raw/local` | `mavros_msgs/msg/PositionTarget` |
+| Body-rate output | `/mavros/setpoint_raw/attitude` | `mavros_msgs/msg/AttitudeTarget` |
+
+The adapter starts a pre-arm sequence immediately:
+
+1. Publish neutral attitude setpoints for two seconds.
+2. Request `OFFBOARD`.
+3. Request arm.
+4. Publish commands only after the planner marks the vehicle armed.
+
+For body-rate output, the OCP control vector is interpreted as:
+
+```text
+[T_ms2, omega_x, omega_y, omega_z, Theta]
+```
+
+Only the first four values are sent. `T_ms2` is converted to normalized MAVROS
+thrust using the `hover_thrust` parameter.
+
+## Target Tracker
+
+Source: `include/platform/target_tracker.hpp`
+
+The planner always subscribes to target topics so runtime OCP switching does not
+require a node restart.
+
+| Topic parameter | Default | Type | Stored fields |
+| --- | --- | --- | --- |
+| `target_odom_topic` | `/target/odom` | `nav_msgs/msg/Odometry` | Position, velocity, orientation, angular velocity |
+| `target_accel_topic` | `/target/accel` | `geometry_msgs/msg/AccelStamped` | Linear and angular acceleration |
+| `target_predicted_accel_topic` | `/target/predicted_accel` | `trajectory_msgs/msg/MultiDOFJointTrajectory` | Future acceleration samples |
+
+Target odometry and acceleration have separate timestamps. Freshness checks use
+both timestamps when an OCP needs a fully valid target snapshot.
+
+## Target Publisher Helper
+
+Source: `src/target_publisher.cpp`
+
+`target_publisher` publishes `/target/odom` and `/target/accel` in `circle` or
+`qualisys` mode. It can also publish relative drone odometry for body-frame and
+target-frame OCPs.
+
+Common commands:
+
+```bash
+# Synthetic target only
+ros2 run comando_planner target_publisher --ros-args \
+  -p target_mode:=circle -p drone_odom_mode:=none
+
+# Body-frame relative odometry for tracking_bodyrate_bf_*
+ros2 run comando_planner target_publisher --ros-args \
+  -p target_mode:=circle \
+  -p drone_odom_mode:=body_frame \
+  -p drone_odom_topic:=/cf_1/odom \
+  -p drone_pose_topic:=/cf_1/pose
+
+# Target-frame relative odometry for tracking_bodyrate_tf_*
+ros2 run comando_planner target_publisher --ros-args \
+  -p target_mode:=circle \
+  -p drone_odom_mode:=target_frame \
+  -p drone_odom_topic:=/cf_1/odom \
+  -p drone_pose_topic:=/cf_1/pose
+```
+
+The current circle shape is defined in `include/target/circular_target.hpp`, not
+by runtime launch parameters.
 
 [Next Chapter: Planner Node Setup](02_planner_node_setup.md)

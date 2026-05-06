@@ -40,11 +40,11 @@ static constexpr int IDX_BN  = 16;
 static constexpr int IDX_DT  = 19;
 static constexpr int IDX_THETA = 4;
 
-static constexpr int HORIZON = 30;
+static constexpr int HORIZON = 40;
 static constexpr double TH_INIT = 0.1;
 static constexpr double THL = 0.05;
 static constexpr double THH = 0.2;
-static constexpr int DEFAULT_N_REPLAY = 7;
+static constexpr int DEFAULT_N_REPLAY = 4;
 
 static constexpr double DEFAULT_MASS_KG = 0.027;
 static constexpr double FMIN = 9.81 * 0.3;
@@ -52,34 +52,73 @@ static constexpr double FMAX = 9.81 * 3.0;
 static constexpr double OMEGA_MAX = 5.0;
 static constexpr double GS_TAN = 1.0;
 static constexpr double VZ_LAND_MAX = 0.5;
+static constexpr double HOVER_THRUST = 9.81;
+
+static constexpr double STAGE_TIME_W = 0.2;
+static constexpr double STAGE_POS_W = 8.0;
+static constexpr double STAGE_VEL_XY_W = 2.0;
+static constexpr double STAGE_VEL_Z_W = 4.0;
+static constexpr double STAGE_ATT_W = 1.0;
+static constexpr double STAGE_THRUST_W = 0.05;
+static constexpr double STAGE_OMEGA_W = 0.25;
+static constexpr double STAGE_THETA_W = 4.0;
 
 static const Eigen::Vector3d GRAVITY(0.0, 0.0, -9.81);
 
 template<typename Scalar>
 class TimeCost : public StageCostBase<Scalar> {
-    Scalar eps_;
 public:
-    explicit TimeCost(double eps = 1e-2) : eps_(eps) {}
+    TimeCost() = default;
+
     Scalar q(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
-        return u(IDX_THETA) + eps_ * x.segment(IDX_V, 3).squaredNorm();
+        const Scalar pos = x.template segment<3>(IDX_P).squaredNorm();
+        const Scalar vel_xy = x.template segment<2>(IDX_V).squaredNorm();
+        const Scalar vel_z = x(IDX_V + 2) * x(IDX_V + 2);
+        const Scalar att = x(IDX_Q + 1) * x(IDX_Q + 1) +
+                           x(IDX_Q + 2) * x(IDX_Q + 2);
+        const Scalar thrust_err = u(0) - Scalar(HOVER_THRUST);
+        const Scalar omega = u.template segment<3>(1).squaredNorm();
+        const Scalar theta_err = u(IDX_THETA) - Scalar(TH_INIT);
+        return Scalar(STAGE_TIME_W) * u(IDX_THETA) +
+               Scalar(STAGE_POS_W) * pos +
+               Scalar(STAGE_VEL_XY_W) * vel_xy +
+               Scalar(STAGE_VEL_Z_W) * vel_z +
+               Scalar(STAGE_ATT_W) * att +
+               Scalar(STAGE_THRUST_W) * thrust_err * thrust_err +
+               Scalar(STAGE_OMEGA_W) * omega +
+               Scalar(STAGE_THETA_W) * theta_err * theta_err;
     }
     Vector<Scalar> qx(const Vector<Scalar>& x, const Vector<Scalar>&) const override {
         Vector<Scalar> g = Vector<Scalar>::Zero(NX_SS);
-        g.segment(IDX_V, 3) = Scalar(2) * eps_ * x.segment(IDX_V, 3);
+        g.segment(IDX_P, 3) = Scalar(2 * STAGE_POS_W) * x.segment(IDX_P, 3);
+        g.segment(IDX_V, 2) = Scalar(2 * STAGE_VEL_XY_W) * x.segment(IDX_V, 2);
+        g(IDX_V + 2) = Scalar(2 * STAGE_VEL_Z_W) * x(IDX_V + 2);
+        g(IDX_Q + 1) = Scalar(2 * STAGE_ATT_W) * x(IDX_Q + 1);
+        g(IDX_Q + 2) = Scalar(2 * STAGE_ATT_W) * x(IDX_Q + 2);
         return g;
     }
-    Vector<Scalar> qu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
+    Vector<Scalar> qu(const Vector<Scalar>&, const Vector<Scalar>& u) const override {
         Vector<Scalar> g = Vector<Scalar>::Zero(NU_SS);
-        g(IDX_THETA) = Scalar(1.0);
+        g(0) = Scalar(2 * STAGE_THRUST_W) * (u(0) - Scalar(HOVER_THRUST));
+        g.segment(1, 3) = Scalar(2 * STAGE_OMEGA_W) * u.segment(1, 3);
+        g(IDX_THETA) = Scalar(STAGE_TIME_W) +
+                       Scalar(2 * STAGE_THETA_W) * (u(IDX_THETA) - Scalar(TH_INIT));
         return g;
     }
     Matrix<Scalar> qxx(const Vector<Scalar>&, const Vector<Scalar>&) const override {
         Matrix<Scalar> H = Matrix<Scalar>::Zero(NX_SS, NX_SS);
-        for (int i = IDX_V; i < IDX_V + 3; ++i) H(i, i) = Scalar(2) * eps_;
+        H(IDX_P+0,IDX_P+0)=H(IDX_P+1,IDX_P+1)=H(IDX_P+2,IDX_P+2)=Scalar(2*STAGE_POS_W);
+        H(IDX_V+0,IDX_V+0)=H(IDX_V+1,IDX_V+1)=Scalar(2*STAGE_VEL_XY_W);
+        H(IDX_V+2,IDX_V+2)=Scalar(2*STAGE_VEL_Z_W);
+        H(IDX_Q+1,IDX_Q+1)=H(IDX_Q+2,IDX_Q+2)=Scalar(2*STAGE_ATT_W);
         return H;
     }
     Matrix<Scalar> quu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
-        return Matrix<Scalar>::Zero(NU_SS, NU_SS);
+        Matrix<Scalar> H = Matrix<Scalar>::Zero(NU_SS, NU_SS);
+        H(0, 0) = Scalar(2 * STAGE_THRUST_W);
+        H(1, 1) = H(2, 2) = H(3, 3) = Scalar(2 * STAGE_OMEGA_W);
+        H(IDX_THETA, IDX_THETA) = Scalar(2 * STAGE_THETA_W);
+        return H;
     }
     Matrix<Scalar> qxu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
         return Matrix<Scalar>::Zero(NX_SS, NU_SS);
@@ -200,9 +239,9 @@ inline Param getSolverParams() {
     p.reg1_min = 1e-2;
     p.reg2_min = 0.5;
     p.mu_mul = 0.1;
-    p.rho = 30.0;
-    p.rhoT = 5.0;
-    p.rho_mul = 20.0;
+    p.rho = 10.0;
+    p.rhoT = 1.0;
+    p.rho_mul = 10.0;
     p.tolerance = 1e-4;
     p.max_iter = 500;
     p.is_quaternion_in_state = false;
@@ -233,8 +272,8 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     auto dyn = std::make_shared<Quad6DOFTargetFrameBodyRate<double>>();
     dyn->setGravity(GRAVITY);
 
-    auto cost  = std::make_shared<TimeCost<double>>(1e-2);
-    auto tcost = std::make_shared<TermCost<double>>(500.0, 50.0, 80.0, 10.0, -0.25);
+    auto cost  = std::make_shared<TimeCost<double>>();
+    auto tcost = std::make_shared<TermCost<double>>(250.0, 40.0, 40.0, 20.0, 0.0);
     auto cT    = std::make_shared<ScalarBoundCon<double>>(0, FMIN, FMAX);
     auto cwx   = std::make_shared<ScalarBoundCon<double>>(1, -OMEGA_MAX, OMEGA_MAX);
     auto cwy   = std::make_shared<ScalarBoundCon<double>>(2, -OMEGA_MAX, OMEGA_MAX);
@@ -268,7 +307,7 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     const double czz = std::max(0.5, Quad6DOFVarTime<double>::calcC(q0)(2, 2));
     Eigen::VectorXd u_hover(NU_SS);
     u_hover.setZero();
-    u_hover(0) = std::clamp(9.81 / czz, FMIN, FMAX);
+    u_hover(0) = std::clamp(HOVER_THRUST / czz, FMIN, FMAX);
     u_hover(IDX_THETA) = th_init;
 
     Eigen::VectorXd xsim = x0ss;
@@ -340,11 +379,11 @@ inline OCPDescriptor descriptor() {
         Eigen::VectorXd x = Eigen::VectorXd::Zero(NX);
         const int n = std::min(static_cast<int>(x_drone.size()), 10);
         x.head(n) = x_drone.head(n);  // [p_B^N, v_B^N, q_NB]
-        // Rotate target accel into target frame: â_N = R_NW * a_T^W
         const Eigen::Matrix3d R_NW = Quad6DOFVarTime<double>::calcC(tgt.orientation).transpose();
-        x.segment(IDX_OMN, 3) = tgt.angular_velocity;
+        // Match standalone worldToTargetFrame(): augmented target kinematics live in N.
+        x.segment(IDX_OMN, 3) = R_NW * tgt.angular_velocity;
         x.segment(IDX_AN,  3) = R_NW * tgt.acceleration;
-        x.segment(IDX_BN,  3) = tgt.angular_acceleration;
+        x.segment(IDX_BN,  3) = R_NW * tgt.angular_acceleration;
         return x;
     };
     d.validate_target = [](const TargetSnapshot& t, double, double) { return t.valid; };

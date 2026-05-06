@@ -115,6 +115,30 @@ public:
         return diag;
     }
 
+    bool hasPendingPlan() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return has_pending_plan_;
+    }
+
+    std::chrono::steady_clock::time_point activePlanOriginTime() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return last_solve_wall_time_;
+    }
+
+    double activeElapsedAt(const std::chrono::steady_clock::time_point& now) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (state_trajectory_.empty()) {
+            return 0.0;
+        }
+        return std::chrono::duration<double>(now - last_solve_wall_time_).count();
+    }
+
+    double activeHorizonEnd(double ocp_dt) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const int active_N = static_cast<int>(state_trajectory_.size()) - 1;
+        return (active_N > 0) ? nodeTime(active_N, ocp_dt) : 0.0;
+    }
+
     bool sampleActiveAtElapsed(double elapsed, double ocp_dt, ReplaySample* out) const {
         if (out == nullptr) {
             return false;

@@ -1,86 +1,142 @@
-# CoManDO Planner: Asynchronous Replanning Architecture
+# Chapter 6: Online Replanning and Trajectory Replay
 
-This document logs the critical architectural changes made to transition the CoManDO planner from a discrete, tick-gated approach to a high-frequency, fully asynchronous online replanning MPC pipeline. 
+The planner separates solving from command replay. ALIPDDP can take longer than
+one control period, so commands are sampled from the last accepted trajectory
+while a new solve is computed and staged for a controlled handoff.
 
-## 1. The Problem with the Old Architecture
+## Main Components
 
-Previously, the planner used a rigid **Tick-Based Gating** system. The `solverLoop` and the `mpcReplayTick` (publisher) were tightly coupled. The system would generate a trajectory based on nodes separated by $dt$ (e.g., 0.1s), and the publisher would manually step through these nodes one by one. This forced the publisher's speed to match the trajectory's resolution, guaranteeing lag. Furthermore, the solver was intentionally delayed ("gated") from starting a new calculation until the trajectory explicitly ran out or told the solver to begin. 
+| Component | File | Role |
+| --- | --- | --- |
+| `PlannerNode` | `src/planner_node.cpp` | ROS timers, parameter switching, platform dispatch, logging |
+| `PlannerCore` | `include/planner_core/planner_core.hpp` | ROS-free solve gating, acceptance, replay sampling, diagnostics |
+| `QuadrotorMPC` | `include/planner_core/quadrotor_mpc.hpp`, `src/quadrotor_mpc.cpp` | ALIPDDP wrapper and warm-start state |
+| `TrajectoryReplayer` | `include/trajectory_replayer.hpp` | Thread-safe active/pending trajectory buffer and interpolation |
 
-```mermaid
-sequenceDiagram
-    participant S as Solver
-    participant P as Publisher (Drone)
-    
-    S->>S: Generate Nodes [0.0s, 0.1s, 0.2s, 0.3s]
-    S->>P: Send full trajectory array
-    S->>S: (Sleeps / Blocked)
-    
-    P->>P: Output Node 1 (0.0s)
-    P->>P: (Wait 0.1s)
-    P->>P: Output Node 2 (0.1s)
-    P->>P: (Wait 0.1s)
-    P->>P: Output Node 3 (0.2s)
-    
-    P-->>S: "I'm almost out of nodes, start solving again!"
-    
-    S->>S: Generate Nodes [0.2s, 0.3s, 0.4s, 0.5s]
+## MPC Timing
+
+In `mpc` mode:
+
+| Timer | Period | Function |
+| --- | --- | --- |
+| Solver timer | 1 ms polling | Calls `solverLoop()`, which asks `PlannerCore` whether a solve may run |
+| Replay timer | active OCP `dt` | Calls `mpcReplayTick()` and publishes the current replay sample |
+
+The solver polling rate is not the solve acceptance rate. `PlannerCore` returns
+`waiting_for_handoff_time` until the active plan has replayed the configured
+handoff depth.
+
+## Accepted Plan Handoff
+
+When a solve is accepted, `PlannerCore` computes:
+
+```text
+last_replan_delay_sec = replayAdvanceTime(result.state_trajectory)
 ```
 
-The result was discontinuous trajectories, halting behavior, and time misalignment. The physical drone would receive commands that were out of sync with its real-world timestamps, causing jerking or crashing.
+`replayAdvanceTime()` uses `n_replay` and the trajectory node timestamps. For
+fixed-step OCPs this is approximately:
 
-## 2. The Solution: Four-Pillar Asynchronous Design
-
-### 2.1 Fully Decoupled Cadences (`planner_node.cpp`)
-We split the pipeline into two entirely independent threads/timers that communicate only via a thread-safe shared memory object (`trajectory_replayer`).
-
-*   **The Solver Loop (`solverLoop`)**: Runs as fast as legally possible (triggered every 1 ms). The moment it finishes a solve, it aggressively pulls the freshest `current_state` and starts a brand new calculation immediately. It no longer waits for permission from the publisher.
-*   **The Replay Loop (`mpcReplayTick`)**: Runs exactly at the desired control frequency (e.g., 100 Hz). It never waits for the solver. It simply asks the shared memory object, *"Give me the exact state I should be in right now."*
-
-```mermaid
-graph TD
-    classDef loop fill:#1f3a53,stroke:#4a90e2,stroke-width:2px,color:#fff;
-    classDef mem fill:#2a6540,stroke:#66c285,stroke-width:2px,color:#fff;
-
-    subgraph Fast Background Thread
-    SL[1ms Timer:<br>solverLoop]:::loop
-    ALIPDDP[ALIPDDP Numerical Solver]
-    SL -->|Pulls latest ROS state| ALIPDDP
-    end
-
-    subgraph Thread-Safe Shared Memory
-    TR[(TrajectoryReplayer)]:::mem
-    end
-
-    ALIPDDP -->|Uploads valid X, U<br>& Anchor Timestamp| TR
-
-    subgraph High-Freq Action Thread
-    P[100Hz Timer:<br>mpcReplayTick]:::loop
-    P --> |Requests exact state at WallTime=T| TR
-    TR -.-> |Returns smooth interpolated State & Control| P
-    P --> |Publishes| Drone[(Pixhawk / Crazyflie)]
-    end
+```text
+n_replay * ocp_dt
 ```
 
-### 2.2 Time-Continuous Interpolation (`trajectory_replayer.hpp`)
-We completely eliminated the concept of "sending nodes". We rewrote the `TrajectoryReplayer` to treat the solver outputs as a continuous mathematical function over time.
+For variable-DT OCPs it uses the cumulative DT state slot at the `n_replay`
+node.
 
-Instead of sending `node[k]`, the replayer now does:
-1. Computes exact elapsed time: `elapsed = current_real_time - solve_start_time`
-2. Finds which two nodes bridge this `elapsed` time.
-3. Performs a **linear interpolation** for position, velocity, and inputs ($x, y, z, v, f_z, m$) and **Spherical Linear Interpolation (SLERP)** for the attitude quaternion.
+The first accepted solve becomes active immediately. Later accepted solves are
+stored as pending plans. `TrajectoryReplayer::sample()` swaps the pending plan
+into active use only when:
 
-> [!TIP]
-> This decoupling completely solves the Node vs. frequency problem! The solver can plan loosely at 10 Hz ($dt=0.1s$) for a long prediction horizon, while the Replayer can pump smooth setpoints to the drone flight controller at 100 Hz or 500 Hz without breaking a sweat!
+```text
+activation_time_reached
+and (active plan is stale or minimum replay time elapsed)
+```
 
-### 2.3 Timestamp Anchoring & Network Latency Compensation (`quadrotor_mpc.cpp`)
-A classic MPC failure mode is the "Time Jump Backward." If the solver starts at $t=0$ and takes 50 milliseconds to solve, the drone is already at $t=50$ ms when the trajectory is output!
+This avoids replacing a plan before the drone reaches the intended handoff
+region.
 
-*   **The Fix**: We mandated that the `solve_timestamp` is hard-anchored to the exact physical microsecond that the `x0_abs` state snapshot was requested. 
-*   Because `TrajectoryReplayer` calculates elapsed time against this strict anchor, when a 50ms solve finishes, the Replay loop instantly skips the first 50ms of the output trajectory, ensuring the drone picks up the plan *exactly* where it physically is down to the millisecond. No jumping backwards.
+## Interpolation
 
-### 2.4 Mathematical & Boundary Validation (`planner_node.cpp` & `ocp_registry.hpp`)
-Because `solverLoop` runs unthrottled with live data, it will inevitably generate garbage trajectories (e.g. if the drone gets hit by wind or the solver gets stuck in a local minimum on a tight turn). We implemented a secondary gating system to protect the published setpoints:
+`TrajectoryReplayer` samples by elapsed wall-clock time:
 
-1.  **Constraint Error (Primal Residuals)**: Added `constraint_error` passthrough directly from the ALIPDDP solver. If the solver spits out a trajectory that violates continuity or glideslope (e.g., error > 1.0), we throw the solve in the trash.
-2.  **Physical Feasibility Gates**: We parse the entire timeline inside `validateTrajectory()` to check for suicidal commands across the horizon (e.g., altitudes $< -0.05m$, insane velocities $> 20$ m/s, negative thrust commands).
-3.  **Fallback Persistence**: If a new solve is rejected, the `TrajectoryReplayer` completely ignores it and seamlessly continues playing the previous valid solve's timeline. This buys the solver more time to try again on the next 1ms tick without dropping the drone out of the sky.
+1. Compute `elapsed = now - active_plan_origin_time`.
+2. Find the bracketing trajectory nodes.
+3. Linearly interpolate physical state and controls.
+4. Renormalize the quaternion segment `[qw,qx,qy,qz]`.
+5. Preserve the DT slot and trailing augmented states from the lower node.
+
+For variable-DT OCPs, node times come from the cumulative DT state slot. For
+fixed-step OCPs, node times are `k * ocp_dt`.
+
+## Diagnostics
+
+When a pending plan replaces the active plan, `TrajectoryReplayer` records a
+handoff diagnostic:
+
+| Value | Meaning |
+| --- | --- |
+| `previous_solve_num` | Replaced solve number |
+| `new_solve_num` | Activated solve number |
+| `active_plan_age_sec` | Age of old active plan at swap |
+| `solve_latency_sec` | ALIPDDP solve duration |
+| `state_jump_norm` | Norm between old and new command states at handoff |
+| `control_jump_norm` | Norm between old and new controls at handoff |
+
+The node logs these diagnostics and publishes RViz jump markers/text.
+
+## Solve Acceptance
+
+`PlannerCore::isSolveAcceptable()` rejects solves unless descriptor or runtime
+configuration skips validation.
+
+Generic checks:
+
+| Check | Threshold |
+| --- | --- |
+| solver success and at least two trajectory states | required |
+| `constraint_error` | <= `max_constraint_error` (`1.0` in default core config) |
+| altitude | `z >= -0.05`, unless descriptor skips altitude validation |
+| velocity norm | <= `20 m/s` |
+| angular-rate norm | <= `50 rad/s` |
+| thrust control | `-0.1 <= u[0] <= 50.0` |
+
+Several relative OCPs skip generic validation because their raw state is not a
+world-frame physical state.
+
+## Stale Plan Handling
+
+Replay samples are marked stale when:
+
+```text
+elapsed > horizon_end + 0.2
+```
+
+In MPC mode, the node warns and clamps to the terminal replay sample. After
+three stale warnings, it enters hover hold and pauses the command sequence.
+
+## Open-Loop Replay
+
+Open-loop mode does not use the pending-plan replayer. The node:
+
+1. Waits for required drone/target state.
+2. Solves once.
+3. Stores `ol_ref_X_` and `ol_ref_U_`.
+4. Publishes one node per `ocp_dt`.
+5. Transitions to hover hold at horizon end.
+
+For absolute open-loop commands, optional divergence abort compares measured
+world z and vz to the command. The check is skipped for relative-state modes
+because raw `x[2]` is not world altitude there.
+
+## Practical Tuning
+
+| Symptom | Parameter or area to check |
+| --- | --- |
+| Handoffs are too frequent | Increase `n_replay` |
+| Planner reacts too slowly | Decrease `n_replay` or shorten OCP solve time |
+| Stale trajectory warnings | Check target freshness, solver success, and validation rejects |
+| Visible handoff jumps | Inspect RViz handoff markers and `state_jump_norm` logs |
+| Terminal solve chatter | Tune `terminal_freeze_enter_pos` and `terminal_freeze_exit_pos` |
+
+[Back to Index](index.md)

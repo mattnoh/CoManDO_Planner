@@ -80,18 +80,25 @@ inline Eigen::Vector4d makeCrazyflieHoverCommand(const OCPDescriptor& desc,
     if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::TargetFrameRelative &&
         state.size() >= 10) {
         const Eigen::Vector4d q_NB = state.segment(6, 4);
+        const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(target.orientation);
         const Eigen::Matrix3d R_NB = Quad6DOFVarTime<double>::calcC(q_NB);
-        const Eigen::Vector3d v_body = R_NB.transpose() * state.segment(3, 3);
+        const Eigen::Matrix3d R_WB = R_WN * R_NB;
+        const Eigen::Vector3d p_N = state.segment(0, 3);
+        const Eigen::Vector3d v_N = state.segment(3, 3);
+        const Eigen::Vector3d v_world =
+            target.velocity + R_WN * (v_N + target.angular_velocity.cross(p_N));
+        const Eigen::Vector3d v_body = R_WB.transpose() * v_world;
         vx_body = v_body.x();
         vy_body = v_body.y();
-        z_world = target.position.z() + state(2);
+        z_world = target.position.z() + (R_WN * p_N).z();
     } else if (desc.drone_odom_mode == OCPDescriptor::DroneOdomMode::BodyFrameRelative &&
                state.size() >= 10) {
-        vx_body = state(3);
-        vy_body = state(4);
         const Eigen::Vector4d q_NB = state.segment(6, 4);
         const Eigen::Matrix3d R_WN = Quad6DOFVarTime<double>::calcC(target.orientation);
         const Eigen::Matrix3d R_WB = R_WN * Quad6DOFVarTime<double>::calcC(q_NB);
+        const Eigen::Vector3d v_body = state.segment(3, 3) + R_WB.transpose() * target.velocity;
+        vx_body = v_body.x();
+        vy_body = v_body.y();
         const Eigen::Vector3d p_target_from_drone_world = R_WB * state.segment(0, 3);
         z_world = target.position.z() - p_target_from_drone_world.z();
     } else {

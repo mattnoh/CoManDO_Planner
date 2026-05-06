@@ -1,146 +1,138 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file gives coding-agent guidance for the current `comando_planner`
+package.
 
 ## Build
 
+Build from the ROS workspace root:
+
 ```bash
 source /opt/ros/humble/setup.zsh
-source ~/ros_ws/install/setup.zsh
-cd ~/ros_ws
+cd /home/lab/projects/cf/online/ros_ws
 colcon build --symlink-install --packages-select comando_planner
+source install/setup.zsh
 ```
 
-ALIPDDP is compiled as a static library from the sibling directory `../ALIPDDP-main` via `add_subdirectory()`. Optional Qualisys support (`mocap4r2_msgs`) is detected at build time and guarded by `HAS_MOCAP4R2_MSGS`.
+`CMakeLists.txt` adds ALIPDDP from the sibling package path
+`../ALIPDDP-main`. Optional dependencies:
 
-### Standalone validation test (no ROS required)
+| Dependency | Build behavior |
+| --- | --- |
+| `mavros_msgs` | Enables MAVROS platform support and defines `HAS_MAVROS_MSGS` |
+| `mocap4r2_msgs` | Enables Qualisys target mode and defines `HAS_MOCAP4R2_MSGS` |
+
+The package still builds without those optional message packages, but related
+runtime paths are unavailable or fall back.
+
+## Common Run Commands
+
+Two-step launch:
 
 ```bash
-cd ~/ros_ws/build/comando_planner
-./test_poly_ocp
+ros2 launch comando_planner planner_launch.py \
+  drone_name:=cf_1 platform:=crazyflie record_bag:=false
+
+ros2 launch comando_planner ocp_launch.py \
+  ocp_type:=hover mode:=mpc n_replay:=4 \
+  hover_target_x:=0.0 hover_target_y:=0.0 hover_target_z:=1.0 \
+  command_seq:=1
 ```
 
-Source file: `test/test_poly_ocp_standalone.cpp`.
-
-## Running the planner
-
-Two-step launch: start infrastructure first, then push an OCP profile.
+Target publisher for body-frame OCPs:
 
 ```bash
-# Terminal A — starts node in paused state
-ros2 launch comando_planner planner_launch.py drone_name:=cf_1
-
-# Terminal B — push an OCP and trigger execution
-ros2 launch comando_planner ocp_launch.py ocp_type:=hover mode:=mpc \
-    hover_target_x:=0.0 hover_target_y:=0.0 hover_target_z:=1.0 command_seq:=1
+ros2 run comando_planner target_publisher --ros-args \
+  -p target_mode:=circle \
+  -p drone_odom_mode:=body_frame \
+  -p drone_odom_topic:=/cf_1/odom \
+  -p drone_pose_topic:=/cf_1/pose
 ```
 
-`ocp_launch.py` staggers parameter updates 150ms apart then fires `command_seq` last, ensuring the node sees a consistent config snapshot before acting. Increment `command_seq` each time you push a new profile to the same running node.
+Target publisher for target-frame OCPs:
 
-## Architecture
+```bash
+ros2 run comando_planner target_publisher --ros-args \
+  -p target_mode:=circle \
+  -p drone_odom_mode:=target_frame \
+  -p drone_odom_topic:=/cf_1/odom \
+  -p drone_pose_topic:=/cf_1/pose
+```
 
-### Registry-Driven OCP Design
+## Current Architecture
 
-Each OCP is an `OCPDescriptor` registered in `OCPRegistry::getTable()` (`include/core/ocp_registry.hpp`). Adding a new behavior is two steps:
+The planner is split into:
 
-1. Create `include/ocp/ocp_mynew.hpp` with a `descriptor()` function returning `OCPDescriptor`.
-2. Add one line to the `table` in `ocp_registry.hpp`: `{"mynew", MyNewOCP::descriptor()}`.
+| Area | Files | Notes |
+| --- | --- | --- |
+| ROS node | `src/planner_node.cpp` | Parameters, timers, state snapshots, logging, command publication |
+| ROS-free core | `include/planner_core/` | OCP descriptors, frame/command adapters, solve/replay orchestration |
+| OCPs | `include/ocp/` | Concrete ALIPDDP problem definitions and descriptors |
+| Platforms | `include/platform/` | Crazyflie, MAVROS, target tracking, state monitor |
+| Replay | `include/trajectory_replayer.hpp` | Thread-safe active/pending plan interpolation |
 
-No changes to `planner_node.cpp`, `TrajectoryReplayer`, or logging are needed.
+## OCP Registry
 
-**Do not include `ocp_registry.hpp` from OCP headers** — it would be circular. Include `core/ocp_descriptor.hpp` instead.
+Registry source: `include/planner_core/ocp_registry.hpp`.
 
-### Solve-while-Replay Pattern
+To add an OCP:
 
-Solver and replay run in separate callback groups (both `MutuallyExclusive`):
+1. Add `include/ocp/ocp_mynew.hpp`.
+2. Implement `MyNewOCP::descriptor()` returning `OCPDescriptor`.
+3. Include the header in `ocp_registry.hpp`.
+4. Add one table entry: `{"mynew", MyNewOCP::descriptor()}`.
 
-- **Solver loop** fires every `n_replay` replay cycles, snapshots drone+target state, calls ALIPDDP, hands a new trajectory to `TrajectoryReplayer`.
-- **Replay timer** fires at `ocp_dt` (e.g. 50 Hz), samples the active trajectory, publishes commands.
+Current keys:
 
-This keeps command output consistent across 100ms+ solve times.
+```text
+hover
+landing
+stateswitch
+tracking_circle_target
+tracking_bodyrate_tf_noimu
+tracking_bodyrate_tf_imu
+tracking_bodyrate_bf_imu
+tracking_bodyrate_bf_noimu
+```
 
-### Key Types
+There is no current `tracking_circle` registry key.
 
-**`OCPDescriptor`** (`include/core/ocp_descriptor.hpp`) — declares identity, timing, dimensions, mode flags, and callbacks:
+## Runtime Contracts
 
-| Field | Purpose |
-|-------|---------|
-| `command_mode` | `CmdFullState` (wrench) or `CmdBodyRate` (specific thrust + angular rates) |
-| `drone_odom_mode` | Which topic / frame the planner reads for drone state (see below) |
-| `transform_state` | Converts raw sensor state into OCP state at solve time |
-| `validate_target` | Returns false → solver withheld (stale/invalid target) |
-| `post_process_result` | Modify `SolverResult` after solve (e.g. mark relative plan) |
-| `merge_prev_augmented` | Re-injects augmented states from previous trajectory into the new `x0` |
-| `prepare_extra` | Build OCP-specific extra params passed to `create()` |
+| OCP family | Drone input | Target input | Command output |
+| --- | --- | --- | --- |
+| `hover`, `landing` | absolute Crazyflie or MAVROS odom | none | full state |
+| `stateswitch` | absolute drone state | `/target/odom`, `/target/accel` | full state reconstructed to world |
+| `tracking_circle_target` | absolute drone state | `/target/odom`, `/target/predicted_accel`; open-loop only | full state reconstructed to world |
+| `tracking_bodyrate_bf_*` | `/drone/body_relative_odom` | `/target/odom`, `/target/accel` | Crazyflie `cmd_hover` or MAVROS `AttitudeTarget` |
+| `tracking_bodyrate_tf_*` | `/drone/target_frame_odom` | `/target/odom`, `/target/accel` | Crazyflie `cmd_hover` or MAVROS `AttitudeTarget` |
 
-**`SolverResult`** — wraps ALIPDDP output: `state_trajectory`, `control_trajectory`, relative-plan flag, and target snapshot embedded at solve time.
+## Validation Commands
 
-**`TargetSnapshot`** (`include/core/target_snapshot.hpp`) — atomic copy of target state at solve time: position, velocity, acceleration, angular velocity, orientation.
+After building:
 
-### DroneOdomMode
+```bash
+ros2 run comando_planner test_poly_ocp
+ros2 run comando_planner test_trajectory_replayer
+ros2 run comando_planner test_target_frame_warm_start
+ros2 run comando_planner test_planner_core
+ros2 run comando_planner test_stateswitch_predictor
+```
 
-Controls which topic the planner subscribes to for drone state:
+Manual Crazyflie body-rate path check:
 
-| Mode | Topic | Description |
-|------|-------|-------------|
-| `Absolute` | `/{name}/pose` + `/{name}/odom` | Standard world-frame state |
-| `AbsoluteShiftedTarget` | Same as above | `transform_state` subtracts target position at solve time |
-| `BodyFrameRelative` | `/drone/body_relative_odom` | Published by `target_publisher` with `enable_body_relative_odom:=true` |
-| `TargetFrameRelative` | `/drone/target_frame_odom` | Published by `target_publisher`; drone position/velocity in target frame N |
+```bash
+ros2 run comando_planner test_bodyrate_cmd.py --ros-args \
+  -p drone_name:=cf_1 -p thrust:=9.81 -p wz:=0.52 -p duration:=3.0
+```
 
-### Platform Adapters (`include/platform/`)
+## Documentation
 
-| Platform | Input | Output | Frame |
-|----------|-------|--------|-------|
-| Crazyflie | `/{name}/pose`, `/{name}/odom` | `/{name}/cmd_full_state` or `/{name}/cmd_hover` | ENU |
-| MAVROS | `/mavros/local_position/odom` | `/mavros/setpoint_raw/local` or `/mavros/setpoint_raw/attitude` | ENU/NED adapter boundary |
+Primary docs:
 
-Crazyflie angular velocity from crazyswarm2 arrives in deg/s and is converted to rad/s internally.
-
-### target_publisher Node
-
-Two modes (`target_mode` param): `"circle"` (fully synthetic) or `"qualisys"` (real vehicle with velocity computed from circular model). Set `enable_body_relative_odom:=true` or `enable_target_frame_odom:=true` to publish the additional relative odometry topics needed by body-frame / target-frame OCPs.
-
-### Terminal Freeze
-
-Solver stops when drone is within `terminal_freeze_enter_pos` and velocity below `terminal_freeze_enter_vel`. Replayer continues executing the last plan. Disabled automatically for tracking OCPs.
-
-## OCP Catalog
-
-| OCP key | File | Frame | State dim | Control dim | Notes |
-|---------|------|-------|-----------|-------------|-------|
-| `hover` | `ocp_hover.hpp` | Absolute | 13 | 4 | Fixed-point stabilization |
-| `landing` | `ocp_landing.hpp` | Absolute | 13 | 4 | Vertical descent |
-| `stateswitch` | `ocp_stateswitch.hpp` | AbsoluteShiftedTarget | 13 | 5 | Variable DT, 30 steps |
-| `tracking_circle_target` | `ocp_tracking_circle_target.hpp` | Absolute | 13 | 4 | Receding-horizon circle via predicted trajectory |
-| `tracking_bodyrate_tf_noimu` | `ocp_tracking_bodyrate_tf_noimu.hpp` | TargetFrameRelative | 11 (10+DT) | 5 | No augmented IMU states |
-| `tracking_bodyrate_tf_imu` | `ocp_tracking_bodyrate_tf_imu.hpp` | TargetFrameRelative | 20 (19+DT) | 5 | Augmented Ω_N, â_N, β_N |
-| `tracking_bodyrate_bf_noimu` | `ocp_tracking_bodyrate_bf_noimu.hpp` | BodyFrameRelative | 11 (10+DT) | 5 | No augmented IMU states |
-| `tracking_bodyrate_bf_imu` | `ocp_tracking_bodyrate_bf_imu.hpp` | BodyFrameRelative | 20 (19+DT) | 5 | Augmented Ω_N, a_T^B, β_N |
-
-### 13D State (hover, landing, stateswitch, tracking_circle_target)
-
-`[px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]`
-
-Control: `[fz_B, Mx, My, Mz]` — body-frame thrust + moments.
-
-### 10D Physical State (bodyrate OCPs without IMU)
-
-**Target frame (tf):** `[p_B^N (3), v_B^N (3), q_NB (4)]` — drone position/velocity/attitude in target frame N.
-
-**Body frame (bf):** `[p_T^B (3), v_rel^B (3), q_NB (4)]` — target position in drone body frame, relative velocity in body frame.
-
-Control: `[T (1), ω_B (3), Theta (1)]` — specific thrust [m/s²], body angular rates, time segment.
-
-### 19D Augmented Physical State (bodyrate OCPs with IMU)
-
-Adds `[Ω_N (3), a_T (3), β_N (3)]` to the 10D physical state at indices 10–18; DT appended at index 19.
-
-`merge_prev_augmented` in the descriptor re-injects these from the previous solve trajectory so the solver carries forward propagated target kinematics rather than resetting from the snapshot.
-
-## Logging
-
-When `enable_logging:=true`, logs written to `./logs/{drone}_{ocp}_{mode}_{solver}_{timestamp}/`:
-- `all_solves.csv` — per-solve metadata + full state/control trajectories
-- `commanded_state.csv` — per-command output
-- `actual_state.csv` — raw sensor measurements
+| File | Purpose |
+| --- | --- |
+| `README.md` | Quick start, OCP catalog, workflows |
+| `docs/COMANDO_PLANNER_INTERFACE.md` | Full ROS topics, parameters, registry, logging |
+| `docs/dynamic_target_hardware_integration.md` | External target estimator/predictor contract |
+| `docs/CoManDO_planner/` | Chapter-style architecture notes |

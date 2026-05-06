@@ -421,8 +421,8 @@ private:
             // v_B^N = R_NW * (v_drone - v_tgt) - Om_N x p_B^N
             // q_NB  = q_target^{-1} * q_drone
             const Eigen::Matrix3d R_NW = last_target_quat_.conjugate().toRotationMatrix();
-            // Om_N: use actual estimated target angular velocity
-            const Eigen::Vector3d Om_N = Eigen::Vector3d(k.wx, k.wy, k.wz);
+            const Eigen::Vector3d omega_W(k.wx, k.wy, k.wz);
+            const Eigen::Vector3d Om_N = R_NW * omega_W;
 
             const Eigen::Vector3d p_drone(drone_pose_copy.pose.position.x,
                                            drone_pose_copy.pose.position.y,
