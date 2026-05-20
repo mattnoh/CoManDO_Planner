@@ -259,6 +259,7 @@ struct OCPDescriptor {
     bool skip_trajectory_validation = false;
     bool variable_dt = false;
     bool use_predicted_handoff_state = true;
+    bool disarm_on_landing_finish = false;
 
     int state_dim = 13;
     int control_dim = 4;

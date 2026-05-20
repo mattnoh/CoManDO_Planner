@@ -261,6 +261,64 @@ private:
         return {float(hover(0)), float(hover(1)), float(hover(2)), float(hover(3))};
     }
 
+    bool shouldDisarmOnLandingFinish() const {
+        if (platform_ != "crazyflie" || ocp_type_.empty()) {
+            return false;
+        }
+        return OCPRegistry::getDescriptor(ocp_type_).disarm_on_landing_finish;
+    }
+
+    bool currentStateInsideTerminalPositionThreshold(
+        const Eigen::VectorXd& current_state,
+        const TargetSnapshot& target_snapshot) const
+    {
+        const auto& desc = OCPRegistry::getDescriptor(ocp_type_);
+        Eigen::VectorXd terminal_state = current_state;
+        if (desc.transform_state) {
+            if (!target_snapshot.valid) {
+                return false;
+            }
+            terminal_state = desc.transform_state(current_state, target_snapshot);
+        }
+        if (terminal_state.size() < 3) {
+            return false;
+        }
+        if (desc.transform_state) {
+            return terminal_state.segment(0, 3).norm() < terminal_freeze_enter_pos_;
+        }
+        return (terminal_state.segment(0, 3) - terminal_position_abs_).norm() <
+            terminal_freeze_enter_pos_;
+    }
+
+    bool rejectedSolveCompletesLanding(
+        const planner_core::PlannerCoreStepResult& result,
+        const Eigen::VectorXd& current_state,
+        const TargetSnapshot& target_snapshot) const
+    {
+        return shouldDisarmOnLandingFinish() &&
+            result.solve_attempted &&
+            result.rejection_reason == "constraint_error" &&
+            currentStateInsideTerminalPositionThreshold(current_state, target_snapshot);
+    }
+
+    bool dispatchLandingShutdownOnce(const std::string& reason) {
+        if (!shouldDisarmOnLandingFinish()) {
+            return false;
+        }
+        if (landing_shutdown_sent_.load()) {
+            return true;
+        }
+        if (!platform::crazyflie::requestLandingShutdownAsync(this, cf_handles_, reason)) {
+            return false;
+        }
+        landing_shutdown_sent_.store(true);
+        command_paused_.store(true);
+        ocp_active_.store(false);
+        maintain_hover_hold_ = false;
+        terminal_freeze_.store(true);
+        return true;
+    }
+
     geometry_msgs::msg::Point pointMsg(const Eigen::Vector3d& p) const {
         geometry_msgs::msg::Point out;
         out.x = p.x();
@@ -748,6 +806,7 @@ private:
         planner_core_.reset();
         is_primed_.store(false);
         terminal_freeze_.store(false);
+        landing_shutdown_sent_.store(false);
         stale_warning_count_ = 0;
         replay_ticks_since_solve_.store(0);
         last_accepted_solve_timestamp_ = Clock::time_point{};
@@ -757,6 +816,9 @@ private:
     // Publishes a world-frame state directly without applying reconstruct_world_state.
     // Use for hover-hold ticks where paused_hover_state_ is already in world frame.
     void publishCommandAbsolute(const Eigen::VectorXd& s_world, const Eigen::VectorXd& u) {
+        if (landing_shutdown_sent_.load()) {
+            return;
+        }
         if (platform_ == "crazyflie") {
             platform::crazyflie::publishCommand(this, cf_handles_, s_world, u, mass_kg_);
         } else if (platform_ == "mavros") {
@@ -765,6 +827,9 @@ private:
     }
 
     void publishPausedHoverHoldTick() {
+        if (landing_shutdown_sent_.load()) {
+            return;
+        }
         if (command_mode_ == OCPDescriptor::CommandMode::CmdBodyRate) {
             if (platform_ == "crazyflie") {
                 if (drone_state_is_relative_) {
@@ -1066,6 +1131,9 @@ private:
         auto coord_mode = [&]() -> std::string {
             if (!result.solve_log.coord_mode.empty()) {
                 return result.solve_log.coord_mode;
+            }
+            if (result.solve_result.is_relative_plan) {
+                return "absolute_shifted";
             }
             return currentFrameLabel();
         };
@@ -1383,9 +1451,19 @@ private:
         if (!core_result.solve_accepted) {
             if (core_result.terminal_freeze_engaged) {
                 terminal_freeze_.store(true);
+                dispatchLandingShutdownOnce("terminal freeze engaged");
             }
             if (core_result.terminal_freeze_released) {
                 terminal_freeze_.store(false);
+            }
+            if (core_result.rejection_reason == "terminal_freeze_active") {
+                dispatchLandingShutdownOnce("terminal freeze active");
+            }
+            if (rejectedSolveCompletesLanding(core_result, x0_abs, target_snapshot)) {
+                terminal_freeze_.store(true);
+                RCLCPP_WARN(this->get_logger(),
+                    "Landing solve rejected near terminal by constraint_error; treating as landing completion.");
+                dispatchLandingShutdownOnce("near-terminal constraint_error");
             }
             return;
         }
@@ -1543,6 +1621,9 @@ private:
     }
 
     void publishCommand(const planner_core::PlannerCommand& cmd) {
+        if (landing_shutdown_sent_.load()) {
+            return;
+        }
         if (cmd.kind == planner_core::CommandKind::Hover && platform_ == "crazyflie") {
             platform::crazyflie::publishHoverCommandDirect(cf_handles_, hoverArray(cmd.hover));
         } else if (cmd.kind == planner_core::CommandKind::BodyRate && platform_ == "mavros") {
@@ -1742,6 +1823,16 @@ private:
         const int N = static_cast<int>(ol_ref_X_.size()) - 1;
 
         if (ol_replay_step_ >= N) {
+            if (shouldDisarmOnLandingFinish()) {
+                if (dispatchLandingShutdownOnce("open-loop landing complete")) {
+                    stopReplayTimer();
+                    setOpenLoopPhase(OpenLoopPhase::Idle);
+                    ocp_active_.store(false);
+                    RCLCPP_INFO(this->get_logger(),
+                        "[OpenLoop] Landing replay complete. Crazyflie shutdown dispatched.");
+                }
+                return;
+            }
             if (hasState() && is_configured_) {
                 const Eigen::VectorXd x_now = convertStateToAbsoluteFrame(getCurrentState());
                 paused_hover_state_ = hover_controller::makeHoverState(
@@ -1862,6 +1953,7 @@ private:
     std::atomic<int>  replay_ticks_since_solve_{0};
     std::atomic<bool> is_primed_{false};
     std::atomic<bool> terminal_freeze_{false};
+    std::atomic<bool> landing_shutdown_sent_{false};
     Eigen::Vector3d terminal_position_abs_ = Eigen::Vector3d::Zero();
     Clock::time_point last_accepted_solve_timestamp_{};
     double last_replan_delay_sec_ = 0.0;

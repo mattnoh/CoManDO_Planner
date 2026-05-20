@@ -87,10 +87,19 @@ std::vector<Eigen::VectorXd> QuadrotorMPC::makeXshifted(int n_shift) const {
 
     const int Nx = static_cast<int>(prev_X_.size());
     const int NEX = std::max(0, n_shift);
+    const auto desc = OCPRegistry::getDescriptor(config_.ocp_type);
+    const int base = std::min(NEX, Nx - 1);
+    const double t0_shift =
+        (desc.variable_dt && prev_X_[base].size() > desc.state_dim)
+            ? prev_X_[base](desc.state_dim)
+            : 0.0;
 
     std::vector<Eigen::VectorXd> xs(Nx);
     for (int i = 0; i < Nx; ++i) {
         xs[i] = prev_X_[std::min(i + NEX, Nx - 1)];
+        if (desc.variable_dt && xs[i].size() > desc.state_dim) {
+            xs[i](desc.state_dim) = std::max(0.0, xs[i](desc.state_dim) - t0_shift);
+        }
     }
     return xs;
 }

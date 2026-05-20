@@ -460,6 +460,7 @@ inline OCPDescriptor descriptor() {
     d.warm_start = OCPDescriptor::WarmStart::Shift;
     d.command_mode = OCPDescriptor::CommandMode::CmdFullState;
     d.drone_odom_mode = OCPDescriptor::DroneOdomMode::Absolute;
+    d.disarm_on_landing_finish = true;
     d.state_dim = 13;
     d.control_dim = 4;
     d.log_state_headers = OCPLoggerDefaults::getStateHeaders13D();

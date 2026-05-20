@@ -24,6 +24,8 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <crazyflie_interfaces/msg/full_state.hpp>
 #include <crazyflie_interfaces/msg/hover.hpp>
+#include <crazyflie_interfaces/srv/arm.hpp>
+#include <crazyflie_interfaces/srv/notify_setpoints_stop.hpp>
 #include <Eigen/Dense>
 #include <array>
 #include <algorithm>
@@ -84,12 +86,16 @@ struct Handles {
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub;
     rclcpp::Publisher<crazyflie_interfaces::msg::FullState>::SharedPtr cmd_pub;
     rclcpp::Publisher<crazyflie_interfaces::msg::Hover>::SharedPtr cmd_hover_pub;
+    rclcpp::Client<crazyflie_interfaces::srv::NotifySetpointsStop>::SharedPtr notify_setpoints_stop_client;
+    rclcpp::Client<crazyflie_interfaces::srv::Arm>::SharedPtr arm_client;
 
     void reset() {
         pose_sub.reset();
         odom_sub.reset();
         cmd_pub.reset();
         cmd_hover_pub.reset();
+        notify_setpoints_stop_client.reset();
+        arm_client.reset();
     }
 };
 
@@ -120,6 +126,11 @@ inline void setup(
         "/" + drone_name + "/cmd_full_state", 10);
     handles.cmd_hover_pub = node->create_publisher<crazyflie_interfaces::msg::Hover>(
         "/" + drone_name + "/cmd_hover", 10);
+    handles.notify_setpoints_stop_client =
+        node->create_client<crazyflie_interfaces::srv::NotifySetpointsStop>(
+            "/" + drone_name + "/notify_setpoints_stop");
+    handles.arm_client = node->create_client<crazyflie_interfaces::srv::Arm>(
+        "/" + drone_name + "/arm");
 
     rclcpp::SubscriptionOptions opts;
     opts.callback_group = callback_group;
@@ -190,6 +201,58 @@ inline void setup(
             "[Crazyflie] Subscribed: /%s/pose, /%s/odom | Publishing: /%s/cmd_full_state, /%s/cmd_hover",
             drone_name.c_str(), drone_name.c_str(), drone_name.c_str(), drone_name.c_str());
     }
+}
+
+inline bool requestLandingShutdownAsync(
+    rclcpp::Node* node,
+    Handles& handles,
+    const std::string& reason = {})
+{
+    using NotifySetpointsStop = crazyflie_interfaces::srv::NotifySetpointsStop;
+    using Arm = crazyflie_interfaces::srv::Arm;
+
+    if (!handles.notify_setpoints_stop_client || !handles.arm_client) {
+        RCLCPP_WARN(node->get_logger(),
+            "[Crazyflie] Landing shutdown requested but service clients are not initialized.");
+        return false;
+    }
+    if (!handles.notify_setpoints_stop_client->service_is_ready() ||
+        !handles.arm_client->service_is_ready()) {
+        RCLCPP_WARN_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
+            "[Crazyflie] Landing shutdown waiting for /notify_setpoints_stop and /arm services.");
+        return false;
+    }
+
+    auto notify_request = std::make_shared<NotifySetpointsStop::Request>();
+    notify_request->group_mask = 0;
+    notify_request->remain_valid_millisecs = 0;
+
+    const auto logger = node->get_logger();
+    const auto arm_client = handles.arm_client;
+    const std::string reason_text = reason;
+
+    handles.notify_setpoints_stop_client->async_send_request(
+        notify_request,
+        [logger, arm_client, reason_text](rclcpp::Client<NotifySetpointsStop>::SharedFuture) {
+            if (!arm_client || !arm_client->service_is_ready()) {
+                RCLCPP_WARN(logger,
+                    "[Crazyflie] notify_setpoints_stop completed, but /arm service is not ready.");
+                return;
+            }
+            auto arm_request = std::make_shared<Arm::Request>();
+            arm_request->arm = false;
+            arm_client->async_send_request(arm_request);
+            if (reason_text.empty()) {
+                RCLCPP_INFO(logger,
+                    "[Crazyflie] Landing shutdown dispatched: notify_setpoints_stop -> arm(false).");
+            } else {
+                RCLCPP_INFO(logger,
+                    "[Crazyflie] Landing shutdown dispatched (%s): notify_setpoints_stop -> arm(false).",
+                    reason_text.c_str());
+            }
+        });
+
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -16,6 +16,7 @@
 #define private public
 #include "planner_core/planner_core.hpp"
 #undef private
+#include "planner_core/ocp_registry.hpp"
 
 namespace {
 
@@ -86,6 +87,27 @@ planner_core::PlannerCoreInput inputAt(const Clock::time_point& now) {
 int main() {
     try {
         const auto t0 = Clock::now();
+
+        {
+            const auto require_disarm = [](const std::string& name) {
+                require(OCPRegistry::getDescriptor(name).disarm_on_landing_finish,
+                        ("landing descriptor should disarm: " + name).c_str());
+            };
+            require(!OCPRegistry::getDescriptor("hover").disarm_on_landing_finish,
+                    "hover descriptor should not disarm");
+            require_disarm("landing");
+            require_disarm("stateswitch");
+            require_disarm("tracking_circle_target");
+            require_disarm("circle_target");
+            require_disarm("tracking_bodyrate_tf_imu");
+            require_disarm("tracking_bodyrate_tf_noimu");
+            require_disarm("tf_imu");
+            require_disarm("tf_noimu");
+            require_disarm("tracking_bodyrate_bf_imu");
+            require_disarm("tracking_bodyrate_bf_noimu");
+            require_disarm("bf_imu");
+            require_disarm("bf_noimu");
+        }
 
         {
             planner_core::PlannerCore core;

@@ -24,13 +24,13 @@ static constexpr int IDX_THETA = 4;
 
 // ── Horizon / timing ─────────────────────────────────────────────────────────
 static constexpr int HORIZON = 30;
-static constexpr double TH_INIT = 0.1;
+static constexpr double TH_INIT = 0.07;
 static constexpr double THL = 0.05;
-static constexpr double THH = 0.2;
+static constexpr double THH = 0.12;
 
 // ── Vehicle parameters ───────────────────────────────────────────────────────
 static constexpr double MASS = 0.027;
-static constexpr int DEFAULT_N_REPLAY = 7;
+static constexpr int DEFAULT_N_REPLAY = 8;
 static constexpr double DEFAULT_MASS_KG = MASS;
 static constexpr double IXX = 1.66e-5;
 static constexpr double IYY = 1.66e-5;
@@ -49,19 +49,31 @@ static const Eigen::Matrix3d J_B = [](){
 static const Eigen::Vector3d GRAVITY(0.0, 0.0, -9.81);
 
 // ── Glideslope parameters ─────────────────────────────────────────────────────
-static constexpr double GS_DEG = 60.0;
+static constexpr double GS_DEG = 35.0;
 static const double GS_TAN = std::tan(GS_DEG * M_PI / 180.0);
-static constexpr double VZ_LAND_MAX = 1.5;
+static constexpr double GS_APEX_OFFSET = 0.1;
+static constexpr double VZ_LAND_MAX = 1.0;
+static constexpr double STAGE_W_VZ     = 0.0;
+static constexpr double STAGE_W_POS_XY = 0.0;
+static constexpr double STAGE_W_POS_Z  = 0.0;
+static constexpr double STAGE_W_VEL_XY = 0.0;
+static constexpr double STAGE_W_VEL_Z  = 0.0;
+static constexpr double TERM_W_POS_XY  = 500.0;
+static constexpr double TERM_W_POS_Z   = 1200.0;
+static constexpr double TERM_W_VEL_XY  = 150.0;
+static constexpr double TERM_W_VEL_Z   = 20.0;
+static constexpr double TERM_W_TILT    = 200.0;
+static constexpr double TERM_W_OM      = 50.0;
 
 // ── Solver parameters ─────────────────────────────────────────────────────────
-const double SOLVER_REG1_MIN = 1e-2;
-const double SOLVER_REG2_MIN = 0.5;
+const double SOLVER_REG1_MIN = 1e-3;
+const double SOLVER_REG2_MIN = 0.1;
 const double SOLVER_MU_MUL = 0.1;
-const double SOLVER_RHO = 10.0;
-const double SOLVER_RHOT = 1.0;
-const double SOLVER_RHO_MUL = 10.0;
+const double SOLVER_RHO = 1.0;
+const double SOLVER_RHOT = 0.5;
+const double SOLVER_RHO_MUL = 5.0;
 const double SOLVER_TOLERANCE = 1e-4;
-const int SOLVER_MAX_ITER = 500;
+const int SOLVER_MAX_ITER = 150;
 
 inline Param getSolverParams() {
  Param p;
@@ -192,18 +204,38 @@ template<typename Scalar>
 class TimeCost : public StageCostBase<Scalar> {
  Scalar eps_;
  Scalar w_vz_;
+ Scalar w_pos_xy_;
+ Scalar w_pos_z_;
+ Scalar w_vel_xy_;
+ Scalar w_vel_z_;
 public:
- explicit TimeCost(double e=1e-4, double w_vz=1.0)
- : eps_(static_cast<Scalar>(e)), w_vz_(static_cast<Scalar>(w_vz)) {}
+ explicit TimeCost(double e=1e-4, double w_vz=1.0,
+ double w_pos_xy=0.0, double w_pos_z=0.0,
+ double w_vel_xy=0.0, double w_vel_z=0.0)
+ : eps_(static_cast<Scalar>(e)),
+   w_vz_(static_cast<Scalar>(w_vz)),
+   w_pos_xy_(static_cast<Scalar>(w_pos_xy)),
+   w_pos_z_(static_cast<Scalar>(w_pos_z)),
+   w_vel_xy_(static_cast<Scalar>(w_vel_xy)),
+   w_vel_z_(static_cast<Scalar>(w_vel_z)) {}
  Scalar q(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
- return u(IDX_THETA) + eps_*(x.segment(3,3).squaredNorm()+x.segment(10,3).squaredNorm())
- + w_vz_*x(5)*x(5);
+ return u(IDX_THETA)
+ + eps_*(x.segment(3,3).squaredNorm()+x.segment(10,3).squaredNorm())
+ + w_vz_*x(5)*x(5)
+ + w_pos_xy_*x.template segment<2>(0).squaredNorm()
+ + w_pos_z_*x(2)*x(2)
+ + w_vel_xy_*x.template segment<2>(3).squaredNorm()
+ + w_vel_z_*x(5)*x(5);
  }
  Vector<Scalar> qx(const Vector<Scalar>& x, const Vector<Scalar>&) const override {
  Vector<Scalar> g=Vector<Scalar>::Zero(NX_SS);
  g.segment(3,3) = Scalar(2)*eps_*x.segment(3,3);
  g.segment(10,3) = Scalar(2)*eps_*x.segment(10,3);
  g(5) += Scalar(2)*w_vz_*x(5);
+ g.segment(0,2) += Scalar(2)*w_pos_xy_*x.segment(0,2);
+ g(2) += Scalar(2)*w_pos_z_*x(2);
+ g.segment(3,2) += Scalar(2)*w_vel_xy_*x.segment(3,2);
+ g(5) += Scalar(2)*w_vel_z_*x(5);
  return g;
  }
  Vector<Scalar> qu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
@@ -214,6 +246,12 @@ public:
  for(int i=3;i<6;++i) H(i,i)=Scalar(2)*eps_;
  for(int i=10;i<13;++i) H(i,i)=Scalar(2)*eps_;
  H(5,5) += Scalar(2)*w_vz_;
+ H(0,0) += Scalar(2)*w_pos_xy_;
+ H(1,1) += Scalar(2)*w_pos_xy_;
+ H(2,2) += Scalar(2)*w_pos_z_;
+ H(3,3) += Scalar(2)*w_vel_xy_;
+ H(4,4) += Scalar(2)*w_vel_xy_;
+ H(5,5) += Scalar(2)*w_vel_z_;
  return H;
  }
  Matrix<Scalar> quu(const Vector<Scalar>&, const Vector<Scalar>&) const override {
@@ -224,51 +262,81 @@ public:
 
 template<typename Scalar>
 class RelTermCost : public TerminalCostBase<Scalar> {
- double wp_;
- double wv_;
- double wvz_;
+ double wp_xy_;
+ double wp_z_;
+ double wv_xy_;
+ double wv_z_;
  double watt_;
  double wom_;
  double vz_ref_;
 public:
- explicit RelTermCost(double wp=500.0, double wv=50.0,
- double wvz=100.0, double watt=200.0,
- double wom=50.0, double vz_ref=-0.1)
- : wp_(wp), wv_(wv), wvz_(wvz), watt_(watt), wom_(wom), vz_ref_(vz_ref) {}
+ explicit RelTermCost(double wp_xy=500.0, double wp_z=1200.0,
+ double wv_xy=900.0, double wv_z=600.0,
+ double watt=200.0, double wom=50.0, double vz_ref=-0.5)
+ : wp_xy_(wp_xy), wp_z_(wp_z), wv_xy_(wv_xy), wv_z_(wv_z),
+   watt_(watt), wom_(wom), vz_ref_(vz_ref) {}
+
+ static void bodyZHorizontal(const Vector<Scalar>& x, Scalar& bx, Scalar& by) {
+  const Scalar qw = x(6), qx = x(7), qy = x(8), qz = x(9);
+  bx = Scalar(2) * (qx * qz + qw * qy);
+  by = Scalar(2) * (qy * qz - qw * qx);
+ }
+
+ static Matrix<Scalar> bodyZHorizontalJacobian(const Vector<Scalar>& x) {
+  const Scalar qw = x(6), qx = x(7), qy = x(8), qz = x(9);
+  Matrix<Scalar> J = Matrix<Scalar>::Zero(2, 4);
+  J(0, 0) = Scalar(2) * qy;
+  J(0, 1) = Scalar(2) * qz;
+  J(0, 2) = Scalar(2) * qw;
+  J(0, 3) = Scalar(2) * qx;
+  J(1, 0) = Scalar(-2) * qx;
+  J(1, 1) = Scalar(-2) * qw;
+  J(1, 2) = Scalar(2) * qz;
+  J(1, 3) = Scalar(2) * qy;
+  return J;
+ }
 
  Scalar p(const Vector<Scalar>& x) const override {
  Scalar ep = x.template segment<2>(0).squaredNorm();
  Scalar ez = x(2)*x(2);
  Scalar evxy = x.template segment<2>(3).squaredNorm();
  Scalar evz = (x(5) - Scalar(vz_ref_)) * (x(5) - Scalar(vz_ref_));
- Scalar eatt = x(7)*x(7) + x(8)*x(8);
+ Scalar bx, by;
+ bodyZHorizontal(x, bx, by);
  Scalar eom = x.template segment<3>(10).squaredNorm();
- return Scalar(wp_)*(ep+ez)
- + Scalar(wv_)*evxy
- + Scalar(wvz_)*evz
- + Scalar(watt_)*eatt
- + Scalar(wom_)*eom;
+ return Scalar(0.5) * (Scalar(wp_xy_)*ep
+ + Scalar(wp_z_)*ez
+ + Scalar(wv_xy_)*evxy
+ + Scalar(wv_z_)*evz
+ + Scalar(watt_)*(bx*bx + by*by)
+ + Scalar(wom_)*eom);
  }
 
  Vector<Scalar> px(const Vector<Scalar>& x) const override {
  Vector<Scalar> g = Vector<Scalar>::Zero(x.size());
- g.segment(0,2) = Scalar(2*wp_)*x.segment(0,2);
- g(2) = Scalar(2*wp_)*x(2);
- g.segment(3,2) = Scalar(2*wv_)*x.segment(3,2);
- g(5) = Scalar(2*wvz_)*(x(5) - Scalar(vz_ref_));
- g(7) = Scalar(2*watt_)*x(7);
- g(8) = Scalar(2*watt_)*x(8);
- g.segment(10,3) = Scalar(2*wom_)*x.segment(10,3);
+ g.segment(0,2) = Scalar(wp_xy_)*x.segment(0,2);
+ g(2) = Scalar(wp_z_)*x(2);
+ g.segment(3,2) = Scalar(wv_xy_)*x.segment(3,2);
+ g(5) = Scalar(wv_z_)*(x(5) - Scalar(vz_ref_));
+ Scalar bx, by;
+ bodyZHorizontal(x, bx, by);
+ Matrix<Scalar> Jtilt = bodyZHorizontalJacobian(x);
+ Vector<Scalar> etilt(2);
+ etilt << bx, by;
+ g.segment(6,4) += Scalar(watt_) * Jtilt.transpose() * etilt;
+ g.segment(10,3) = Scalar(wom_)*x.segment(10,3);
  return g;
  }
 
  Matrix<Scalar> pxx(const Vector<Scalar>& x) const override {
  Matrix<Scalar> H = Matrix<Scalar>::Zero(x.size(), x.size());
- H(0,0)=H(1,1)=H(2,2) = Scalar(2*wp_);
- H(3,3)=H(4,4) = Scalar(2*wv_);
- H(5,5) = Scalar(2*wvz_);
- H(7,7)=H(8,8) = Scalar(2*watt_);
- H(10,10)=H(11,11)=H(12,12) = Scalar(2*wom_);
+ H(0,0)=H(1,1) = Scalar(wp_xy_);
+ H(2,2) = Scalar(wp_z_);
+ H(3,3)=H(4,4) = Scalar(wv_xy_);
+ H(5,5) = Scalar(wv_z_);
+ Matrix<Scalar> Jtilt = bodyZHorizontalJacobian(x);
+ H.block(6,6,4,4) += Scalar(watt_) * Jtilt.transpose() * Jtilt;
+ H(10,10)=H(11,11)=H(12,12) = Scalar(wom_);
  return H;
  }
 };
@@ -342,14 +410,16 @@ class VzMinCon:public StageConstraintBase<Scalar>{Scalar vz_min_;public:
 template<typename Scalar>
 class GlideslopeCon_rel : public StageConstraintBase<Scalar> {
  Scalar tan_gs_;
+ Scalar z_apex_offset_;
 public:
- explicit GlideslopeCon_rel(double tg=GS_TAN) : tan_gs_(static_cast<Scalar>(tg)) {
+ explicit GlideslopeCon_rel(double tg=GS_TAN, double z_apex_offset=GS_APEX_OFFSET)
+ : tan_gs_(static_cast<Scalar>(tg)), z_apex_offset_(static_cast<Scalar>(z_apex_offset)) {
  this->constraint_type = ConstraintType::SOC;
  this->dim_c = 3;
  }
  Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>&) const override {
  Vector<Scalar> cn(3);
- cn(0) = tan_gs_ * x(2);
+ cn(0) = tan_gs_ * (x(2) + z_apex_offset_);
  cn(1) = x(0);
  cn(2) = x(1);
  return -cn;
@@ -391,8 +461,14 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
  dyn->setJb(J_B);
  dyn->setTargetAccel(predictor->predictAccel(0.0));
 
- auto cost = std::make_shared<TimeCost<double>>(1e-4, 1.0);
- auto tcost = std::make_shared<RelTermCost<double>>(500.0, 50.0);
+ auto cost = std::make_shared<TimeCost<double>>(
+  0.0, STAGE_W_VZ,
+  STAGE_W_POS_XY, STAGE_W_POS_Z,
+  STAGE_W_VEL_XY, STAGE_W_VEL_Z);
+ auto tcost = std::make_shared<RelTermCost<double>>(
+  TERM_W_POS_XY, TERM_W_POS_Z,
+  TERM_W_VEL_XY, TERM_W_VEL_Z,
+  TERM_W_TILT, TERM_W_OM, -1.0);
  auto cfmin = std::make_shared<FminCon<double>>();
  auto cfmax = std::make_shared<FmaxCon<double>>();
  auto cmom = std::make_shared<MomentCon<double>>();
@@ -482,10 +558,11 @@ inline OCPDescriptor descriptor() {
     d.dt = TH_INIT;
     d.default_n_replay = DEFAULT_N_REPLAY;
     d.default_mass_kg = DEFAULT_MASS_KG;
-    d.warm_start = OCPDescriptor::WarmStart::Feedback;
+    d.warm_start = OCPDescriptor::WarmStart::Shift;
     d.command_mode = OCPDescriptor::CommandMode::CmdFullState;
     d.drone_odom_mode = OCPDescriptor::DroneOdomMode::Absolute;
     d.variable_dt = true;
+    d.disarm_on_landing_finish = true;
     d.state_dim = 13;
     d.control_dim = 4;
     d.skip_altitude_validation = true;

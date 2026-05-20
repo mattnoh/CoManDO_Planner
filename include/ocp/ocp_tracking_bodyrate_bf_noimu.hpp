@@ -305,6 +305,7 @@ inline OCPDescriptor descriptor() {
     d.warm_start = OCPDescriptor::WarmStart::Shift;
     d.command_mode = OCPDescriptor::CommandMode::CmdBodyRate;
     d.drone_odom_mode = OCPDescriptor::DroneOdomMode::BodyFrameRelative;
+    d.disarm_on_landing_finish = true;
     d.skip_altitude_validation = true;
     d.skip_trajectory_validation = true;
     d.variable_dt = true;

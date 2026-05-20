@@ -4,3 +4,5 @@ logs/landing
 logs/relative
 build
 logs/
+test/
+CLAUDE.MD
