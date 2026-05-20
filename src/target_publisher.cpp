@@ -1,40 +1,41 @@
 /// @file target_publisher.cpp
 /// @brief Standalone ROS2 node that publishes the target state for the CoManDO planner.
 ///
-/// Target source:
+/// Target modes:
 ///
-///   "model"    — Fully synthetic trajectory. No external input.
-///                The target_trajectory parameter selects circle, figure8, etc.
+///   "gazebo_circle"  — Synthetic circular pose measurements fed through the
+///                      same estimator used by mocap.
 ///
-///   "qualisys" — Real vehicle pose from a Qualisys-sourced rigid-bodies topic.
-///                Position comes from the observed pose. Velocity and acceleration
-///                are estimated by finite-differencing a short pose history window.
-///                No synthetic model assumed; works for any target trajectory.
+///   "gazebo_figure8" — Synthetic figure-8 pose measurements fed through the
+///                      same estimator used by mocap.
+///
+///   "mocap"          — Real target pose from a Qualisys-sourced rigid-bodies
+///                      topic, selected by rigid_body_name.
 ///
 /// Publishes on:
 ///   /target/odom   (nav_msgs/msg/Odometry)
 ///   /target/accel  (geometry_msgs/msg/AccelStamped)
+///   /target/true_odom, /target/true_accel in gazebo_* modes only
 ///
 /// Parameters:
-///   target_source       — "model" or "qualisys"            default: "model"
-///   target_trajectory   — "circle" or "figure8"            default: "circle"
-///   target_mode         — legacy alias for older commands
+///   target_mode         — "gazebo_circle", "gazebo_figure8", or "mocap"
+///                         default: "gazebo_circle"
 ///   center_x/y/z        — orbit center [m]                 default: 0, 0, 0.2
 ///   omega               — angular speed [rad/s]            default: 0.4
 ///   phi0                — initial phase, circle mode [rad] default: 0.0
 ///   radius              — orbit radius, circle mode [m]    default: 1.0
 ///   publish_hz          — publish rate [Hz]                default: 100.0
 ///   frame_id            — header frame                     default: "world"
-///   qualisys_pose_topic — input pose topic, qualisys mode  default: "/stmini/pose"
+///   rigid_body_name     — mocap rigid body name            default: "stmini"
 ///   drone_odom_topic    — drone odom for relative odom     default: "/gogogo/odom"
 ///   planning_frame      — "world", "shifted", "target_frame", or "body_frame"
 ///   drone_odom_mode     — legacy alias for planning_frame
 ///
 /// Usage:
 ///   ros2 run comando_planner target_publisher --ros-args
-///       -p target_source:=model -p target_trajectory:=circle
+///       -p target_mode:=gazebo_circle
 ///   ros2 run comando_planner target_publisher --ros-args
-///       -p target_source:=qualisys -p rigid_body_name:=stmini
+///       -p target_mode:=mocap -p rigid_body_name:=stmini
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -44,7 +45,6 @@
 #include <mocap4r2_msgs/msg/rigid_bodies.hpp>
 #endif
 #include <Eigen/Geometry>
-#include <deque>
 
 #include "target/circular_target.hpp"
 #include "target/figure8_target.hpp"
@@ -56,20 +56,14 @@
 namespace {
 constexpr double DEG2RAD = M_PI / 180.0;
 
-std::string normalizeTargetSource(const std::string& requested,
-                                  const std::string& legacy_mode,
-                                  std::string* target_trajectory)
+std::string normalizeTargetMode(const std::string& requested)
 {
-    if (!requested.empty()) {
+    if (requested == "gazebo_circle" ||
+        requested == "gazebo_figure8" ||
+        requested == "mocap") {
         return requested;
     }
-    if (legacy_mode == "qualisys") {
-        return "qualisys";
-    }
-    if (legacy_mode == "circle" || legacy_mode == "figure8") {
-        *target_trajectory = legacy_mode;
-    }
-    return "model";
+    return "gazebo_circle";
 }
 
 std::string normalizePlanningFrame(const std::string& requested,
@@ -79,8 +73,14 @@ std::string normalizePlanningFrame(const std::string& requested,
     if (raw.empty() || raw == "none" || raw == "world") {
         return "world";
     }
-    if (raw == "shifted_world") {
+    if (raw == "shifted_world" || raw == "shifted") {
         return "shifted";
+    }
+    if (raw == "target" || raw == "target_frame") {
+        return "target_frame";
+    }
+    if (raw == "body" || raw == "body_frame") {
+        return "body_frame";
     }
     return raw;
 }
@@ -92,18 +92,13 @@ public:
     BenchmarkTargetPublisher() : Node("target_publisher")
     {
         // ── Parameters ──────────────────────────────────────────────────────
-        // target_mode and drone_odom_mode are kept as aliases for older launch commands.
-        std::string target_trajectory = declare_parameter<std::string>("target_trajectory", "circle");
-        const std::string legacy_target_mode = declare_parameter<std::string>("target_mode", "");
-        target_source_ = normalizeTargetSource(
-            declare_parameter<std::string>("target_source", ""),
-            legacy_target_mode,
-            &target_trajectory);
-        target_trajectory_ = target_trajectory;
+        const std::string requested_target_mode =
+            declare_parameter<std::string>("target_mode", "gazebo_circle");
+        target_mode_ = normalizeTargetMode(requested_target_mode);
         target_yaw_rate_ = declare_parameter<double>("target_yaw_rate", 0.3);
         publish_hz_  = declare_parameter<double>("publish_hz", 100.0);
         frame_id_    = declare_parameter<std::string>("frame_id", "world");
-        qualisys_pose_topic_  = declare_parameter<std::string>("rigid_body_name", "stmini");
+        rigid_body_name_  = declare_parameter<std::string>("rigid_body_name", "stmini");
         drone_odom_topic_     = declare_parameter<std::string>("drone_odom_topic", "/cf_1/odom");
         const std::string legacy_drone_odom_mode = declare_parameter<std::string>("drone_odom_mode", "");
         planning_frame_ = normalizePlanningFrame(
@@ -120,17 +115,17 @@ public:
         body_relative_angular_unit_ = declare_parameter<std::string>(
             "body_relative_input_angular_unit", "deg_s");
 
-        if (target_source_ != "model" && target_source_ != "qualisys") {
+        // Filter gains for qualisys mode (alpha-beta-gamma on position, alpha-beta on angular velocity).
+        filter_alpha_   = declare_parameter<double>("filter_alpha",   0.8);
+        filter_beta_    = declare_parameter<double>("filter_beta",    0.4);
+        filter_gamma_   = declare_parameter<double>("filter_gamma",   0.001);
+        filter_alpha_w_ = declare_parameter<double>("filter_alpha_w", 0.7);
+        filter_beta_w_  = declare_parameter<double>("filter_beta_w",  0.3);
+
+        if (target_mode_ != requested_target_mode) {
             RCLCPP_WARN(get_logger(),
-                "[TargetPublisher] Unknown target_source='%s'; using model.",
-                target_source_.c_str());
-            target_source_ = "model";
-        }
-        if (target_trajectory_ != "circle" && target_trajectory_ != "figure8") {
-            RCLCPP_WARN(get_logger(),
-                "[TargetPublisher] Unknown target_trajectory='%s'; using circle.",
-                target_trajectory_.c_str());
-            target_trajectory_ = "circle";
+                "[TargetPublisher] Unknown target_mode='%s'; using gazebo_circle.",
+                requested_target_mode.c_str());
         }
         if (drone_odom_mode_ != "world" && drone_odom_mode_ != "shifted" &&
             drone_odom_mode_ != "target_frame" && drone_odom_mode_ != "body_frame") {
@@ -142,19 +137,21 @@ public:
         }
 
 #ifndef HAS_MOCAP4R2_MSGS
-        if (target_source_ == "qualisys") {
+        if (target_mode_ == "mocap") {
             RCLCPP_WARN(get_logger(),
-                "[TargetPublisher] target_source=qualisys requested, but this build has no "
-                "mocap4r2_msgs support. Falling back to model source.");
-            target_source_ = "model";
+                "[TargetPublisher] target_mode=mocap requested, but this build has no "
+                "mocap4r2_msgs support. Falling back to gazebo_circle.");
+            target_mode_ = "gazebo_circle";
         }
 #endif
 
-        t0_ = now().seconds();  // model source uses relative time from here
+        t0_ = now().seconds();
 
         // ── Publishers ───────────────────────────────────────────────────────
         odom_pub_  = create_publisher<nav_msgs::msg::Odometry>("/target/odom", 10);
         accel_pub_ = create_publisher<geometry_msgs::msg::AccelStamped>("/target/accel", 10);
+        true_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/target/true_odom", 10);
+        true_accel_pub_ = create_publisher<geometry_msgs::msg::AccelStamped>("/target/true_accel", 10);
 
         if (drone_odom_mode_ == "shifted") {
             abs_rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/relative_odometry", 10);
@@ -182,9 +179,12 @@ public:
                 });
         }
 
-        // ── Qualisys rigid bodies subscriber (qualisys mode only) ───────────
+        pos_filter_.configure(filter_alpha_, filter_beta_, filter_gamma_);
+        angvel_filter_.configure(filter_alpha_w_, filter_beta_w_);
+
+        // ── Mocap rigid bodies subscriber (mocap mode only) ─────────────────
 #ifdef HAS_MOCAP4R2_MSGS
-        if (target_source_ == "qualisys") {
+        if (target_mode_ == "mocap") {
             rigid_bodies_sub_ = create_subscription<mocap4r2_msgs::msg::RigidBodies>(
                 "/rigid_bodies", 10,
                 [this](const mocap4r2_msgs::msg::RigidBodies::SharedPtr msg) {
@@ -194,36 +194,36 @@ public:
                     for (const auto & rb : msg->rigidbodies) {
                         RCLCPP_INFO_ONCE(get_logger(),
                             "[TargetPublisher] body seen: '%s'", rb.rigid_body_name.c_str());
-                        if (rb.rigid_body_name != qualisys_pose_topic_) continue;
-                        PoseObs obs;
-                        obs.t   = rclcpp::Time(msg->header.stamp).seconds();
-                        obs.pos = {rb.pose.position.x, rb.pose.position.y, rb.pose.position.z};
-                        obs.q   = Eigen::Quaterniond(rb.pose.orientation.w, rb.pose.orientation.x, rb.pose.orientation.y, rb.pose.orientation.z);
-                        obs.q.normalize();
-                        std::lock_guard<std::mutex> lk(pose_mutex_);
-                        pose_history_.push_back(obs);
-                        if (pose_history_.size() > N_POSE_HISTORY) {
-                            pose_history_.pop_front();
-                        }
+                        if (rb.rigid_body_name != rigid_body_name_) continue;
+                        const double t = rclcpp::Time(msg->header.stamp).seconds();
+                        const Eigen::Vector3d p_meas(
+                            rb.pose.position.x, rb.pose.position.y, rb.pose.position.z);
+                        Eigen::Quaterniond q_meas(
+                            rb.pose.orientation.w, rb.pose.orientation.x,
+                            rb.pose.orientation.y, rb.pose.orientation.z);
+                        q_meas.normalize();
+                        ingestTargetPoseMeasurement(p_meas, q_meas, t);
                         break;
                     }
                 });
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] source=qualisys  body_name=%s",
-                qualisys_pose_topic_.c_str());
+                "[TargetPublisher] mode=mocap  body_name=%s  abg(alpha=%.2f beta=%.2f gamma=%.4f)  ab(alpha=%.2f beta=%.2f)",
+                rigid_body_name_.c_str(),
+                filter_alpha_, filter_beta_, filter_gamma_,
+                filter_alpha_w_, filter_beta_w_);
         } else {
             RCLCPP_INFO(get_logger(),
-                "[TargetPublisher] source=model trajectory=%s  circle_center=(%.2f,%.2f,%.2f)  "
+                "[TargetPublisher] mode=%s synthetic pose measurements  circle_center=(%.2f,%.2f,%.2f)  "
                 "circle_R=%.2f  circle_omega=%.2f rad/s  %.0f Hz",
-                target_trajectory_.c_str(),
+                target_mode_.c_str(),
                 circle_model_.center.x(), circle_model_.center.y(), circle_model_.center.z(),
                 circle_model_.R, circle_model_.omega, publish_hz_);
         }
 #else
         RCLCPP_INFO(get_logger(),
-            "[TargetPublisher] source=model trajectory=%s  circle_center=(%.2f,%.2f,%.2f)  "
+            "[TargetPublisher] mode=%s synthetic pose measurements  circle_center=(%.2f,%.2f,%.2f)  "
             "circle_R=%.2f  circle_omega=%.2f rad/s  %.0f Hz",
-            target_trajectory_.c_str(),
+            target_mode_.c_str(),
             circle_model_.center.x(), circle_model_.center.y(), circle_model_.center.z(),
             circle_model_.R, circle_model_.omega, publish_hz_);
 #endif
@@ -262,90 +262,82 @@ private:
         Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
     };
 
+    // Alpha-beta-gamma tracking filter: measurement = position, outputs p, v, a.
+    struct ABGFilter3D {
+        double alpha = 0.8, beta = 0.4, gamma = 0.001;
+        Eigen::Vector3d p = Eigen::Vector3d::Zero();
+        Eigen::Vector3d v = Eigen::Vector3d::Zero();
+        Eigen::Vector3d a = Eigen::Vector3d::Zero();
+        bool initialized = false;
+        double last_t = 0.0;
+
+        void configure(double a_, double b_, double g_) { alpha = a_; beta = b_; gamma = g_; }
+        void reset() { initialized = false; v.setZero(); a.setZero(); }
+
+        void update(const Eigen::Vector3d& meas, double t) {
+            if (!initialized) {
+                p = meas; v.setZero(); a.setZero();
+                initialized = true; last_t = t; return;
+            }
+            const double dt = t - last_t;
+            if (dt < 1e-9) return;
+            last_t = t;
+            const Eigen::Vector3d p_pred = p + v * dt + 0.5 * a * dt * dt;
+            const Eigen::Vector3d v_pred = v + a * dt;
+            const Eigen::Vector3d r = meas - p_pred;
+            p = p_pred + alpha * r;
+            v = v_pred + (beta / dt) * r;
+            a = a + (2.0 * gamma / (dt * dt)) * r;
+        }
+    };
+
+    // Alpha-beta tracking filter: measurement = velocity (raw omega), outputs x and dx (ang accel).
+    struct ABFilter3D {
+        double alpha = 0.7, beta = 0.3;
+        Eigen::Vector3d x = Eigen::Vector3d::Zero();
+        Eigen::Vector3d dx = Eigen::Vector3d::Zero();
+        bool initialized = false;
+        double last_t = 0.0;
+
+        void configure(double a_, double b_) { alpha = a_; beta = b_; }
+        void reset() { initialized = false; dx.setZero(); }
+
+        void update(const Eigen::Vector3d& meas, double t) {
+            if (!initialized) {
+                x = meas; dx.setZero();
+                initialized = true; last_t = t; return;
+            }
+            const double dt = t - last_t;
+            if (dt < 1e-9) return;
+            last_t = t;
+            const Eigen::Vector3d x_pred = x + dx * dt;
+            const Eigen::Vector3d r = meas - x_pred;
+            x = x_pred + alpha * r;
+            dx = dx + (beta / dt) * r;
+        }
+    };
+
     // ── Timer callback ───────────────────────────────────────────────────────
     void timerCallback()
     {
         const rclcpp::Time stamp = now();
         const double t = stamp.seconds();
 
-        Kinematics k{};
+        if (target_mode_ == "gazebo_circle" || target_mode_ == "gazebo_figure8") {
+            const Kinematics truth = syntheticTargetTruth(t);
+            publishSyntheticTruth(truth, stamp);
+            ingestTargetPoseMeasurement(
+                Eigen::Vector3d(truth.px, truth.py, truth.pz), truth.q, t);
+        }
 
-        if (target_source_ == "qualisys") {
-            // ── qualisys mode: finite-differenced velocity and acceleration ──
-            std::lock_guard<std::mutex> lk(pose_mutex_);
-            if (pose_history_.empty()) {
+        Kinematics k{};
+        if (!readEstimatedTarget(k)) {
+            if (target_mode_ == "mocap") {
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                     "[TargetPublisher] Waiting for '%s' in /rigid_bodies ...",
-                    qualisys_pose_topic_.c_str());
-                return;
+                    rigid_body_name_.c_str());
             }
-            const auto& latest = pose_history_.back();
-            k.px = latest.pos.x();
-            k.py = latest.pos.y();
-            k.pz = latest.pos.z();
-            k.q  = latest.q;
-            
-            Eigen::Vector3d w0 = Eigen::Vector3d::Zero();
-            Eigen::Vector3d w1 = Eigen::Vector3d::Zero();
-
-            if (pose_history_.size() >= 2) {
-                const auto& oldest = pose_history_.front();
-                const double dt = latest.t - oldest.t;
-                if (dt > 1e-6) {
-                    const Eigen::Vector3d vel = (latest.pos - oldest.pos) / dt;
-                    k.vx = vel.x(); k.vy = vel.y(); k.vz = vel.z();
-                    
-                    Eigen::Quaterniond dq = latest.q * oldest.q.conjugate();
-                    Eigen::AngleAxisd aa(dq);
-                    Eigen::Vector3d w = aa.axis() * aa.angle() / dt;
-                    k.wx = w.x(); k.wy = w.y(); k.wz = w.z();
-                }
-            }
-            if (pose_history_.size() >= 3) {
-                const auto& p0   = pose_history_.front();
-                const auto& pmid = pose_history_[pose_history_.size() / 2];
-                const auto& p1   = pose_history_.back();
-                const double dt0 = pmid.t - p0.t;
-                const double dt1 = p1.t  - pmid.t;
-                if (dt0 > 1e-6 && dt1 > 1e-6) {
-                    const Eigen::Vector3d v0  = (pmid.pos - p0.pos) / dt0;
-                    const Eigen::Vector3d v1  = (p1.pos  - pmid.pos) / dt1;
-                    const Eigen::Vector3d acc = (v1 - v0) / (0.5 * (dt0 + dt1));
-                    k.ax = acc.x(); k.ay = acc.y(); k.az = acc.z();
-                    
-                    Eigen::Quaterniond dq0 = pmid.q * p0.q.conjugate();
-                    Eigen::AngleAxisd aa0(dq0);
-                    w0 = aa0.axis() * aa0.angle() / dt0;
-                    
-                    Eigen::Quaterniond dq1 = p1.q * pmid.q.conjugate();
-                    Eigen::AngleAxisd aa1(dq1);
-                    w1 = aa1.axis() * aa1.angle() / dt1;
-                    
-                    Eigen::Vector3d alf = (w1 - w0) / (0.5 * (dt0 + dt1));
-                    k.alfx = alf.x(); k.alfy = alf.y(); k.alfz = alf.z();
-                }
-            }
-
-        } else {
-            // ── model source: fully synthetic, trajectory selected by target_trajectory.
-            const double t_rel = t - t0_;
-            Eigen::Vector3d p = Eigen::Vector3d::Zero();
-            Eigen::Vector3d v = Eigen::Vector3d::Zero();
-            Eigen::Vector3d a = Eigen::Vector3d::Zero();
-            if (target_trajectory_ == "figure8") {
-                p = figure8_model_.pos(t_rel);
-                v = figure8_model_.vel(t_rel);
-                a = figure8_model_.accel(t_rel);
-            } else {
-                p = circle_model_.pos(t_rel);
-                v = circle_model_.vel(t_rel);
-                a = circle_model_.accel(t_rel);
-            }
-            k = {p.x(), p.y(), p.z(), v.x(), v.y(), v.z(), a.x(), a.y(), a.z(), 0.0, 0.0, target_yaw_rate_, 0.0, 0.0, 0.0, Eigen::Quaterniond::Identity()};
-            
-            // Yaw model
-            double psi = target_yaw_rate_ * t_rel;
-            k.q = Eigen::Quaterniond(std::cos(psi/2.0), 0.0, 0.0, std::sin(psi/2.0));
+            return;
         }
 
         // ── Odometry message ─────────────────────────────────────────────────
@@ -548,16 +540,123 @@ private:
         }
     }
 
+    bool readEstimatedTarget(Kinematics& k) {
+        std::lock_guard<std::mutex> lk(pose_mutex_);
+        if (!pos_filter_.initialized) {
+            return false;
+        }
+        k.px = pos_filter_.p.x();
+        k.py = pos_filter_.p.y();
+        k.pz = pos_filter_.p.z();
+        k.vx = pos_filter_.v.x();
+        k.vy = pos_filter_.v.y();
+        k.vz = pos_filter_.v.z();
+        k.ax = pos_filter_.a.x();
+        k.ay = pos_filter_.a.y();
+        k.az = pos_filter_.a.z();
+        k.wx = angvel_filter_.x.x();
+        k.wy = angvel_filter_.x.y();
+        k.wz = angvel_filter_.x.z();
+        k.alfx = angvel_filter_.dx.x();
+        k.alfy = angvel_filter_.dx.y();
+        k.alfz = angvel_filter_.dx.z();
+        k.q = target_q_latest_;
+        return true;
+    }
+
+    Kinematics syntheticTargetTruth(double t) const
+    {
+        const double t_rel = t - t0_;
+        Eigen::Vector3d p = Eigen::Vector3d::Zero();
+        Eigen::Vector3d v = Eigen::Vector3d::Zero();
+        Eigen::Vector3d a = Eigen::Vector3d::Zero();
+        if (target_mode_ == "gazebo_figure8") {
+            p = figure8_model_.pos(t_rel);
+            v = figure8_model_.vel(t_rel);
+            a = figure8_model_.accel(t_rel);
+        } else {
+            p = circle_model_.pos(t_rel);
+            v = circle_model_.vel(t_rel);
+            a = circle_model_.accel(t_rel);
+        }
+        const double psi = target_yaw_rate_ * t_rel;
+        Kinematics k{};
+        k.px = p.x(); k.py = p.y(); k.pz = p.z();
+        k.vx = v.x(); k.vy = v.y(); k.vz = v.z();
+        k.ax = a.x(); k.ay = a.y(); k.az = a.z();
+        k.wx = 0.0; k.wy = 0.0; k.wz = target_yaw_rate_;
+        k.alfx = 0.0; k.alfy = 0.0; k.alfz = 0.0;
+        k.q = Eigen::Quaterniond(std::cos(psi / 2.0), 0.0, 0.0, std::sin(psi / 2.0));
+        return k;
+    }
+
+    void publishSyntheticTruth(const Kinematics& k, const rclcpp::Time& stamp)
+    {
+        nav_msgs::msg::Odometry odom;
+        odom.header.stamp = stamp;
+        odom.header.frame_id = frame_id_;
+        odom.child_frame_id = "target_true";
+        odom.pose.pose.position.x = k.px;
+        odom.pose.pose.position.y = k.py;
+        odom.pose.pose.position.z = k.pz;
+        odom.pose.pose.orientation.w = k.q.w();
+        odom.pose.pose.orientation.x = k.q.x();
+        odom.pose.pose.orientation.y = k.q.y();
+        odom.pose.pose.orientation.z = k.q.z();
+        odom.twist.twist.linear.x = k.vx;
+        odom.twist.twist.linear.y = k.vy;
+        odom.twist.twist.linear.z = k.vz;
+        odom.twist.twist.angular.x = k.wx;
+        odom.twist.twist.angular.y = k.wy;
+        odom.twist.twist.angular.z = k.wz;
+        true_odom_pub_->publish(odom);
+
+        geometry_msgs::msg::AccelStamped accel;
+        accel.header.stamp = stamp;
+        accel.header.frame_id = frame_id_;
+        accel.accel.linear.x = k.ax;
+        accel.accel.linear.y = k.ay;
+        accel.accel.linear.z = k.az;
+        accel.accel.angular.x = k.alfx;
+        accel.accel.angular.y = k.alfy;
+        accel.accel.angular.z = k.alfz;
+        true_accel_pub_->publish(accel);
+    }
+
+    void ingestTargetPoseMeasurement(const Eigen::Vector3d& p_meas,
+                                     const Eigen::Quaterniond& q_meas,
+                                     double t)
+    {
+        std::lock_guard<std::mutex> lk(pose_mutex_);
+        pos_filter_.update(p_meas, t);
+
+        Eigen::Vector3d omega_raw = Eigen::Vector3d::Zero();
+        if (target_q_initialized_) {
+            const double dt = t - target_t_prev_;
+            if (dt > 1e-9) {
+                Eigen::Quaterniond dq = q_meas * target_q_prev_.conjugate();
+                if (dq.w() < 0.0) dq.coeffs() *= -1.0;  // shortest path
+                const Eigen::AngleAxisd aa(dq);
+                omega_raw = aa.axis() * aa.angle() / dt;
+                angvel_filter_.update(omega_raw, t);
+            }
+        } else {
+            target_q_initialized_ = true;
+        }
+        target_q_prev_   = q_meas;
+        target_q_latest_ = q_meas;
+        target_t_prev_   = t;
+    }
+
     // ── Parameters ─────────────────────────────────────────────────────────
-    std::string target_source_;
-    std::string target_trajectory_;
+    std::string target_mode_;
     double target_yaw_rate_;
     double publish_hz_;
     std::string frame_id_;
     target_models::CircularTarget circle_model_;  // circle model defaults live in circular_target.hpp
     target_models::Figure8Target figure8_model_;  // figure-8 model defaults live in figure8_target.hpp
     double t0_ = 0.0;  // wall-clock time at startup, for relative time in model source
-    std::string qualisys_pose_topic_;
+    std::string rigid_body_name_;
     std::string drone_odom_topic_;
     std::string planning_frame_;
     std::string drone_odom_mode_;  // "world" | "shifted" | "body_frame" | "target_frame"
@@ -572,6 +671,8 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          body_rel_odom_pub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          target_frame_odom_pub_;
     rclcpp::Publisher<geometry_msgs::msg::AccelStamped>::SharedPtr accel_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          true_odom_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::AccelStamped>::SharedPtr true_accel_pub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr       drone_odom_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr drone_pose_sub_;
 #ifdef HAS_MOCAP4R2_MSGS
@@ -579,11 +680,21 @@ private:
 #endif
     rclcpp::TimerBase::SharedPtr timer_;
 
-    // ── Qualisys pose history (guarded by pose_mutex_) ───────────────────────
-    struct PoseObs { double t; Eigen::Vector3d pos; Eigen::Quaterniond q = Eigen::Quaterniond::Identity(); };
-    static constexpr std::size_t N_POSE_HISTORY = 8;
+    // ── Target estimator state (guarded by pose_mutex_) ─────────────────────
     std::mutex pose_mutex_;
-    std::deque<PoseObs> pose_history_;
+    ABGFilter3D pos_filter_;
+    ABFilter3D  angvel_filter_;
+    Eigen::Quaterniond target_q_prev_   = Eigen::Quaterniond::Identity();
+    Eigen::Quaterniond target_q_latest_ = Eigen::Quaterniond::Identity();
+    double target_t_prev_ = 0.0;
+    bool   target_q_initialized_ = false;
+
+    // Filter gains
+    double filter_alpha_   = 0.8;
+    double filter_beta_    = 0.4;
+    double filter_gamma_   = 0.001;
+    double filter_alpha_w_ = 0.7;
+    double filter_beta_w_  = 0.3;
 
     // ── Drone odom (guarded by drone_mutex_) ────────────────────────────────
     std::mutex drone_mutex_;
