@@ -6,8 +6,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     args = [
-        DeclareLaunchArgument('target_source', default_value='model'),
-        DeclareLaunchArgument('target_trajectory', default_value='circle'),
+        DeclareLaunchArgument('target_mode', default_value='gazebo_circle'),
         DeclareLaunchArgument('planning_frame', default_value='world'),
         DeclareLaunchArgument('target_yaw_rate', default_value='0.3'),
         DeclareLaunchArgument('publish_hz', default_value='100.0'),
@@ -25,8 +24,7 @@ def generate_launch_description():
         name='target_publisher',
         output='screen',
         parameters=[{
-            'target_source': LaunchConfiguration('target_source'),
-            'target_trajectory': LaunchConfiguration('target_trajectory'),
+            'target_mode': LaunchConfiguration('target_mode'),
             'planning_frame': LaunchConfiguration('planning_frame'),
             'target_yaw_rate': LaunchConfiguration('target_yaw_rate'),
             'publish_hz': LaunchConfiguration('publish_hz'),

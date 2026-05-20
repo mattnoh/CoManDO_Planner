@@ -96,6 +96,8 @@ def generate_launch_description():
                 drone_topic('/planner_debug_markers'),
                 '/target/odom',
                 '/target/accel',
+                '/target/true_odom',
+                '/target/true_accel',
                 '/target/predicted_accel',
                 '/drone/body_relative_odom',
                 '/drone/target_frame_odom',
