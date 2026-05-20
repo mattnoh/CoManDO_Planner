@@ -1,8 +1,5 @@
-logs/circle
-logs/hover
-logs/landing
-logs/relative
 build
-logs/
+logs/*
+!logs/plot_bag_circle.py
 test/
 CLAUDE.MD
