@@ -18,7 +18,7 @@ The current workflow is two-step:
 | `include/planner_core/` | ROS-free planner contracts, OCP registry, command adapters, replay orchestration |
 | `include/ocp/` | Registered ALIPDDP OCP formulations |
 | `include/platform/` | Crazyflie, MAVROS, state monitor, and target-tracker adapters |
-| `src/target_publisher.cpp` | Synthetic circle or Qualisys target publisher plus optional relative odometry |
+| `src/target_publisher.cpp` | Gazebo-style synthetic pose or mocap target estimator plus optional relative odometry |
 | `launch/` | Infrastructure launch and runtime OCP trigger launch |
 | `rviz/comando_debug.rviz` | RViz layout for planned paths and debug markers |
 | `docs/` | Detailed interface, architecture, math, and target-integration notes |
@@ -31,7 +31,7 @@ The current workflow is two-step:
 | ALIPDDP | Expected as sibling directory `../ALIPDDP-main` from this package |
 | `crazyflie_interfaces` | Required; used by the Crazyflie adapter |
 | `mavros_msgs` | Optional at build time; enables `platform:=mavros` when found |
-| `mocap4r2_msgs` | Optional at build time; enables `target_mode:=qualisys` when found |
+| `mocap4r2_msgs` | Optional at build time; enables `target_mode:=mocap` when found |
 | Eigen3 | Required by planner, OCPs, and target helpers |
 
 Build from the workspace root:
@@ -43,10 +43,10 @@ colcon build --symlink-install --packages-select comando_planner
 source install/setup.zsh
 ```
 
-MAVROS and Qualisys support are detected by CMake. If `mavros_msgs` is missing,
+MAVROS and mocap support are detected by CMake. If `mavros_msgs` is missing,
 the package still builds but `platform:=mavros` is unavailable. If
-`mocap4r2_msgs` is missing, `target_publisher` falls back from `qualisys` to
-`circle`.
+`mocap4r2_msgs` is missing, `target_publisher` falls back from `mocap` to
+`gazebo_circle`.
 
 ## Crazyflie Workflow
 
@@ -59,7 +59,7 @@ ros2 launch comando_planner planner_launch.py \
 
 # Terminal B: optional target publisher for tracking OCPs
 ros2 launch comando_planner target_launch.py \
-  target_source:=model target_trajectory:=circle planning_frame:=body_frame \
+  target_mode:=gazebo_circle planning_frame:=body_frame \
   drone_odom_topic:=/cf_1/odom drone_pose_topic:=/cf_1/pose
 
 # Terminal C: hover at 1 m
@@ -105,21 +105,29 @@ expose it as a launch argument.
 | --- | --- | --- |
 | `/target/odom` | `nav_msgs/msg/Odometry` | Target position, velocity, orientation, angular velocity |
 | `/target/accel` | `geometry_msgs/msg/AccelStamped` | Target linear and angular acceleration |
+| `/target/true_odom` | `nav_msgs/msg/Odometry` | Synthetic truth for `gazebo_*` modes only |
+| `/target/true_accel` | `geometry_msgs/msg/AccelStamped` | Synthetic truth for `gazebo_*` modes only |
 
-Target source, target trajectory, planning frame, and OCP selection are separate:
+`/target/odom` and `/target/accel` are always estimator outputs. In `gazebo_*`
+modes, the analytic motion model is used only to generate pose measurements and
+the separate `/target/true_*` topics for bag comparison. In `mocap` mode there
+is no separate truth topic; the mocap pose is the measurement feeding the same
+estimator.
+
+Target mode, planning frame, and OCP selection are separate:
 
 ```bash
 # Synthetic circular target, target-frame relative odometry for tf_imu/tf_noimu.
 ros2 launch comando_planner target_launch.py \
-  target_source:=model target_trajectory:=circle planning_frame:=target_frame
+  target_mode:=gazebo_circle planning_frame:=target_frame
 
 # Synthetic figure-8 target, body-frame relative odometry for bf_imu/bf_noimu.
 ros2 launch comando_planner target_launch.py \
-  target_source:=model target_trajectory:=figure8 planning_frame:=body_frame
+  target_mode:=gazebo_figure8 planning_frame:=body_frame
 
-# Qualisys target truth, world-frame state for stateswitch.
+# Mocap target pose measurements, world-frame state for stateswitch.
 ros2 launch comando_planner target_launch.py \
-  target_source:=qualisys rigid_body_name:=stmini planning_frame:=world
+  target_mode:=mocap rigid_body_name:=stmini planning_frame:=world
 ```
 
 It can also publish relative drone odometry:
@@ -131,9 +139,9 @@ It can also publish relative drone odometry:
 | `target_frame` | `/drone/target_frame_odom` | `tracking_bodyrate_tf_*` |
 | `shifted` | `/drone/relative_odometry` | Diagnostic/historical output; not selected by current OCP descriptors |
 
-Legacy `target_mode:=circle|qualisys` and `drone_odom_mode:=none|shifted_world|target_frame|body_frame`
-still work as aliases. OCP aliases are also available: `tf_imu`, `tf_noimu`,
-`bf_imu`, `bf_noimu`, `state_switch`, and `circle_target`.
+Valid target modes are `gazebo_circle`, `gazebo_figure8`, and `mocap`. OCP
+aliases are also available: `tf_imu`, `tf_noimu`, `bf_imu`, `bf_noimu`,
+`state_switch`, and `circle_target`.
 
 ## Runtime Parameters
 
