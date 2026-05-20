@@ -9,7 +9,7 @@ target node is `target_publisher`.
 | Executable | Source | Purpose |
 | --- | --- | --- |
 | `comando_planner` | `src/planner_node.cpp` | Runtime planner node, OCP switching, ALIPDDP solve/replay, command publishing |
-| `target_publisher` | `src/target_publisher.cpp` | Synthetic/Qualisys target state publisher and relative-odometry helper |
+| `target_publisher` | `src/target_publisher.cpp` | Gazebo-style synthetic pose or mocap target estimator and relative-odometry helper |
 | `test_bodyrate_cmd.py` | `scripts/test_bodyrate_cmd.py` | Manual body-rate command publisher for Crazyflie command-path checks |
 
 ## Launch Model

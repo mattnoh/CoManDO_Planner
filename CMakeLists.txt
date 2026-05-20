@@ -36,14 +36,14 @@ target_link_libraries(planner_core INTERFACE
   alipddp_library
 )
 
-option(COMANDO_ENABLE_QUALISYS "Enable Qualisys/mocap4r2 message support" ON)
+option(COMANDO_ENABLE_MOCAP "Enable mocap4r2 message support" ON)
 find_package(mocap4r2_msgs QUIET)
-if(COMANDO_ENABLE_QUALISYS AND mocap4r2_msgs_FOUND)
-  message(STATUS "mocap4r2_msgs FOUND — Qualisys target mode enabled")
-elseif(COMANDO_ENABLE_QUALISYS)
-  message(WARNING "mocap4r2_msgs NOT FOUND — building without Qualisys target mode")
+if(COMANDO_ENABLE_MOCAP AND mocap4r2_msgs_FOUND)
+  message(STATUS "mocap4r2_msgs FOUND — mocap target mode enabled")
+elseif(COMANDO_ENABLE_MOCAP)
+  message(WARNING "mocap4r2_msgs NOT FOUND — building without mocap target mode")
 else()
-  message(STATUS "Qualisys target mode disabled by COMANDO_ENABLE_QUALISYS=OFF")
+  message(STATUS "mocap target mode disabled by COMANDO_ENABLE_MOCAP=OFF")
 endif()
 find_package(mavros_msgs QUIET)
 if(mavros_msgs_FOUND)
@@ -67,7 +67,7 @@ macro(configure_target TARGET_NAME)
     config
   )
 
-  if(COMANDO_ENABLE_QUALISYS AND mocap4r2_msgs_FOUND)
+  if(COMANDO_ENABLE_MOCAP AND mocap4r2_msgs_FOUND)
     target_compile_definitions(${TARGET_NAME} PRIVATE HAS_MOCAP4R2_MSGS)
   endif()
   if(mavros_msgs_FOUND)
@@ -87,7 +87,7 @@ macro(configure_target TARGET_NAME)
     visualization_msgs
     crazyflie_interfaces
   )
-  if(COMANDO_ENABLE_QUALISYS AND mocap4r2_msgs_FOUND)
+  if(COMANDO_ENABLE_MOCAP AND mocap4r2_msgs_FOUND)
     list(APPEND _AMENT_DEPS mocap4r2_msgs)
   endif()
   if(mavros_msgs_FOUND)

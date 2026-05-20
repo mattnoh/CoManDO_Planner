@@ -9,7 +9,7 @@
 ///   "gazebo_figure8" — Synthetic figure-8 pose measurements fed through the
 ///                      same estimator used by mocap.
 ///
-///   "mocap"          — Real target pose from a Qualisys-sourced rigid-bodies
+///   "mocap"          — Real target pose from a mocap4r2 rigid-bodies
 ///                      topic, selected by rigid_body_name.
 ///
 /// Publishes on:

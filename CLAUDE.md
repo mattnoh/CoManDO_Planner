@@ -20,7 +20,7 @@ source install/setup.zsh
 | Dependency | Build behavior |
 | --- | --- |
 | `mavros_msgs` | Enables MAVROS platform support and defines `HAS_MAVROS_MSGS` |
-| `mocap4r2_msgs` | Enables Qualisys target mode and defines `HAS_MOCAP4R2_MSGS` |
+| `mocap4r2_msgs` | Enables mocap target mode and defines `HAS_MOCAP4R2_MSGS` |
 
 The package still builds without those optional message packages, but related
 runtime paths are unavailable or fall back.
