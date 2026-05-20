@@ -107,18 +107,19 @@ with `drone_odom_topic` plus `drone_pose_topic`.
 
 | `target_mode` | Behavior |
 | --- | --- |
-| `circle` | Synthetic circular target using constants in `include/target/circular_target.hpp` |
-| `qualisys` | Reads `/rigid_bodies`, selects `rigid_body_name`, and finite-differences pose history |
+| `gazebo_circle` | Synthetic circular pose measurements through the shared estimator |
+| `gazebo_figure8` | Synthetic figure-8 pose measurements through the shared estimator |
+| `mocap` | Reads `/rigid_bodies`, selects `rigid_body_name`, and feeds the shared estimator |
 
 Runtime parameters currently declared by the node:
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `target_mode` | `circle` | `circle` or `qualisys` |
-| `target_yaw_rate` | `0.3` | Synthetic yaw rate in circle mode |
+| `target_mode` | `gazebo_circle` | `gazebo_circle`, `gazebo_figure8`, or `mocap` |
+| `target_yaw_rate` | `0.3` | Synthetic yaw rate in `gazebo_*` modes |
 | `publish_hz` | `100.0` | Output rate |
 | `frame_id` | `world` | Header frame for target messages |
-| `rigid_body_name` | `stmini` | Qualisys rigid body name |
+| `rigid_body_name` | `stmini` | Mocap rigid body name |
 | `drone_odom_topic` | `/cf_1/odom` | Drone odom input for helper relative odometry |
 | `drone_pose_topic` | `/cf_1/pose` | Drone pose input for helper relative odometry |
 | `drone_odom_mode` | `none` | `none`, `shifted_world`, `body_frame`, or `target_frame` |

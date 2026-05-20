@@ -43,7 +43,7 @@ Target publisher for body-frame OCPs:
 
 ```bash
 ros2 run comando_planner target_publisher --ros-args \
-  -p target_mode:=circle \
+  -p target_mode:=gazebo_circle \
   -p drone_odom_mode:=body_frame \
   -p drone_odom_topic:=/cf_1/odom \
   -p drone_pose_topic:=/cf_1/pose
@@ -53,7 +53,7 @@ Target publisher for target-frame OCPs:
 
 ```bash
 ros2 run comando_planner target_publisher --ros-args \
-  -p target_mode:=circle \
+  -p target_mode:=gazebo_circle \
   -p drone_odom_mode:=target_frame \
   -p drone_odom_topic:=/cf_1/odom \
   -p drone_pose_topic:=/cf_1/pose

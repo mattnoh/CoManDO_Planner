@@ -17,7 +17,7 @@
   <depend>tf2_ros</depend>
   <!-- Crazyflie interface messages -->
   <depend>crazyflie_interfaces</depend>
-  <!-- mocap4ros2 rigid body messages (optional at build time; needed for qualisys mode) -->
+  <!-- mocap4ros2 rigid body messages (optional at build time; needed for mocap mode) -->
   <exec_depend>mocap4r2_msgs</exec_depend>
   <!-- MAVROS interface messages (optional — build proceeds without it) -->
   <exec_depend>mavros_msgs</exec_depend>

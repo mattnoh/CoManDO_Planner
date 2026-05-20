@@ -115,7 +115,7 @@ public:
         body_relative_angular_unit_ = declare_parameter<std::string>(
             "body_relative_input_angular_unit", "deg_s");
 
-        // Filter gains for qualisys mode (alpha-beta-gamma on position, alpha-beta on angular velocity).
+        // Filter gains for target pose measurements.
         filter_alpha_   = declare_parameter<double>("filter_alpha",   0.8);
         filter_beta_    = declare_parameter<double>("filter_beta",    0.4);
         filter_gamma_   = declare_parameter<double>("filter_gamma",   0.001);

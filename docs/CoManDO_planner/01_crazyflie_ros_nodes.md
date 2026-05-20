@@ -111,8 +111,10 @@ both timestamps when an OCP needs a fully valid target snapshot.
 
 Source: `src/target_publisher.cpp`
 
-`target_publisher` publishes `/target/odom` and `/target/accel` in `circle` or
-`qualisys` mode. It can also publish relative drone odometry for body-frame and
+`target_publisher` publishes estimator output on `/target/odom` and
+`/target/accel` in `gazebo_circle`, `gazebo_figure8`, or `mocap` mode. Gazebo
+modes also publish `/target/true_odom` and `/target/true_accel` for bag
+comparison. It can also publish relative drone odometry for body-frame and
 target-frame OCPs.
 
 Common commands:
@@ -120,18 +122,18 @@ Common commands:
 ```bash
 # Synthetic target only
 ros2 run comando_planner target_publisher --ros-args \
-  -p target_mode:=circle -p drone_odom_mode:=none
+  -p target_mode:=gazebo_circle -p drone_odom_mode:=none
 
 # Body-frame relative odometry for tracking_bodyrate_bf_*
 ros2 run comando_planner target_publisher --ros-args \
-  -p target_mode:=circle \
+  -p target_mode:=gazebo_circle \
   -p drone_odom_mode:=body_frame \
   -p drone_odom_topic:=/cf_1/odom \
   -p drone_pose_topic:=/cf_1/pose
 
 # Target-frame relative odometry for tracking_bodyrate_tf_*
 ros2 run comando_planner target_publisher --ros-args \
-  -p target_mode:=circle \
+  -p target_mode:=gazebo_circle \
   -p drone_odom_mode:=target_frame \
   -p drone_odom_topic:=/cf_1/odom \
   -p drone_pose_topic:=/cf_1/pose
