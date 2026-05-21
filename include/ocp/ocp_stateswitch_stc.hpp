@@ -1,5 +1,43 @@
 /// @file ocp_stateswitch_stc.hpp
 /// @brief CT-cSTC state-switch OCP for relative-frame landing on a moving target.
+///
+/// --- Hardware flight 1 (2026-05-21, gogogo_stateswitch_stc_mpc_alipddp_20260521_111539) ---
+/// Problem observed:
+///   After 5 accepted solves, solver entered a cascade of 30+ consecutive rejections
+///   (constraint_error up to 28,836) from which it never recovered. Root cause:
+///   CTCSLandingEnvelopeCon constraints became infeasible the moment the drone descended
+///   within ALT_TRIG=0.8 m of the target with realistic hardware approach speed.
+///   The speed constraint trig*(||v_rel||^2 - SPD_STC_TIGHT^2) <= CTCS_BETA required
+///   ||v_rel|| <= 0.81 m/s when triggered, but the drone's relative speed was ~1.1 m/s
+///   at solve 2 (recovery_live handoff, control_jump_norm=12.19). The tight bound plus
+///   tiny CTCS_BETA slack made every subsequent recovery solve infeasible.
+///
+/// Fix applied (2026-05-21):
+///   SPD_STC_TIGHT : 0.8  -> 1.0  m/s  (allows ||v_rel|| up to 1.07 m/s when fully triggered)
+///   CTCS_BETA     : 2e-2 -> 0.15      (7.5x more slack for hardware tracking transients)
+///   ALT_TRIG      : 0.8  -> 0.45 m    (tight bounds only activate in final 45 cm of descent)
+/// ---------------------------------------------------------------------------------------------
+///
+/// --- Hardware flight 2 (2026-05-21, gogogo_stateswtich_stc_mpc_alipddp_20260521_123115) ---
+/// Problem observed:
+///   Solve 0 rejected 3 times (warm-start trajectory diverged to 40+ m in absolute mode)
+///   before accepting with constraint_error=0.883. At the solve 0→1 handoff, control_jump
+///   norm=47.74: solve 1 computed mx=41.5, my=22.7 rad/s² at node 0 vs solve 0's
+///   mx=-0.33, my=-0.28. The drone's trajectory switched from gradual attitude evolution
+///   to nearly upright in 0.12 s (nodes 0→2 of solve 1), causing a violent attitude
+///   transient. Flight ended after only 3 accepted solves.
+///
+///   Root cause: W_PHASE0_TAU=1e-3 is negligible — applying mx=41.5 rad/s² cost only
+///   1e-3*41.5²=1.7 per stage, while the W_PHASE0_TILT=3000 tilt penalty at 14° tilt
+///   cost 130. The optimizer rationally chose instant attitude correction, but in hardware
+///   this produces a discontinuous trajectory at every plan handoff after a tracking error.
+///
+/// Fix applied (2026-05-21):
+///   W_PHASE0_TAU  : 1e-3 -> 0.3    (300x; at mx=41.5 cost becomes 517 vs tilt cost ~43,
+///                                    forcing gradual attitude correction)
+///   W_PHASE0_TILT : 3000 -> 1000   (3x reduction; reduces per-step urgency; hard tilt
+///                                    constraint at 25° + terminal TERM_W_TILT=200 remain)
+/// ---------------------------------------------------------------------------------------------
 #pragma once
 
 #include "optimal_control_problem.h"
@@ -79,8 +117,8 @@ static constexpr double W_LAND_STAGE_XY = 80.0;
 static constexpr double W_LAND_STAGE_Z = 140.0;
 static constexpr double W_LAND_STAGE_V = 10.0;
 static constexpr double W_PHASE0_HOVER_T = 100000.0;
-static constexpr double W_PHASE0_TAU = 1e-3;
-static constexpr double W_PHASE0_TILT = 3000.0;
+static constexpr double W_PHASE0_TAU = 0.3;           // was 1e-3; prevents large moment spikes at plan handoffs
+static constexpr double W_PHASE0_TILT = 1000.0;       // was 3000; hard 25° tilt con + TERM_W_TILT=200 still apply
 static constexpr double W_PHASE0_OMEGA = 50.0;
 static constexpr double W_PHASE0_VZ = 200.0;
 
@@ -90,13 +128,13 @@ static constexpr double THETA_STC_DEG = 10.0;
 static constexpr double ALPHA_THETA_STC = 1.0;
 static constexpr double OMEGA_STC_TIGHT = 0.6;
 static constexpr double GS_STC_TIGHT_TAN = 0.466;
-static constexpr double SPD_STC_TIGHT = 0.8;
+static constexpr double SPD_STC_TIGHT = 1.0;    // was 0.8; loosened for hardware tracking error
 static constexpr double T_MIN_AFT = 0.21;
 static constexpr double T_MAX_AFT = 0.40;
-static constexpr double CTCS_BETA = 2e-2;
+static constexpr double CTCS_BETA = 0.15;        // was 2e-2; loosened for hardware tracking error
 static constexpr double V_THRUST_TRIG = 1.0;
 static constexpr double THETA_THRUST_TRIG_DEG = 15.0;
-static constexpr double ALT_TRIG = 0.8;
+static constexpr double ALT_TRIG = 0.45;         // was 0.8; activate tight bounds only in final descent
 static constexpr double ALT_TRIG_FULL = 0.0;
 
 static constexpr double W_STC_TILT = 0.0;

@@ -1,0 +1,1 @@
+timestamp,solve_num,event,reason,coord_mode,x0_source,solve_time_ms,solve_iters,constraint_error,active_elapsed_now_sec,activation_elapsed_sec,activation_wall_time_sec,solve_lead_sec,solve_finish_late_by_sec,handoff_pos_err,handoff_vel_err,replan_delay_sec,state_jump_norm,control_jump_norm,hover_z_jump,extra_values

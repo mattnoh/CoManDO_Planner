@@ -36,6 +36,24 @@ PAGE_TALL = (12.8, 9.0)
 PAGE_GRID = (13.2, 9.4)
 
 
+def bag_has_metadata(bag_dir):
+    return os.path.isfile(os.path.join(bag_dir, "metadata.yaml"))
+
+
+def resolve_bag_dir(run_dir, bag_arg):
+    if bag_arg:
+        return os.path.abspath(bag_arg)
+
+    default_bag = os.path.join(run_dir, "bags", "comando_debug")
+    reindexed_bag = os.path.join(run_dir, "bags", "comando_debug_reindexed")
+    if bag_has_metadata(default_bag):
+        return default_bag
+    if bag_has_metadata(reindexed_bag):
+        print(f"Default bag has no metadata.yaml; using {reindexed_bag}")
+        return reindexed_bag
+    return default_bag
+
+
 def _fig(title, figsize=PAGE_WIDE):
     fig = plt.figure(figsize=figsize, facecolor=FIG_BG, constrained_layout=False)
     fig.suptitle(title, color=TEXT_COL, fontsize=13, fontweight="bold", y=0.98)
@@ -133,7 +151,7 @@ def read_bag(bag_dir):
                 "t": t, "x": p.x, "y": p.y, "z": p.z,
                 "qw": q.w, "qx": q.x, "qy": q.y, "qz": q.z,
             })
-        elif topic.endswith("/odom") and topic.startswith("/cf_"):
+        elif topic.endswith("/odom") and topic not in ("/target/odom", "/target/true_odom", "/drone/target_frame_odom"):
             records["drone_odom"].append(odom_row(msg, t, ""))
         elif topic == "/target/odom":
             records["target_odom"].append(odom_row(msg, t, "tgt_"))
@@ -570,7 +588,16 @@ def page_ocp_nodes(title, solves):
 
 
 def build_pdf(run_dir, bag_dir, out_path, cut_secs, csv_solver, auto_trim, trim_margin_sec):
-    records, topic_counts, _ = read_bag(bag_dir)
+    try:
+        records, topic_counts, _ = read_bag(bag_dir)
+    except RuntimeError:
+        fallback_bag = os.path.join(run_dir, "bags", "comando_debug_reindexed")
+        if os.path.abspath(bag_dir) != os.path.abspath(fallback_bag) and bag_has_metadata(fallback_bag):
+            print(f"Could not open {bag_dir}; retrying with {fallback_bag}")
+            bag_dir = fallback_bag
+            records, topic_counts, _ = read_bag(bag_dir)
+        else:
+            raise
     drone_pose = df_from(records["drone_pose"])
     drone_odom = df_from(records["drone_odom"])
     target = df_from(records["target_odom"])
@@ -581,7 +608,7 @@ def build_pdf(run_dir, bag_dir, out_path, cut_secs, csv_solver, auto_trim, trim_
 
     drone = drone_pose if not drone_pose.empty else drone_odom
     if drone.empty:
-        raise RuntimeError("No drone truth topic found. Expected /cf_1/pose or /cf_1/odom.")
+        raise RuntimeError("No drone truth topic found. Expected <drone>/pose or <drone>/odom.")
     if target.empty:
         raise RuntimeError("No target truth topic found. Expected /target/odom.")
     if drone_odom.empty:
@@ -657,7 +684,7 @@ def main():
     args = parser.parse_args()
 
     run_dir = os.path.abspath(args.dir)
-    bag_dir = os.path.abspath(args.bag) if args.bag else os.path.join(run_dir, "bags", "comando_debug")
+    bag_dir = resolve_bag_dir(run_dir, args.bag)
     build_pdf(run_dir, bag_dir, args.out, args.cut, args.csv_solver,
               auto_trim=not args.no_auto_trim,
               trim_margin_sec=args.trim_margin)

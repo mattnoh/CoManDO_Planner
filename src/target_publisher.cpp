@@ -398,6 +398,21 @@ private:
             }
         }
 
+        if (drone_odom_mode_ != "world") {
+            if (!have_drone_odom) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "[TargetPublisher] Waiting for drone odom on '%s' — "
+                    "relative odom output will not publish until data arrives.",
+                    drone_odom_topic_.c_str());
+            } else if (!have_drone_pose &&
+                       (drone_odom_mode_ == "body_frame" || drone_odom_mode_ == "target_frame")) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "[TargetPublisher] Waiting for drone pose on '%s' — "
+                    "relative odom output will not publish until data arrives.",
+                    drone_pose_topic_.c_str());
+            }
+        }
+
         if (drone_odom_mode_ == "shifted" && abs_rel_odom_pub_ && have_drone_odom) {
             nav_msgs::msg::Odometry rel = drone_odom_copy;
             rel.header.stamp    = drone_odom_copy.header.stamp;

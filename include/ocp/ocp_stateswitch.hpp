@@ -1,5 +1,27 @@
 /// @file ocp_stateswitch.hpp
 /// @brief OCP formulation for relative-frame landing on a moving target (state-switch).
+///
+/// ── Hardware flight history ───────────────────────────────────────────────────
+///
+/// FLIGHT 1 — 2026-05-21 (gogogo_stateswitch_mpc_alipddp_20260521_112506) — FAILED
+///   Problem: solver never converged on any of the 8 accepted solves (126–144 iters,
+///   max_iter=150 every time). Root cause: GS_DEG=35° was too tight. Drone started
+///   ~1.01 m lateral / 1.58 m above target; at solve 1 the glideslope margin was only
+///   8 mm. Solver spent all iterations fighting the cone constraint, solutions were
+///   suboptimal, control jumps at handoffs were 0.5–0.7 (normal) then 3.57 (fatal)
+///   when a recovery-from-live-state plan was swapped in. After that jump the drone
+///   diverged; every recovery solve was rejected (constraint_error ~100–1400,
+///   max_relative_position_norm up to 33 m at terminal node from a diverging warm-start).
+///   Secondary contributor: SOLVER_TOLERANCE=1e-4 was never reached, so the solver
+///   always ran out of iterations before producing a clean solution.
+///   Weights (TERM_W_VEL_XY=150, TERM_W_VEL_Z=20) already matched the sim — not the issue.
+///
+/// FIX applied before FLIGHT 2:
+///   GS_DEG        35.0 → 50.0   (wider cone; gives ~0.65 m margin at flight-1 start pose)
+///   GS_APEX_OFFSET 0.1 → 0.2   (matches standalone sim; more clearance near apex)
+///   SOLVER_TOLERANCE 1e-4 → 5e-4 (allows clean convergence in ~70–100 iters, not 150)
+///
+/// ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
 #include <Eigen/Dense>
@@ -49,9 +71,9 @@ static const Eigen::Matrix3d J_B = [](){
 static const Eigen::Vector3d GRAVITY(0.0, 0.0, -9.81);
 
 // ── Glideslope parameters ─────────────────────────────────────────────────────
-static constexpr double GS_DEG = 35.0;
+static constexpr double GS_DEG = 50.0;
 static const double GS_TAN = std::tan(GS_DEG * M_PI / 180.0);
-static constexpr double GS_APEX_OFFSET = 0.1;
+static constexpr double GS_APEX_OFFSET = 0.2;
 static constexpr double VZ_LAND_MAX = 1.0;
 static constexpr double STAGE_W_VZ     = 0.0;
 static constexpr double STAGE_W_POS_XY = 0.0;
@@ -72,7 +94,7 @@ const double SOLVER_MU_MUL = 0.1;
 const double SOLVER_RHO = 1.0;
 const double SOLVER_RHOT = 0.5;
 const double SOLVER_RHO_MUL = 5.0;
-const double SOLVER_TOLERANCE = 1e-4;
+const double SOLVER_TOLERANCE = 5e-4;
 const int SOLVER_MAX_ITER = 150;
 
 inline Param getSolverParams() {
