@@ -303,6 +303,97 @@ public:
         return out;
     }
 
+    /// One-shot open-loop solve. Runs the same descriptor plumbing as
+    /// trySolve (frame contract, state transform, prepare_extra,
+    /// post-processing, circle-target absolute reconstruction) but with no
+    /// handoff scheduling, terminal freeze, or replayer involvement — the
+    /// wrapper replays the returned solve_result.state_trajectory itself.
+    /// path.states carries the world-frame trajectory for publishing.
+    PlannerCoreStepResult solveOpenLoop(const PlannerCoreInput& input) {
+        PlannerCoreStepResult out;
+        if (!configured_) {
+            reject(out, "not_configured", "PlannerCore is not configured");
+            return out;
+        }
+        if (config_.solver_type != "alipddp" || !mpc_) {
+            reject(out, "solver_unavailable", "ALIPDDP solver is unavailable");
+            return out;
+        }
+        const auto frame_check = validateFrameContract(
+            desc_, input.active_odom_mode, input.active_odom_topic,
+            config_.body_relative_odom_topic, config_.target_frame_odom_topic);
+        if (!frame_check.ok) {
+            reject(out, "frame_contract", frame_check.reason);
+            return out;
+        }
+
+        const Eigen::VectorXd x0 =
+            prepareOcpState(desc_, input.current_state, input.target_snapshot);
+        out.x0_source = "live_open_loop";
+        out.solve_attempted = true;
+        out.solve_num = 0;
+
+        PlannerConfig planner_config;
+        planner_config.ocp_type = config_.ocp_type;
+        planner_config.solver_type = config_.solver_type;
+        planner_config.mode = "open_loop";
+        planner_config.n_replay = config_.n_replay;
+        planner_config.ocp_dt = config_.ocp_dt;
+        planner_config.dt = config_.ocp_dt;
+        planner_config.mass_kg = desc_.default_mass_kg;
+        planner_config.t_start_abs = input.ros_time_sec;
+        if (input.has_target_accel_buffer) {
+            planner_config.target_accel_buffer = input.target_accel_buffer;
+        }
+
+        std::any extra;
+        if (desc_.prepare_extra) {
+            extra = desc_.prepare_extra(planner_config, input.ros_time_sec, input.target_snapshot);
+        }
+
+        const Eigen::Vector3d target_accel =
+            input.target_snapshot.valid ? input.target_snapshot.acceleration
+                                        : Eigen::Vector3d::Zero();
+        auto raw = mpc_->solve(x0, target_accel, extra, input.ros_time_sec);
+        SolverResult result = toSolverResult(raw, input.target_snapshot);
+        if (desc_.post_process_result) {
+            desc_.post_process_result(result, input.target_snapshot);
+        }
+
+        // tracking_circle_target replays absolute states: rebuild them from
+        // the predicted-accel buffer so replay needs no live target frame.
+        if (config_.ocp_type == "tracking_circle_target" && result.is_relative_plan) {
+            TrackingCircleTargetOCP::TrackingCircleTargetExtra ex;
+            if (!tryGetTrackingCircleTargetExtra(result.extra, ex)) {
+                reject(out, "open_loop_missing_target_buffer",
+                       "tracking_circle_target open-loop solve is missing the predicted accel buffer");
+                out.solve_result = std::move(result);
+                return out;
+            }
+            std::vector<Eigen::Vector3d> tgt_pos_nodes, tgt_vel_nodes;
+            result.state_trajectory = reconstructTrackingCircleTargetAbsoluteTrajectory(
+                result.state_trajectory, result.target_snapshot_pos,
+                result.target_snapshot_vel, ex.buf, ex.t_abs,
+                &tgt_pos_nodes, &tgt_vel_nodes);
+            result.target_world_pos_trajectory = std::move(tgt_pos_nodes);
+            result.target_world_vel_trajectory = std::move(tgt_vel_nodes);
+            result.target_motion_source = "odom+predicted_accel";
+            result.is_relative_plan = false;
+        }
+
+        if (!result.success || result.state_trajectory.size() < 2) {
+            reject(out, "solve_failed", "Open-loop solve failed");
+            out.solve_result = std::move(result);
+            return out;
+        }
+
+        out.solve_accepted = true;
+        out.path.states = makeTrajectoryForPublishing(result);
+        out.solve_log = makeSolveLogData(result, 0);
+        out.solve_result = std::move(result);
+        return out;
+    }
+
     std::vector<PlannerDiagnostic> consumeDiagnostics() {
         auto out = diagnostics_;
         diagnostics_.clear();
@@ -601,8 +692,10 @@ private:
         if (config_.skip_trajectory_validation || desc_.skip_trajectory_validation) {
             return true;
         }
-        if (!validateTrajectory(result.state_trajectory, result.control_trajectory)) {
-            reason = "physical_bounds";
+        std::string bounds_detail;
+        if (!validateTrajectory(result.state_trajectory, result.control_trajectory,
+                                bounds_detail)) {
+            reason = "physical_bounds:" + bounds_detail;
             return false;
         }
         return true;
@@ -682,16 +775,33 @@ private:
     }
 
     bool validateTrajectory(const std::vector<Eigen::VectorXd>& X,
-                            const std::vector<Eigen::VectorXd>& U) const {
-        if (X.size() < 2) return false;
-        for (const auto& x : X) {
+                            const std::vector<Eigen::VectorXd>& U,
+                            std::string& detail) const {
+        if (X.size() < 2) { detail = "trajectory_too_short"; return false; }
+        for (int i = 0; i < static_cast<int>(X.size()); ++i) {
+            const auto& x = X[i];
             if (x.size() < desc_.state_dim) continue;
-            if (!desc_.skip_altitude_validation && x.size() >= 3 && x(2) < -0.05) return false;
-            if (x.size() >= 6 && x.segment(3, 3).norm() > 20.0) return false;
-            if (x.size() >= 13 && x.segment(10, 3).norm() > 50.0) return false;
+            if (!desc_.skip_altitude_validation && x.size() >= 3 && x(2) < -0.05) {
+                detail = "altitude node=" + std::to_string(i) +
+                         " z=" + std::to_string(x(2)) + " floor=-0.05";
+                return false;
+            }
+            if (x.size() >= 6 && x.segment(3, 3).norm() > 20.0) {
+                detail = "velocity node=" + std::to_string(i) +
+                         " |v|=" + std::to_string(x.segment(3, 3).norm()) + " limit=20";
+                return false;
+            }
+            if (x.size() >= 13 && x.segment(10, 3).norm() > 50.0) {
+                detail = "body_rate node=" + std::to_string(i) +
+                         " |w|=" + std::to_string(x.segment(10, 3).norm()) + " limit=50";
+                return false;
+            }
         }
-        for (const auto& u : U) {
+        for (int i = 0; i < static_cast<int>(U.size()); ++i) {
+            const auto& u = U[i];
             if (u.size() > 0 && (u(0) < -0.1 || u(0) > 50.0)) {
+                detail = "thrust node=" + std::to_string(i) +
+                         " u0=" + std::to_string(u(0)) + " range=[-0.1,50]";
                 return false;
             }
         }
@@ -737,14 +847,20 @@ private:
         const Eigen::Vector3d& target_pos0,
         const Eigen::Vector3d& target_vel0,
         const target_models::TargetAccelBuffer& buffer,
-        double t0_abs) const {
+        double t0_abs,
+        std::vector<Eigen::Vector3d>* tgt_pos_nodes = nullptr,
+        std::vector<Eigen::Vector3d>* tgt_vel_nodes = nullptr) const {
         std::vector<Eigen::VectorXd> abs_traj;
         abs_traj.reserve(rel_traj.size());
+        if (tgt_pos_nodes) { tgt_pos_nodes->clear(); tgt_pos_nodes->reserve(rel_traj.size()); }
+        if (tgt_vel_nodes) { tgt_vel_nodes->clear(); tgt_vel_nodes->reserve(rel_traj.size()); }
         Eigen::Vector3d tgt_pos = target_pos0;
         Eigen::Vector3d tgt_vel = target_vel0;
         double prev_t_node = 0.0;
         for (int i = 0; i < static_cast<int>(rel_traj.size()); ++i) {
             const Eigen::VectorXd& x_rel = rel_traj[i];
+            if (tgt_pos_nodes) tgt_pos_nodes->push_back(tgt_pos);
+            if (tgt_vel_nodes) tgt_vel_nodes->push_back(tgt_vel);
             if (x_rel.size() < desc_.state_dim) {
                 abs_traj.push_back(x_rel);
                 continue;

@@ -1,10 +1,9 @@
-/// @file state_monitor.hpp
+/// @file state_monitor.hpp  (ROS1 Noetic branch)
 /// @brief Thread-safe state ownership for planner sensor and target streams.
-
 #pragma once
 
 #include <Eigen/Dense>
-#include <rclcpp/rclcpp.hpp>
+#include <ros/ros.h>
 
 #include <mutex>
 #include <string>
@@ -34,39 +33,26 @@ public:
     std::mutex& stateMutex() const { return state_mutex_; }
     std::mutex& targetMutex() { return target_mutex_; }
 
-    bool hasState(const std::string& platform) const {
-        if (platform == "crazyflie") {
-            return cf_state_.hasFullState();
-        }
-        if (platform == "mavros") {
-            return cf_state_.hasFullState();
-        }
-        return false;
+    bool hasState(const std::string& /*platform*/) const {
+        return cf_state_.hasFullState();
     }
 
-    StateDebugSnapshot getStateDebugSnapshot(const std::string& platform) const {
+    StateDebugSnapshot getStateDebugSnapshot(const std::string& /*platform*/) const {
         std::lock_guard<std::mutex> lk(state_mutex_);
         StateDebugSnapshot snap;
         snap.cf_pose_received = cf_state_.pose_received;
         snap.cf_odom_received = cf_state_.odom_received;
-
-        if (platform == "crazyflie" || platform == "mavros") {
-            snap.has_state = cf_state_.hasFullState();
-        }
+        snap.has_state = cf_state_.hasFullState();
         return snap;
     }
 
-    /// @brief Check if target state is fresh if the OCP requires it.
-    bool hasFreshTargetState(bool needs_target, const rclcpp::Time& now) const {
-        if (!needs_target) {
-            return true;
-        }
+    bool hasFreshTargetState(bool needs_target, const ros::Time& now) const {
+        if (!needs_target) return true;
         std::lock_guard<std::mutex> lk(target_mutex_);
         return target_state_.isFresh(now, target_state_max_age_sec_);
     }
 
-    /// @brief Get live target snapshot if the OCP requires it.
-    TargetSnapshot getTargetSnapshot(bool needs_target, const rclcpp::Time& now) const {
+    TargetSnapshot getTargetSnapshot(bool /*needs_target*/, const ros::Time& now) const {
         TargetSnapshot s;
         std::lock_guard<std::mutex> lk(target_mutex_);
         s.position = target_state_.position;
@@ -75,14 +61,9 @@ public:
         s.angular_velocity = target_state_.angular_velocity;
         s.angular_acceleration = target_state_.angular_acceleration;
         s.orientation = target_state_.orientation;
-        s.odom_stamp_sec = target_state_.odom_timestamp.seconds();
-        s.accel_stamp_sec = target_state_.accel_timestamp.seconds();
+        s.odom_stamp_sec  = target_state_.odom_timestamp.toSec();
+        s.accel_stamp_sec = target_state_.accel_timestamp.toSec();
         s.valid = target_state_.isFresh(now, target_state_max_age_sec_);
-
-        if (!needs_target) {
-            // Optional target: expose best-effort snapshot, but do not gate planner loop.
-            return s;
-        }
         return s;
     }
 
@@ -91,7 +72,7 @@ public:
         return {target_state_.position, target_state_.velocity};
     }
 
-    bool hasTargetTrajectory(const rclcpp::Time& now) const {
+    bool hasTargetTrajectory(const ros::Time& now) const {
         std::lock_guard<std::mutex> lk(target_mutex_);
         return target_state_.predicted_accel.isFresh(now, 2.0);
     }
@@ -101,15 +82,9 @@ public:
         return target_state_.predicted_accel.accel_buffer;
     }
 
-    Eigen::VectorXd getCurrentState(const std::string& platform) const {
+    Eigen::VectorXd getCurrentState(const std::string& /*platform*/) const {
         std::lock_guard<std::mutex> lk(state_mutex_);
-        if (platform == "crazyflie") {
-            return cf_state_.current;
-        }
-        if (platform == "mavros") {
-            return cf_state_.current;
-        }
-        return fallback_state_;
+        return cf_state_.current;
     }
 
 private:

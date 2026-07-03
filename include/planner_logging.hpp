@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
-#include <rclcpp/rclcpp.hpp>
+#include <ros/ros.h>
 
 #include "planner_core/types.hpp"
 
@@ -67,6 +67,12 @@ struct SolverEventLogRow {
 
 class CsvLogger {
 public:
+    /// Set the directory run folders are created under. Call before initialize().
+    void setLogRoot(const std::string& dir) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!dir.empty()) log_root_ = dir;
+    }
+
     /// Initialize logger.
     /// @param state_names     Column names for raw OCP state vector (from descriptor().state_names)
     /// @param control_names   Column names for raw OCP control vector (from descriptor().control_names)
@@ -75,7 +81,7 @@ public:
                     const std::string& ocp_type,
                     const std::string& mode,
                     const std::string& solver_type,
-                    const rclcpp::Logger& ros_logger,
+                    const std::string& /*ros_logger*/,
                     double mass_kg,
                     int state_dim,
                     const std::vector<std::string>& state_names,
@@ -100,7 +106,7 @@ public:
         auto t = std::chrono::system_clock::to_time_t(now);
         std::stringstream ts;
         ts << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S");
-        std::string folder = "./logs/" + drone_name + "_" + ocp_type + "_" +
+        std::string folder = log_root_ + "/" + drone_name + "_" + ocp_type + "_" +
                              mode + "_" + solver_type + "_" + ts.str();
         std::filesystem::create_directories(folder);
         log_folder_ = folder;
@@ -154,7 +160,7 @@ public:
 
         initialized_ = all_solves_log_.is_open() &&
                        solver_events_log_.is_open();
-        RCLCPP_INFO(ros_logger, "Logging to: %s", folder.c_str());
+        ROS_INFO("Logging to: %s", folder.c_str());
         return initialized_;
     }
 
@@ -318,6 +324,10 @@ private:
 
     mutable std::mutex mutex_;
     bool initialized_ = false;
+    // Root for run folders. cwd-relative by default (roslaunch nodes run in
+    // ~/.ros); the node overrides it with the log_dir param, which
+    // planner_launch.launch points at the package logs/ directory.
+    std::string log_root_ = "./logs";
     double mass_kg_ = 0.0282;
     int state_dim_ = 13;
     std::vector<std::string> state_names_;

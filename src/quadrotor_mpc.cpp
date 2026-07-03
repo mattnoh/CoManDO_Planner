@@ -197,10 +197,8 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
         if (X_result.size() > 1) {
             auto desc = OCPRegistry::getDescriptor(config_.ocp_type);
             int state_dim = desc.state_dim;
-            if (config_.ocp_type == "stateswitch" && X_result[1].size() >= state_dim) {
+            if (X_result[1].size() >= state_dim) {
                 result.next_state = X_result[1].head(state_dim);
-            } else if (X_result[1].size() >= 13) {
-                result.next_state = X_result[1].head(13); // Default fallback just in case
             } else {
                 result.next_state = X_result[1];
             }

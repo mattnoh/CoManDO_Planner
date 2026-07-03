@@ -1,33 +1,19 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
-<package format="3">
+<package format="2">
   <name>comando_planner</name>
   <version>0.1.0</version>
-  <description>CoManDO MPC planner — ALIPDDP solver, Crazyflie and MAVROS platforms</description>
+  <description>CoManDO MPC planner — ALIPDDP solver, MAVROS platform (ROS1 Noetic branch)</description>
   <maintainer email="your_email@example.com">Your Name</maintainer>
   <license>MIT</license>
-  <buildtool_depend>ament_cmake</buildtool_depend>
-  <!-- Core ROS2 dependencies -->
-  <depend>rclcpp</depend>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>roscpp</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>trajectory_msgs</depend>
-  <depend>visualization_msgs</depend>
-  <depend>tf2</depend>
   <depend>tf2_ros</depend>
-  <!-- Crazyflie interface messages -->
-  <depend>crazyflie_interfaces</depend>
-  <!-- mocap4ros2 rigid body messages (optional at build time; needed for qualisys mode) -->
-  <exec_depend>mocap4r2_msgs</exec_depend>
-  <!-- MAVROS interface messages (optional — build proceeds without it) -->
-  <exec_depend>mavros_msgs</exec_depend>
-  <!-- Eigen for linear algebra -->
+  <depend>mavros_msgs</depend>
+
   <depend>eigen</depend>
-  <!-- ALIPDDP library (Integrated as sibling) -->
-  <!-- <depend>alipddp</depend> -->
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
 </package>

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
-#include <rclcpp/rclcpp.hpp>
+#include <ros/ros.h>
 
 #include <string>
 
@@ -9,97 +9,56 @@
 
 #include "planner_runtime_config_types.hpp"
 
-inline PlannerRuntimeConfig loadPlannerRuntimeConfig(rclcpp::Node* node) {
+inline PlannerRuntimeConfig loadPlannerRuntimeConfig(ros::NodeHandle& nh) {
     PlannerRuntimeConfig cfg;
 
-    node->declare_parameter("ocp_type", cfg.ocp_type);
-    cfg.ocp_type = node->get_parameter("ocp_type").as_string();
+    nh.param<std::string>("ocp_type", cfg.ocp_type, cfg.ocp_type);
 
+    nh.param<std::string>("drone_name",    cfg.drone_name,    cfg.drone_name);
+    nh.param<bool>       ("enable_logging", cfg.enable_logging, cfg.enable_logging);
+    nh.param<std::string>("platform",      cfg.platform,      cfg.platform);
+    nh.param<std::string>("solver",        cfg.solver,        cfg.solver);
+    nh.param<std::string>("mode",          cfg.mode,          cfg.mode);
+
+    // Must run AFTER the mode param is read: isConfigured() needs both
+    // ocp_type and mode, and a node restarted with sticky rosparams would
+    // otherwise come up configured with ocp_dt=0 (no replay timer).
     if (cfg.isConfigured()) {
         cfg.ocp_dt = OCPRegistry::getDT(cfg.ocp_type);
         cfg.n_replay = OCPRegistry::getDefaultNReplay(cfg.ocp_type);
         cfg.mass_kg = OCPRegistry::getDefaultMassKg(cfg.ocp_type);
     }
 
-    node->declare_parameter("drone_name", cfg.drone_name);
-    node->declare_parameter("enable_logging", cfg.enable_logging);
-    node->declare_parameter("platform", cfg.platform);
-    node->declare_parameter("solver", cfg.solver);
-    node->declare_parameter("mode", cfg.mode);
-    
-    // Used for Hover OCP
-    node->declare_parameter("hover_target_x", cfg.hover_target_x);
-    node->declare_parameter("hover_target_y", cfg.hover_target_y);
-    node->declare_parameter("hover_target_z", cfg.hover_target_z);
+    nh.param<double>("hover_target_x", cfg.hover_target_x, cfg.hover_target_x);
+    nh.param<double>("hover_target_y", cfg.hover_target_y, cfg.hover_target_y);
+    nh.param<double>("hover_target_z", cfg.hover_target_z, cfg.hover_target_z);
 
-    // Used as a target movement for Tracking Circle OCP
-    node->declare_parameter("circle_center_x", cfg.circle_center_x);
-    node->declare_parameter("circle_center_y", cfg.circle_center_y);
-    node->declare_parameter("circle_center_z", cfg.circle_center_z);
-    node->declare_parameter("circle_R", cfg.circle_R);
-    node->declare_parameter("circle_omega", cfg.circle_omega);
-    node->declare_parameter("circle_phi0", cfg.circle_phi0);
+    nh.param<double>("circle_center_x", cfg.circle_center_x, cfg.circle_center_x);
+    nh.param<double>("circle_center_y", cfg.circle_center_y, cfg.circle_center_y);
+    nh.param<double>("circle_center_z", cfg.circle_center_z, cfg.circle_center_z);
+    nh.param<double>("circle_R",        cfg.circle_R,        cfg.circle_R);
+    nh.param<double>("circle_omega",    cfg.circle_omega,    cfg.circle_omega);
+    nh.param<double>("circle_phi0",     cfg.circle_phi0,     cfg.circle_phi0);
 
-    // n_replay: how many re-planned setpoints we send per RH step (not used for open-loop).
-    node->declare_parameter("n_replay", cfg.n_replay);
-    node->declare_parameter("open_loop_abort_on_divergence", cfg.open_loop_abort_on_divergence);
-    node->declare_parameter("open_loop_abort_max_z_error_m", cfg.open_loop_abort_max_z_error_m);
-    node->declare_parameter("open_loop_abort_max_vz_error_mps", cfg.open_loop_abort_max_vz_error_mps);
+    nh.param<int>   ("n_replay",     cfg.n_replay,     cfg.n_replay);
+    nh.param<bool>  ("open_loop_abort_on_divergence",    cfg.open_loop_abort_on_divergence,    cfg.open_loop_abort_on_divergence);
+    nh.param<double>("open_loop_abort_max_z_error_m",   cfg.open_loop_abort_max_z_error_m,   cfg.open_loop_abort_max_z_error_m);
+    nh.param<double>("open_loop_abort_max_vz_error_mps",cfg.open_loop_abort_max_vz_error_mps,cfg.open_loop_abort_max_vz_error_mps);
 
-    node->declare_parameter("body_relative_odom_topic", cfg.body_relative_odom_topic);
+    nh.param<std::string>("body_relative_odom_topic",     cfg.body_relative_odom_topic,     cfg.body_relative_odom_topic);
+    nh.param<std::string>("target_odom_topic",            cfg.target_odom_topic,            cfg.target_odom_topic);
+    nh.param<std::string>("target_accel_topic",           cfg.target_accel_topic,           cfg.target_accel_topic);
+    nh.param<std::string>("target_predicted_accel_topic", cfg.target_predicted_accel_topic, cfg.target_predicted_accel_topic);
+    nh.param<bool>       ("debug_body_relative_trace",    cfg.debug_body_relative_trace,    cfg.debug_body_relative_trace);
 
-    // Topics for external target tracking.
-    node->declare_parameter("target_odom_topic", cfg.target_odom_topic);
-    node->declare_parameter("target_accel_topic", cfg.target_accel_topic);
-    node->declare_parameter("target_predicted_accel_topic", cfg.target_predicted_accel_topic);
-    node->declare_parameter("debug_body_relative_trace", cfg.debug_body_relative_trace);
+    nh.param<bool>  ("enable_terminal_freeze",      cfg.enable_terminal_freeze,      cfg.enable_terminal_freeze);
+    nh.param<double>("terminal_freeze_enter_pos",   cfg.terminal_freeze_enter_pos,   cfg.terminal_freeze_enter_pos);
+    nh.param<double>("terminal_freeze_enter_vel",   cfg.terminal_freeze_enter_vel,   cfg.terminal_freeze_enter_vel);
+    nh.param<bool>  ("terminal_freeze_require_vel", cfg.terminal_freeze_require_vel, cfg.terminal_freeze_require_vel);
+    nh.param<double>("terminal_freeze_exit_pos",    cfg.terminal_freeze_exit_pos,    cfg.terminal_freeze_exit_pos);
 
-    node->declare_parameter("enable_terminal_freeze", cfg.enable_terminal_freeze);
-    node->declare_parameter("terminal_freeze_enter_pos", cfg.terminal_freeze_enter_pos);
-    node->declare_parameter("terminal_freeze_enter_vel", cfg.terminal_freeze_enter_vel);
-    node->declare_parameter("terminal_freeze_require_vel", cfg.terminal_freeze_require_vel);
-    node->declare_parameter("terminal_freeze_exit_pos", cfg.terminal_freeze_exit_pos);
-
-    node->declare_parameter("start_paused", cfg.start_paused);
-    node->declare_parameter("command_seq", cfg.command_seq);
-
-    cfg.drone_name = node->get_parameter("drone_name").as_string();
-    cfg.enable_logging = node->get_parameter("enable_logging").as_bool();
-    cfg.platform = node->get_parameter("platform").as_string();
-    cfg.solver = node->get_parameter("solver").as_string();
-    cfg.mode = node->get_parameter("mode").as_string();
-
-    cfg.hover_target_x = node->get_parameter("hover_target_x").as_double();
-    cfg.hover_target_y = node->get_parameter("hover_target_y").as_double();
-    cfg.hover_target_z = node->get_parameter("hover_target_z").as_double();
-
-    cfg.circle_center_x = node->get_parameter("circle_center_x").as_double();
-    cfg.circle_center_y = node->get_parameter("circle_center_y").as_double();
-    cfg.circle_center_z = node->get_parameter("circle_center_z").as_double();
-    cfg.circle_R = node->get_parameter("circle_R").as_double();
-    cfg.circle_omega = node->get_parameter("circle_omega").as_double();
-    cfg.circle_phi0 = node->get_parameter("circle_phi0").as_double();
-
-    cfg.n_replay = node->get_parameter("n_replay").as_int();
-    cfg.open_loop_abort_on_divergence = node->get_parameter("open_loop_abort_on_divergence").as_bool();
-    cfg.open_loop_abort_max_z_error_m = node->get_parameter("open_loop_abort_max_z_error_m").as_double();
-    cfg.open_loop_abort_max_vz_error_mps = node->get_parameter("open_loop_abort_max_vz_error_mps").as_double();
-
-    cfg.body_relative_odom_topic = node->get_parameter("body_relative_odom_topic").as_string();
-
-    cfg.target_odom_topic = node->get_parameter("target_odom_topic").as_string();
-    cfg.target_accel_topic = node->get_parameter("target_accel_topic").as_string();
-    cfg.target_predicted_accel_topic = node->get_parameter("target_predicted_accel_topic").as_string();
-    cfg.debug_body_relative_trace = node->get_parameter("debug_body_relative_trace").as_bool();
-
-    cfg.enable_terminal_freeze = node->get_parameter("enable_terminal_freeze").as_bool();
-    cfg.terminal_freeze_enter_pos = node->get_parameter("terminal_freeze_enter_pos").as_double();
-    cfg.terminal_freeze_enter_vel = node->get_parameter("terminal_freeze_enter_vel").as_double();
-    cfg.terminal_freeze_require_vel = node->get_parameter("terminal_freeze_require_vel").as_bool();
-    cfg.terminal_freeze_exit_pos = node->get_parameter("terminal_freeze_exit_pos").as_double();
-
-    cfg.start_paused = node->get_parameter("start_paused").as_bool();
-    cfg.command_seq = node->get_parameter("command_seq").as_int();
+    nh.param<bool>("start_paused",  cfg.start_paused,  cfg.start_paused);
+    nh.param<int> ("command_seq",   cfg.command_seq,   cfg.command_seq);
 
     return cfg;
 }

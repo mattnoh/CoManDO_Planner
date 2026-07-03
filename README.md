@@ -1,5 +1,17 @@
 # CoManDO Planner
 
+> **⚠️ You are on the ROS 1 Noetic branch.** On this branch only
+> `platform:=mavros` is implemented (Crazyflie is a compile-only stub), the
+> build is `catkin build comando_planner`, and the `ros2 launch ... .py`
+> commands below belong to the ROS 2 branch. Use the `.launch` XML files
+> instead (`roslaunch comando_planner planner_launch.launch`), trigger OCPs
+> with `rosrun comando_planner apply_profile.sh` (there is no
+> `ocp_launch.launch`), run tests with `rosrun comando_planner test_*`, and
+> see **`docs/MAVROS_SITL.md`** for the full PX4 SITL bring-up guide and
+> **§9 there** for the post-flight analysis recipe (`logs/analyze_flight.py`
+> turns a recorded flight bag into the paper 3-D/state figures + GIF inside
+> `logs/<run_name>/`, together with the bag and the planner's CSV logs).
+
 `comando_planner` is a ROS 2 Humble MPC planner for Crazyflie and MAVROS-based
 quadrotors. It wraps ALIPDDP optimal-control problems behind a registry, keeps
 state and target tracking in ROS adapters, and streams either full-state or

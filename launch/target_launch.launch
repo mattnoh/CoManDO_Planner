@@ -1,0 +1,23 @@
+<launch>
+  <arg name="target_trajectory"                   default="circle"/>
+  <arg name="planning_frame"                      default="world"/>
+  <arg name="target_yaw_rate"                     default="0.3"/>
+  <arg name="publish_hz"                          default="100.0"/>
+  <arg name="frame_id"                            default="world"/>
+  <arg name="drone_odom_topic"                    default="/mavros/local_position/odom"/>
+  <arg name="drone_pose_topic"                    default="/mavros/local_position/pose"/>
+  <arg name="body_relative_input_angular_unit"    default="rad_s"/>
+  <arg name="debug_body_relative_trace"           default="false"/>
+
+  <node pkg="comando_planner" type="target_publisher" name="target_publisher" output="screen">
+    <param name="target_trajectory"                 value="$(arg target_trajectory)"/>
+    <param name="planning_frame"                    value="$(arg planning_frame)"/>
+    <param name="target_yaw_rate"                   type="double" value="$(arg target_yaw_rate)"/>
+    <param name="publish_hz"                        type="double" value="$(arg publish_hz)"/>
+    <param name="frame_id"                          value="$(arg frame_id)"/>
+    <param name="drone_odom_topic"                  value="$(arg drone_odom_topic)"/>
+    <param name="drone_pose_topic"                  value="$(arg drone_pose_topic)"/>
+    <param name="body_relative_input_angular_unit"  value="$(arg body_relative_input_angular_unit)"/>
+    <param name="debug_body_relative_trace"         value="$(arg debug_body_relative_trace)"/>
+  </node>
+</launch>

@@ -24,7 +24,12 @@ const Eigen::Matrix3d INERTIA = (Eigen::Matrix3d() <<
  0.0, 0.0, 2.92e-5 * J_SCALE).finished();
 
 // ── Constraint parameters ────────────────────────────────────────
-const double FMAX = 1.2;
+// Keep the planned agility mild (thrust-to-weight ~1.5): the plan is tracked
+// by the platform's own position controller (PX4 on this branch), and a
+// cf-agility plan (FMAX 1.2, t/w 4.3) outruns it — tracking error then trips
+// handoff recovery every replan and the drone limit-cycles around the target.
+const double FMAX = 0.42;
+const double FMIN = 0.08;
 
 // ── Solver parameters ────────────────────────────────────────────
 const double SOLVER_REG1_MIN = 1e-6;
@@ -37,14 +42,17 @@ const int SOLVER_MAX_ITER = 200;
 
 // ── Stage cost weights ───────────────────────────────────────────
 const double W_POS_STAGE = 15.0;
-const double W_VEL_STAGE = 5.0;
+const double W_VEL_STAGE = 20.0;
 const double W_ATT_STAGE = 2.0;
 const double W_ANGRATE_STAGE = 5.0;
 const double W_THRUST = 1e-1;
 const double W_MOMENT = 1e-1;
 
 // ── Terminal cost weights ────────────────────────────────────────
-const double TERM_POS_WEIGHT = 100.0;
+// High enough that the plan ends AT the target within the 5 s horizon even
+// with the mild stage weights above — open_loop mode holds the plan's
+// terminal state forever, so any terminal offset becomes a permanent offset.
+const double TERM_POS_WEIGHT = 600.0;
 const double TERM_VEL_WEIGHT = 100.0;
 const double TERM_ATT_WEIGHT = 200.0;
 const double TERM_ANGRATE_WEIGHT = 100.0;
@@ -243,6 +251,28 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────
+// Min thrust constraint (inequality) – a quad cannot push downward
+// ─────────────────────────────────────────────────────────────────
+template <typename Scalar>
+class MinThrustConstraint : public StageConstraintBase<Scalar> {
+public:
+ MinThrustConstraint() {
+ this->constraint_type = ConstraintType::NO;
+ this->dim_c = 1;
+ }
+ Vector<Scalar> c(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+ (void)x; Vector<Scalar> c_n(1); c_n(0) = FMIN - u(0); return c_n;
+ }
+ Matrix<Scalar> cx(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+ (void)x; (void)u; return Matrix<Scalar>::Zero(1, x.size());
+ }
+ Matrix<Scalar> cu(const Vector<Scalar>& x, const Vector<Scalar>& u) const override {
+ (void)x; (void)u;
+ Matrix<Scalar> J = Matrix<Scalar>::Zero(1, u.size()); J(0,0) = -1.0; return J;
+ }
+};
+
+// ─────────────────────────────────────────────────────────────────
 // Factory function: creates a hover problem with given target
 // ─────────────────────────────────────────────────────────────────
 inline std::shared_ptr<OptimalControlProblem<double>> create(
@@ -269,8 +299,11 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
  prob->setTerminalCost(std::make_shared<TerminalCost<double>>(terminal_state));
 
  auto mt = std::make_shared<MaxThrustConstraint<double>>(fmax);
- for (int i = 0; i < HORIZON; ++i)
+ auto fmin = std::make_shared<MinThrustConstraint<double>>();
+ for (int i = 0; i < HORIZON; ++i) {
  prob->addStageConstraint(i, mt);
+ prob->addStageConstraint(i, fmin);
+ }
 
  prob->setInitialState(0, current_state);
 

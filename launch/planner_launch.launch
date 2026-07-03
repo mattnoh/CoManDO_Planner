@@ -1,0 +1,99 @@
+<launch>
+  <!-- Infrastructure-only launcher.
+       Starts comando_planner with subscriptions/publishers active but unconfigured.
+       OCP params (ocp_type, mode, n_replay, hover_target) are NOT set here.
+       Set them via rosparam or ocp_launch.launch before setting command_seq. -->
+
+  <arg name="drone_name"                        default="px4_drone"/>
+  <arg name="platform"                          default="mavros"/>
+  <arg name="solver"                            default="alipddp"/>
+  <arg name="enable_logging"                    default="true"/>
+  <!-- Planner CSV run folders go here (not ~/.ros: roslaunch nodes run cwd-less). -->
+  <arg name="log_dir"                           default="$(find comando_planner)/logs"/>
+  <!-- Auto-record a flight bag alongside the planner. Bag lands in
+       $(arg log_dir)/flight_<date>.bag; feed it to logs/analyze_flight.py. -->
+  <arg name="record_bag"                        default="true"/>
+
+  <!-- Safety / abort -->
+  <arg name="open_loop_abort_on_divergence"     default="false"/>
+  <arg name="open_loop_abort_max_z_error_m"     default="0.50"/>
+  <arg name="open_loop_abort_max_vz_error_mps"  default="1.00"/>
+  <arg name="max_first_solve_age_sec"           default="1.00"/>
+  <arg name="skip_trajectory_validation"        default="false"/>
+  <arg name="max_relative_position_norm"        default="10.0"/>
+  <arg name="max_relative_vertical_abs"         default="5.0"/>
+  <arg name="max_relative_velocity_norm"        default="8.0"/>
+
+  <!-- Drone state topics (MAVROS) -->
+  <arg name="drone_odom_topic"                  default="/mavros/local_position/odom"/>
+  <arg name="drone_pose_topic"                  default="/mavros/local_position/pose"/>
+  <arg name="body_relative_odom_topic"          default="/drone/body_relative_odom"/>
+
+  <!-- Target topics -->
+  <arg name="target_odom_topic"                 default="/target/odom"/>
+  <arg name="target_accel_topic"                default="/target/accel"/>
+  <arg name="target_predicted_accel_topic"      default="/target/predicted_accel"/>
+
+  <!-- Terminal freeze -->
+  <arg name="enable_terminal_freeze"            default="true"/>
+  <arg name="terminal_freeze_enter_pos"         default="0.20"/>
+  <arg name="terminal_freeze_enter_vel"         default="0.10"/>
+  <arg name="terminal_freeze_require_vel"       default="false"/>
+  <arg name="terminal_freeze_exit_pos"          default="0.20"/>
+
+  <!-- Hover thrust initial estimate (normalised 0-1) -->
+  <arg name="hover_thrust"                      default="0.3"/>
+
+  <!-- stc_landing scenario tuning (SZMUK_* env, read once at node start).
+       Values are TARGET-RELATIVE metres; the SITL platform sits at ~0.2 m.
+       1.3 rel = world 1.5 m: staging floor below the 1.8 m hover start, and
+       the LOS cone arms only during the final descent (once the drone is
+       over the pad and the cone is satisfiable), not on the lateral
+       approach. Code defaults stay at the benchmark's 1.8. -->
+  <arg name="stc_z_stage"                       default="1.3"/>
+  <arg name="stc_los_alt_trig"                  default="1.3"/>
+
+  <node pkg="comando_planner" type="comando_planner" name="comando_planner" output="screen">
+    <env name="SZMUK_Z_STAGE"      value="$(arg stc_z_stage)"/>
+    <env name="SZMUK_LOS_ALT_TRIG" value="$(arg stc_los_alt_trig)"/>
+    <param name="drone_name"                        value="$(arg drone_name)"/>
+    <param name="platform"                          value="$(arg platform)"/>
+    <param name="solver"                            value="$(arg solver)"/>
+    <param name="enable_logging"                    value="$(arg enable_logging)"/>
+    <param name="log_dir"                           value="$(arg log_dir)"/>
+
+    <param name="open_loop_abort_on_divergence"     value="$(arg open_loop_abort_on_divergence)"/>
+    <param name="open_loop_abort_max_z_error_m"     type="double" value="$(arg open_loop_abort_max_z_error_m)"/>
+    <param name="open_loop_abort_max_vz_error_mps"  type="double" value="$(arg open_loop_abort_max_vz_error_mps)"/>
+    <param name="max_first_solve_age_sec"           type="double" value="$(arg max_first_solve_age_sec)"/>
+    <param name="skip_trajectory_validation"        value="$(arg skip_trajectory_validation)"/>
+    <param name="max_relative_position_norm"        type="double" value="$(arg max_relative_position_norm)"/>
+    <param name="max_relative_vertical_abs"         type="double" value="$(arg max_relative_vertical_abs)"/>
+    <param name="max_relative_velocity_norm"        type="double" value="$(arg max_relative_velocity_norm)"/>
+
+    <param name="drone_odom_topic"                  value="$(arg drone_odom_topic)"/>
+    <param name="drone_pose_topic"                  value="$(arg drone_pose_topic)"/>
+    <param name="body_relative_odom_topic"          value="$(arg body_relative_odom_topic)"/>
+
+    <param name="target_odom_topic"                 value="$(arg target_odom_topic)"/>
+    <param name="target_accel_topic"                value="$(arg target_accel_topic)"/>
+    <param name="target_predicted_accel_topic"      value="$(arg target_predicted_accel_topic)"/>
+
+    <param name="enable_terminal_freeze"            value="$(arg enable_terminal_freeze)"/>
+    <param name="terminal_freeze_enter_pos"         type="double" value="$(arg terminal_freeze_enter_pos)"/>
+    <param name="terminal_freeze_enter_vel"         type="double" value="$(arg terminal_freeze_enter_vel)"/>
+    <param name="terminal_freeze_require_vel"       value="$(arg terminal_freeze_require_vel)"/>
+    <param name="terminal_freeze_exit_pos"          type="double" value="$(arg terminal_freeze_exit_pos)"/>
+
+    <param name="hover_thrust"                      type="double" value="$(arg hover_thrust)"/>
+
+    <!-- Start paused; set command_seq via rosparam after OCP profile is loaded -->
+    <param name="start_paused"                      value="true"/>
+    <param name="command_seq"                       type="int" value="0"/>
+  </node>
+
+  <node pkg="rosbag" type="record" name="flight_recorder" if="$(arg record_bag)"
+        args="-o $(arg log_dir)/flight
+              /mavros/local_position/odom /mavros/setpoint_raw/local /mavros/state
+              /target/odom /target/accel /$(arg drone_name)/planned_trajectory /rosout"/>
+</launch>

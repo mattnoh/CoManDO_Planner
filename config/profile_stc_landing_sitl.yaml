@@ -1,0 +1,12 @@
+# stc_landing profile for the PX4 SITL smoke test (see docs/MAVROS_SITL.md).
+# Needs the target publisher running on /target/odom + /target/accel.
+# Loaded into the comando_planner private namespace by scripts/apply_profile.sh.
+ocp_type: stc_landing
+mode: mpc
+# land_action: on terminal freeze (touchdown), stop the OCP and hand the stop
+# to PX4. auto_land = switch to AUTO.LAND (slow: PX4 descends + auto-disarms;
+# a moving platform drives ~2 m away meanwhile); force_disarm = immediate
+# motor cut at the freeze latch (right choice for moving platforms — verified
+# ~1 s from touchdown to motors-off); disarm = normal disarm request (PX4
+# accepts only once its land detector agrees).
+land_action: force_disarm
