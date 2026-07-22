@@ -88,12 +88,26 @@ ros2 service call /cf_1/go_to crazyflie_interfaces/srv/GoTo \
   "{relative: false, goal: {x: 2.0, y: 2.0, z: 1.8}, duration: {sec: 5}}"
 
 # 6. trigger the landing OCP (bump command_seq by +1 each trigger)
+#    n_replay:=4 is REQUIRED — see below. NOT the descriptor's NEX=7.
 ros2 launch comando_planner ocp_launch.py ocp_type:=stc_landing_noaug \
-  mode:=mpc n_replay:=7 command_seq:=1
+  mode:=mpc n_replay:=4 command_seq:=1
 ```
 
 Hard-won gotchas:
 
+- **`n_replay:=4`, not the descriptor default `NEX=7`.** The warm start is
+  shifted `n_replay` nodes (~0.12 s each) but `x0` is predicted only
+  `solve_lead` (~0.3 s) ahead. At 7 the shift is 0.84 s against a 0.26 s lead,
+  so `x0` is ~0.6 s out of sync with the trajectory it warm-starts from: the
+  initial defect explodes (constraint ~5e5) and the solver bails at 27 iters
+  instead of its usual 150–180. Every replan is then rejected and the flight
+  rides the activation plan open-loop. At 4 (0.48 s shift vs 0.30 s lead):
+  **17/17 accepted, 0 rejected**, lateral error 3.79 m → 0.04 m, monotonic
+  descent, i.e. MAVROS parity (13/0). Diagnose with `replan_delay_sec ÷ theta`
+  in `solver_events.csv` — it must equal `n_replay`.
+  NOTE: the validated MAVROS run also ran at 4, but only because rosparams are
+  sticky and `profile_hover_sitl.yaml` sets `n_replay: 4` while the landing
+  profile never set it. Both profiles now state it explicitly.
 - **`SZMUK_Z_STAGE=1.3` / `SZMUK_LOS_ALT_TRIG=1.3`** are required for the stc
   landing OCPs to converge from the documented staging geometry; the compiled
   defaults (1.8/1.8) stall the IPM (constraint ~30-60, "Outer Max/Min").
@@ -106,10 +120,11 @@ Hard-won gotchas:
 - `test_stc_landing_noaug` validates against an **R=2.0 / v=0.8** target; the
   SITL circle is R=1.0 / v=0.4. The unit test passing does not prove SITL
   convergence — check offline with the real target values + launch env.
-- Known gaps vs the ROS1 arm: `land_action` is not a declared parameter (no
-  touchdown disarm — the drone holds the terminal setpoint on the ground),
-  and in the validated landing all post-activation replans were rejected
-  (the flight rode the activation plan; MAVROS re-accepts ~13 solves).
+- Known gap vs the ROS1 arm: `land_action` is not a declared parameter, so
+  there is no touchdown disarm — at terminal freeze the drone holds a hover at
+  pad height instead of cutting motors, and the (virtual) platform circles out
+  from under it. The intercept itself is correct; only the final motor-cut is
+  missing.
 
 ## Current Architecture
 
