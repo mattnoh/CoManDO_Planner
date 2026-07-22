@@ -9,6 +9,14 @@
   <arg name="body_relative_input_angular_unit"    default="rad_s"/>
   <arg name="debug_body_relative_trace"           default="false"/>
 
+  <!-- Simulated relative sensing (defaults preserve legacy behavior) -->
+  <arg name="target_source"                       default="ground_truth"/>
+  <arg name="sim_relative_estimate"               default="false"/>
+  <arg name="pad_z"                               default="0.0"/>
+  <arg name="relative_estimate_topic"             default="/drone/relative_target_estimate"/>
+  <arg name="publish_ground_truth_debug"          default="true"/>
+  <arg name="drone_odom_twist_frame"              default="body"/>
+
   <node pkg="comando_planner" type="target_publisher" name="target_publisher" output="screen">
     <param name="target_trajectory"                 value="$(arg target_trajectory)"/>
     <param name="planning_frame"                    value="$(arg planning_frame)"/>
@@ -19,5 +27,11 @@
     <param name="drone_pose_topic"                  value="$(arg drone_pose_topic)"/>
     <param name="body_relative_input_angular_unit"  value="$(arg body_relative_input_angular_unit)"/>
     <param name="debug_body_relative_trace"         value="$(arg debug_body_relative_trace)"/>
+    <param name="target_source"                     value="$(arg target_source)"/>
+    <param name="sim_relative_estimate"             type="bool"   value="$(arg sim_relative_estimate)"/>
+    <param name="pad_z"                             type="double" value="$(arg pad_z)"/>
+    <param name="relative_estimate_topic"           value="$(arg relative_estimate_topic)"/>
+    <param name="publish_ground_truth_debug"        type="bool"   value="$(arg publish_ground_truth_debug)"/>
+    <param name="drone_odom_twist_frame"            value="$(arg drone_odom_twist_frame)"/>
   </node>
 </launch>

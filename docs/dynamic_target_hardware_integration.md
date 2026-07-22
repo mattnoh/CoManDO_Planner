@@ -129,6 +129,136 @@ The source comments still mention runtime circle shape parameters, but the
 current implementation does not declare them. Change `include/target/circular_target.hpp`
 or replace the publisher if you need runtime-selectable trajectories.
 
+## Relative Target Estimate (drone body frame)
+
+For relative-sensing landings (`stc_landing`), the target can be driven by a
+**body-frame relative measurement** instead of an absolute target feed — what a
+downward camera plus an attitude estimate produces. `target_publisher` splits
+this into two stages that communicate only over a ROS topic, so a real estimator
+can replace the simulator without touching the synthesis side.
+
+```
+stage 1 (sim, optional)                stage 2 (synthesis)
+generator + drone odom  ──▶  /drone/relative_target_estimate  ──▶  /target/odom
+                                                                   /target/accel
+```
+
+**Message contract** — `nav_msgs/Odometry` on `relative_estimate_topic`
+(default `/drone/relative_target_estimate`):
+
+| Field | Content |
+| --- | --- |
+| `header.frame_id` | `drone_body` (FLU body frame, ENU-consistent) |
+| `child_frame_id` | `target_in_drone_body` |
+| `pose.pose.position` | target position relative to the drone, in body axes |
+| `twist.twist.linear` | target velocity relative to the drone, in body axes |
+| `pose.pose.orientation` | identity; `pose.covariance[21] = -1.0` marks it unmeasured |
+| `pose/twist.covariance[14]` | Reserved z-validity marker (`-1.0` = estimator has no z). **Stage 2 does not read it today** — z is always taken from `pad_z`. |
+
+Publish all three position/velocity components. Stage 2 rotates the full vector
+into world **before** overriding z, so keeping body-z is what makes the world x/y
+correct while the drone is tilted.
+
+**Synthesis math** (`R` = drone attitude from `/mavros/local_position/odom`):
+
+```
+p_target_world = p_drone + R * p_rel_body ;  z ← pad_z
+v_target_world = v_drone + R * v_rel_body ;  vz ← 0
+```
+
+The measurement convention is a pure frame projection (`R^T (x_t - x_d)`, no
+`omega x r` term), so the synthesis is its exact algebraic inverse — in
+simulation the round trip reproduces ground truth to machine precision.
+
+`v_drone` comes from the drone odom twist; `/mavros/local_position/odom` has
+`child_frame_id: base_link`, i.e. a **body-frame** twist, which is the
+`drone_odom_twist_frame:=body` default. Set it to `world` only if your odom
+source publishes a world-frame twist.
+
+Synthesized `/target/accel` is zero (the relative estimate carries no
+acceleration) and is published at the same stamp as `/target/odom`, because the
+tracker's 0.2 s freshness gate requires both streams. Publish the estimate at
+**20 Hz or better** to keep margin against that gate.
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `target_source` | `ground_truth` | `relative_estimate` makes `/target/odom` come from the synthesis stage |
+| `sim_relative_estimate` | `false` | Simulate the measurement from the built-in trajectory generator |
+| `pad_z` | `0.0` | World z assigned to the synthesized target (landing pad height / mocap z) |
+| `relative_estimate_topic` | `/drone/relative_target_estimate` | Swap point for a real estimator |
+| `publish_ground_truth_debug` | `true` | In relative mode, generator truth moves to `/target/odom_gt` + `/target/accel_gt` |
+| `drone_odom_twist_frame` | `body` | Interpretation of the drone odom twist |
+
+Simulated round trip (verifies the pipeline against ground truth):
+
+```bash
+roslaunch comando_planner target_launch.launch \
+  target_source:=relative_estimate sim_relative_estimate:=true pad_z:=0.2
+# compare /target/odom against /target/odom_gt
+```
+
+Real estimator (synthesis stage unchanged):
+
+```bash
+roslaunch comando_planner target_launch.launch \
+  target_source:=relative_estimate sim_relative_estimate:=false pad_z:=0.0 \
+  publish_ground_truth_debug:=false
+# your node publishes /drone/relative_target_estimate
+```
+
+Note that in this mode the target's acceleration is hidden from the OCP's
+constant-accel predictor (zeros are published), and the synthesized target
+carries no yaw — both are inherent to the relative-sensing contract, not bugs.
+
+### Why the world-frame hop is not a frame change
+
+The measurement is **drone-centered** (`target relative to drone`, body axes),
+matching what a camera outputs and the existing `/drone/body_relative_odom`
+convention. The `stc_landing` OCP is **target-centered, world-aligned**:
+`transform_state` subtracts the target from the drone state and never rotates.
+These are reconciled by stage 2, not by any change to the dynamics:
+
+```
+sensor          p_rel^B  = R^T (p_target - p_drone)      drone-centered, body axes
+stage 2         p_target = p_drone + R p_rel^B           absolute world
+transform_state x_rel    = x_drone - p_target            target-centered, world axes
+```
+
+Substituting stage 2 into `transform_state` gives `x_rel = -R p_rel^B`: the
+absolute drone position **cancels**. The world frame is only a transport format
+that lets the existing tracker and snapshot plumbing be reused unchanged. No new
+dynamics are involved.
+
+The cancellation is exact only if both sides use the same drone-odom sample.
+Stage 2 uses the odom cached when the estimate arrived; the planner uses its own
+snapshot at solve time. Slow estimator drift cancels (the point of the design);
+timing skew between the two samples does not. Keep the relative measurement and
+the odom it is paired with time-aligned.
+
+### What still requires an absolute source
+
+| Quantity | Cancels? | Consequence |
+| --- | --- | --- |
+| Drone x, y | Yes | Horizontal drift in the local estimate is invisible to the solver |
+| Drone velocity x, y | Yes | Same |
+| **Drone z** | **No** | `pad_z` is a constant, so `x_rel,z = drone_odom_z - pad_z`. Height above the pad comes straight from the drone's altitude estimate and needs a real source (mocap z, rangefinder, or baro referenced to takeoff). |
+| Attitude `R` | No | Required — it is the rotation between sensor body axes and the world axes the setpoints live in. Comes from the IMU/EKF, no mocap needed. |
+
+Relative sensing therefore removes the dependence on an absolute **horizontal**
+target fix, not on altitude. To make z relative as well, the estimator must
+supply relative z and stage 2 must stop overriding it
+(`p_target_z = p_drone_z + (R p_rel^B)_z`), at which point z cancels like x/y —
+that is what the reserved `covariance[14]` marker is for.
+
+Independently of all this, `stc_landing` emits absolute `PositionTarget`
+setpoints, so PX4 still needs a self-consistent local position estimate to track
+them. Drift cancels, but the estimate must exist: offboard position control does
+not function without one.
+
+Stage 2 fails safe — it skips synthesis when drone odom is missing or older than
+0.5 s, so `/target/odom` goes stale and the planner's freshness gate holds the
+command rather than acting on a bad transform.
+
 ## Startup and Gating Behavior
 
 For target-tracking OCPs, the planner waits until required streams are fresh

@@ -111,6 +111,12 @@ can switch OCPs at runtime without restarting:
 | `target_accel_topic` | `/target/accel` | `geometry_msgs/msg/AccelStamped` | Target linear acceleration and optional angular acceleration |
 | `target_predicted_accel_topic` | `/target/predicted_accel` | `trajectory_msgs/msg/MultiDOFJointTrajectory` | Future acceleration samples for `tracking_circle_target` |
 
+`target_publisher` can source `/target/odom` from a body-frame relative
+measurement on `/drone/relative_target_estimate` instead of ground truth
+(`target_source:=relative_estimate`, optionally `sim_relative_estimate:=true`,
+target height from `pad_z`); the planner-side contract above is unchanged. See
+`docs/dynamic_target_hardware_integration.md`.
+
 Freshness rules are OCP-dependent. Body-rate OCPs use the `TargetSnapshot`
 valid flag, which requires fresh target odom and accel. `tracking_circle_target`
 requires fresh target odom and separately requires a predicted-acceleration
