@@ -108,11 +108,13 @@ expose it as a launch argument.
 | `/target/true_odom` | `nav_msgs/msg/Odometry` | Synthetic truth for `gazebo_*` modes only |
 | `/target/true_accel` | `geometry_msgs/msg/AccelStamped` | Synthetic truth for `gazebo_*` modes only |
 
-`/target/odom` and `/target/accel` are always estimator outputs. In `gazebo_*`
-modes, the analytic motion model is used only to generate pose measurements and
-the separate `/target/true_*` topics for bag comparison. In `mocap` mode there
-is no separate truth topic; the mocap pose is the measurement feeding the same
-estimator.
+`/target/odom` and `/target/accel` are estimator outputs in `gazebo_*` and
+`mocap` modes. In `gazebo_*` modes, the analytic motion model is used only to
+generate pose measurements and the separate `/target/true_*` topics for bag
+comparison. In `mocap` mode there is no separate truth topic; the mocap pose is
+the measurement feeding the same estimator. In `trace_replay` mode,
+`/target/odom` and `/target/accel` are replayed directly from CSV
+(`t,x,y,z,vx,vy,vz,ax,ay,az`) with interpolation.
 
 Target mode, planning frame, and OCP selection are separate:
 
@@ -128,6 +130,11 @@ ros2 launch comando_planner target_launch.py \
 # Mocap target pose measurements, world-frame state for stateswitch.
 ros2 launch comando_planner target_launch.py \
   target_mode:=mocap rigid_body_name:=stmini planning_frame:=world
+
+# Replayed hardware target trace, world-frame state for stateswitch.
+ros2 launch comando_planner target_launch.py \
+  target_mode:=trace_replay planning_frame:=world \
+  trace_csv_path:=/tmp/target_trace_circling.csv
 ```
 
 It can also publish relative drone odometry:
@@ -139,9 +146,9 @@ It can also publish relative drone odometry:
 | `target_frame` | `/drone/target_frame_odom` | `tracking_bodyrate_tf_*` |
 | `shifted` | `/drone/relative_odometry` | Diagnostic/historical output; not selected by current OCP descriptors |
 
-Valid target modes are `gazebo_circle`, `gazebo_figure8`, and `mocap`. OCP
-aliases are also available: `tf_imu`, `tf_noimu`, `bf_imu`, `bf_noimu`,
-`state_switch`, and `circle_target`.
+Valid target modes are `gazebo_circle`, `gazebo_figure8`, `mocap`, and
+`trace_replay`. OCP aliases are also available: `tf_imu`, `tf_noimu`,
+`bf_imu`, `bf_noimu`, `state_switch`, and `circle_target`.
 
 ## Runtime Parameters
 
