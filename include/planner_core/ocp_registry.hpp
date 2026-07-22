@@ -11,6 +11,7 @@
 #include "ocp/ocp_landing.hpp"
 #include "ocp/ocp_stateswitch.hpp"
 #include "ocp/ocp_stc_landing.hpp"
+#include "ocp/ocp_stc_landing_noaug.hpp"
 #include "ocp/ocp_tracking_circle_target.hpp"
 #include "ocp/ocp_tracking_bodyrate_tf_noimu.hpp"
 #include "ocp/ocp_tracking_bodyrate_tf_imu.hpp"
@@ -34,6 +35,8 @@ inline const std::map<std::string, OCPDescriptor>& getTable() {
         {"state_switch",                   StateswitchOCP::descriptor()},
         {"stc_landing",                    StcLandingOCP::descriptor()},
         {"rh_stc",                         StcLandingOCP::descriptor()},
+        {"stc_landing_noaug",              StcLandingNoAugOCP::descriptor()},
+        {"rh_stc_noaug",                   StcLandingNoAugOCP::descriptor()},
         {"tracking_circle_target",         TrackingCircleTargetOCP::descriptor()},
         {"circle_target",                  TrackingCircleTargetOCP::descriptor()},
         {"tracking_bodyrate_tf_noimu",     TrackingBodyrateTfNoImuOCP::descriptor()},

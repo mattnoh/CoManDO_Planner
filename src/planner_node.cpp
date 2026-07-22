@@ -55,6 +55,7 @@ public:
         nh_.param<std::string>("log_dir", log_dir, std::string{});
         logger_.setLogRoot(log_dir);
         nh_.param<double>("max_first_solve_age_sec",    max_first_solve_age_sec_,    1.0);
+        nh_.param<double>("max_constraint_error",       max_constraint_error_,       max_constraint_error_);
         nh_.param<double>("max_relative_position_norm", max_relative_position_norm_, 10.0);
         nh_.param<double>("max_relative_vertical_abs",  max_relative_vertical_abs_,  5.0);
         nh_.param<double>("max_relative_velocity_norm", max_relative_velocity_norm_,  8.0);
@@ -254,6 +255,25 @@ private:
             if (ocp_type_ == "tracking_circle_target" && mode_ == "mpc") {
                 ROS_ERROR("tracking_circle_target supports open_loop only");
                 return;
+            }
+            // Target-relative OCPs solve against the target snapshot; starting
+            // without one silently lands on garbage. Hold the command (seq not
+            // consumed) until /target/odom is fresh — it auto-starts once the
+            // target publisher is up.
+            if (drone_odom_mode_ != OCPDescriptor::DroneOdomMode::Absolute) {
+                bool target_fresh;
+                {
+                    std::lock_guard<std::mutex> tlk(state_monitor_.targetMutex());
+                    target_fresh = state_monitor_.targetState()
+                                       .isOdomFresh(ros::Time::now(), 1.0);
+                }
+                if (!target_fresh) {
+                    ROS_ERROR_THROTTLE(2.0,
+                        "Cannot start %s: no fresh /target/odom (is "
+                        "target_launch running?). Waiting for target data.",
+                        ocp_type_.c_str());
+                    return;
+                }
             }
             last_command_seq_ = p_seq;
             if (platform_ == "mavros") platform::mavros::resetForNewFlight(mavros_handles_);

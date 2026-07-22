@@ -95,6 +95,10 @@ add_executable(test_stc_landing test/test_stc_landing.cpp ${SHARED_SOURCES})
 target_include_directories(test_stc_landing PRIVATE ${EIGEN3_INCLUDE_DIR} include config)
 target_link_libraries(test_stc_landing planner_core)
 
+add_executable(test_stc_landing_noaug test/test_stc_landing_noaug.cpp ${SHARED_SOURCES})
+target_include_directories(test_stc_landing_noaug PRIVATE ${EIGEN3_INCLUDE_DIR} include config)
+target_link_libraries(test_stc_landing_noaug planner_core)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS
     comando_planner

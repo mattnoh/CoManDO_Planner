@@ -1,0 +1,14 @@
+# stc_landing_noaug profile for the PX4 SITL smoke test (see docs/MAVROS_SITL.md).
+# No-aug interval CT-cSTC arm: 14-state (no accumulator), per-stage interval
+# inequality integral(H dt) <= SZMUK_CTCS_STEP_EPS. Tune via env exports on the
+# planner terminal (noaug_basin champion: SZMUK_CTCS_STEP_EPS=1.6e-3,
+# SZMUK_CTCS_Y_SCALE=10 — also the compiled-in defaults).
+# Needs the target publisher running on /target/odom + /target/accel.
+# Loaded into the comando_planner private namespace by scripts/apply_profile.sh.
+ocp_type: stc_landing_noaug
+mode: mpc
+# land_action: on terminal freeze (touchdown), stop the OCP and hand the stop
+# to PX4. force_disarm = immediate motor cut at the freeze latch (right choice
+# for moving platforms — verified ~1 s from touchdown to motors-off). Always
+# set explicitly: params are sticky on the rosparam server.
+land_action: force_disarm

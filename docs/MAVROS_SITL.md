@@ -169,6 +169,22 @@ rosrun comando_planner apply_profile.sh /comando_planner \
   $(rospack find comando_planner)/config/profile_stc_landing_sitl.yaml
 ```
 
+For the no-aug interval arm (`stc_landing_noaug`, 14-state, hard per-node
+`integral(H dt) <= eps` instead of the terminal `y_N = 0` equality) use
+`config/profile_stc_landing_noaug_sitl.yaml` instead. Its compiled-in
+defaults are the tuned SITL setting (noaug_basin champion
+`SZMUK_CTCS_STEP_EPS=1.6e-3`, `SZMUK_CTCS_Y_SCALE=10`; validated run:
+`logs/stc_landing_noaug_sitl_circle/`). Two rules for this arm:
+
+- **Engage from a general lateral offset** — hover to a staging point with a
+  real lateral distance from the platform first (never from directly above,
+  never from spawn). The hard interval constraint makes the activation cold
+  solve the critical one; from a settled offset hover it converges
+  (`test_stc_landing_noaug` checks exactly this gate).
+- Its cold seed aims at `(0,0,Z_STAGE)` until laterally captured; do not
+  weaken `max_constraint_error` if activation solves are rejected — fix the
+  engagement geometry instead (same rule as `stc_landing`).
+
 ### Stopping after touchdown (`land_action`)
 
 By default (`land_action: none`) terminal freeze holds the last setpoint at
@@ -275,7 +291,7 @@ The tools live in `logs/` itself — what makes which file:
 
 | Tool | Produces |
 | --- | --- |
-| `analyze_flight.py` (one-shot driver) | the whole run folder: copies the bag + planner CSVs, then runs the three below |
+| `analyze_flight.py` (one-shot driver) | the whole run folder: copies the bag + planner CSVs, then runs the four below |
 | `bag_to_stc_csv.py` | `moving_executed.csv` + `constraints.csv` (bag → executed trajectory + constraint bounds, STC trigger signals recomputed from the `ocp_stc_landing.hpp` formulas and any `SZMUK_*` env overrides) |
 | `plot_stc_paper.py` | `stc_flight_3d.png` (world + target-relative 3D) and `stc_flight_states.png` (constraint/state timelines) |
 | `animate_stc_paper.py` | `stc_flight.gif` |
@@ -288,16 +304,14 @@ Full recipe for an STC landing run (recording is automatic — see §4):
 # 1. Fly: hover profile, wait for settle, landing profile, wait for disarm,
 #    then Ctrl-C the planner launch (that finalizes logs/flight_<date>.bag).
 
-# 2. Analyze: creates logs/<run_name>/ with everything. The window is
-#    trimmed automatically from the LANDING OCP activation to touchdown —
-#    the hover-to-staging-point phase is excluded from the plots.
+# 2. Analyze — fully automatic: picks the newest logs/flight_*.bag, moves it
+#    into the planner's own run folder (which already has the CSVs), and
+#    renders everything there — executed CSVs, 3D + states figures,
+#    planned-vs-executed overlay, GIF. The window is trimmed automatically
+#    from the LANDING OCP activation to touchdown — the hover-to-staging
+#    phase is excluded from the plots.
 cd $(rospack find comando_planner)/logs
-python3 analyze_flight.py --bag flight_<date>.bag --name my_run_name
-
-# 3. Optional: planned-vs-executed overlay (also excludes hover horizons;
-#    pass --all-horizons to include them).
-python3 plot_sitl_planned_overlay.py --dir my_run_name \
-  --out my_run_name/stc_flight_planned_overlay.png
+python3 analyze_flight.py                     # --bag/--name to override
 ```
 
 Useful `analyze_flight.py` flags: `--name` (run folder name; defaults to the

@@ -19,6 +19,13 @@
   <arg name="open_loop_abort_max_z_error_m"     default="0.50"/>
   <arg name="open_loop_abort_max_vz_error_mps"  default="1.00"/>
   <arg name="max_first_solve_age_sec"           default="1.00"/>
+  <!-- Solver constraint-error acceptance gate. Converged solves report
+       ~1e-15; infeasible ones (e.g. a landing triggered from below the STC
+       staging height) report 1e2..1e4 and fly WILD trajectories if accepted
+       — do not disable this. If solves are being rejected en masse, the fix
+       is to start the landing from the staging height (hover settled at
+       1.8 m), not to open this gate. -->
+  <arg name="max_constraint_error"              default="1.0"/>
   <arg name="skip_trajectory_validation"        default="false"/>
   <arg name="max_relative_position_norm"        default="10.0"/>
   <arg name="max_relative_vertical_abs"         default="5.0"/>
@@ -66,6 +73,7 @@
     <param name="open_loop_abort_max_z_error_m"     type="double" value="$(arg open_loop_abort_max_z_error_m)"/>
     <param name="open_loop_abort_max_vz_error_mps"  type="double" value="$(arg open_loop_abort_max_vz_error_mps)"/>
     <param name="max_first_solve_age_sec"           type="double" value="$(arg max_first_solve_age_sec)"/>
+    <param name="max_constraint_error"              type="double" value="$(arg max_constraint_error)"/>
     <param name="skip_trajectory_validation"        value="$(arg skip_trajectory_validation)"/>
     <param name="max_relative_position_norm"        type="double" value="$(arg max_relative_position_norm)"/>
     <param name="max_relative_vertical_abs"         type="double" value="$(arg max_relative_vertical_abs)"/>

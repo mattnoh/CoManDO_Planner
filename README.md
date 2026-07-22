@@ -150,9 +150,9 @@ out of the plots:
 
 ```bash
 cd $(rospack find comando_planner)/logs
-python3 analyze_flight.py --bag flight_<date>.bag --name my_run
-python3 plot_sitl_planned_overlay.py --dir my_run \
-  --out my_run/stc_flight_planned_overlay.png   # planned-vs-executed 3D
+python3 analyze_flight.py   # newest bag → the run's own folder, all figures
+# → 3D + states, planned-vs-executed overlay, GIF, executed CSVs
+# (--bag <bag> / --name <folder> to override)
 ```
 
 See `docs/MAVROS_SITL.md` §9 for the tool → output-file table.
