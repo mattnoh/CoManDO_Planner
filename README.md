@@ -132,7 +132,7 @@ constants — retune before using them on a larger airframe
 | `terminal_freeze_enter_pos/vel` | `0.20` / `0.10` | Touchdown latch gates; use `vel:=0.30` against moving targets |
 | `hover_thrust` | `0.3` | Body-rate OCPs only |
 | `skip_trajectory_validation` | `false` | Debug: accept plans that fail the physical-bounds check |
-| `stc_z_stage`, `stc_los_alt_trig` | `1.3` | stc_landing staging/trigger altitudes (target-relative metres) |
+| `stc_z_stage`, `stc_los_alt_trig` | `1.5` / `1.3` | stc_landing staging floor / LOS trigger altitude (target-relative metres). Floor 1.5 assumes a true world-1.8 engagement hover (profile commands 2.05); from a lower ~1.54 settle use `stc_z_stage:=1.3` |
 
 ## Logging, Analysis, RViz
 
