@@ -1,3 +1,23 @@
+/// @file ocp_stc_landing_noaug_legacy.hpp
+/// @brief ARCHIVED pre-faithful-port variant of the no-aug CT-cSTC landing arm.
+///
+/// This is the ORIGINAL CoManDO port as it existed before commit e02ec53
+/// ("make the integrand a faithful port of the benchmark arm"), preserved
+/// verbatim for A/B comparison. It differs from the benchmark
+/// quad_single_horizon_noaug_stc.cpp in three ways that were inherited from
+/// the ocp_stc_landing.hpp scaffold rather than chosen:
+///   1. landing trigger = normalized altitude ramp * lateral-capture AND
+///      ((trig_alt/ALT_TRIG) * trig_cap/cap^2) instead of raw posPart(ALT_TRIG-z)
+///   2. thrust STC blocks (tight/wide) inside the CT-cSTC integrand
+///   3. planning thrust bounds = actuator bounds (0.08/0.60), no margin
+/// plus looser stage/tilt/omega constants (STAGE_RADIUS 0.55 etc.).
+///
+/// Registry keys: `stc_landing_noaug_legacy` / `rh_stc_noaug_legacy`.
+/// All env tunables are prefixed SZMUK_LEGACY_* so this arm can be tuned
+/// without disturbing the faithful arm in the same process.
+///
+/// Do not "fix" this file — its value is being an unchanged reference point.
+
 /// @file ocp_stc_landing_noaug.hpp
 /// @brief No-aug interval CT-cSTC receding-horizon landing OCP ("stc_landing_noaug").
 ///
@@ -46,7 +66,7 @@
 #include "alipddp/alipddp.h"
 #include "planner_core/types.hpp"
 
-namespace StcLandingNoAugOCP {
+namespace StcLandingNoAugLegacyOCP {
 
 // ── Env helpers ───────────────────────────────────────────────────────────────
 inline double envOrQ(const char* n, double d) {
@@ -72,16 +92,10 @@ static constexpr double IXX     = 1.66e-5;
 static constexpr double IYY     = 1.66e-5;
 static constexpr double IZZ     = 2.92e-5;
 static constexpr double J_SCALE = 1.0 / IXX;
-// Benchmark split (quad_single_horizon_noaug_stc): the PLAN is bounded to
-// FMIN/FMAX with margin inside the ACTUATOR_F* physical limits; TAU_MAX
-// derives from the actuator limits, not the planning bounds.
-static constexpr double ACTUATOR_FMIN = 0.08;
-static constexpr double ACTUATOR_FMAX = 0.60;
-static constexpr double FMIN    = 0.12;
-static constexpr double FMAX    = 0.52;
+static constexpr double FMIN    = 0.08;
+static constexpr double FMAX    = 0.6;
 static constexpr double L_ARM   = 0.046;
-static const double TAU_MAX =
-    L_ARM * (ACTUATOR_FMAX/4.0 - ACTUATOR_FMIN/4.0) * J_SCALE;
+static const double TAU_MAX = L_ARM * (FMAX/4.0 - FMIN/4.0) * J_SCALE;
 
 static const Eigen::Matrix3d J_B = [](){
     Eigen::Matrix3d J; J.setZero();
@@ -91,85 +105,91 @@ static const Eigen::Matrix3d J_B = [](){
 static const Eigen::Vector3d GRAVITY(0.0, 0.0, -9.81);
 
 // ── Horizon / timing (env-resolved once at startup) ──────────────────────────
-static const int    HORIZON = std::max(1, std::getenv("SZMUK_RH_N")
-                                  ? std::atoi(std::getenv("SZMUK_RH_N"))
-                                  : envOrInt("SZMUK_N", 30));
-static const int    NEX     = std::max(1, envOrInt("SZMUK_RH_NEX", 7));
-static const double TH0     = envOrQ("SZMUK_TH0", 0.07);
-static const double THL     = envOrQ("SZMUK_THL", 0.05);
-static const double THH     = envOrQ("SZMUK_THH", 0.12);
+static const int    HORIZON = std::max(1, std::getenv("SZMUK_LEGACY_RH_N")
+                                  ? std::atoi(std::getenv("SZMUK_LEGACY_RH_N"))
+                                  : envOrInt("SZMUK_LEGACY_N", 30));
+static const int    NEX     = std::max(1, envOrInt("SZMUK_LEGACY_RH_NEX", 7));
+static const double TH0     = envOrQ("SZMUK_LEGACY_TH0", 0.07);
+static const double THL     = envOrQ("SZMUK_LEGACY_THL", 0.05);
+static const double THH     = envOrQ("SZMUK_LEGACY_THH", 0.12);
 
 // ── Glideslope / floor / descent cap ─────────────────────────────────────────
 static constexpr double GS_APEX_OFFSET  = 0.1;
 static constexpr double VZ_LAND_MAX     = 0.5;
 
 // ── Terminal cost weights ─────────────────────────────────────────────────────
-static const double TERM_W_POS_XY  = envOrQ("SZMUK_TERM_W_POS_XY", 2500.0);
-static const double TERM_W_POS_Z   = envOrQ("SZMUK_TERM_W_POS_Z", 2500.0);
-static const double TERM_W_VEL_XY  = envOrQ("SZMUK_TERM_W_VEL_XY", 900.0);
-static const double TERM_W_VEL_Z   = envOrQ("SZMUK_TERM_W_VEL_Z", 900.0);
-static const double TERM_W_TILT    = envOrQ("SZMUK_TERM_W_TILT", 200.0);
-static const double TERM_W_OM      = envOrQ("SZMUK_TERM_W_OM", 50.0);
-static const double TERM_VZ_REF    = envOrQ("SZMUK_TERM_VZ_REF", 0.0);
-static const double STAGE_W_TIME   = envOrQ("SZMUK_W_TIME", 0.04);
-static const double R_THETA        = envOrQ("SZMUK_R_THETA", 10.0);
-static const double THETA_REF      = envOrQ("SZMUK_THETA_REF", 0.10);
+static const double TERM_W_POS_XY  = envOrQ("SZMUK_LEGACY_TERM_W_POS_XY", 2500.0);
+static const double TERM_W_POS_Z   = envOrQ("SZMUK_LEGACY_TERM_W_POS_Z", 2500.0);
+static const double TERM_W_VEL_XY  = envOrQ("SZMUK_LEGACY_TERM_W_VEL_XY", 900.0);
+static const double TERM_W_VEL_Z   = envOrQ("SZMUK_LEGACY_TERM_W_VEL_Z", 900.0);
+static const double TERM_W_TILT    = envOrQ("SZMUK_LEGACY_TERM_W_TILT", 200.0);
+static const double TERM_W_OM      = envOrQ("SZMUK_LEGACY_TERM_W_OM", 50.0);
+static const double TERM_VZ_REF    = envOrQ("SZMUK_LEGACY_TERM_VZ_REF", 0.0);
+static const double STAGE_W_TIME   = envOrQ("SZMUK_LEGACY_W_TIME", 0.04);
+static const double R_THETA        = envOrQ("SZMUK_LEGACY_R_THETA", 10.0);
+static const double THETA_REF      = envOrQ("SZMUK_LEGACY_THETA_REF", 0.10);
 
 // ── Smoothness/control weights ────────────────────────────────────────────────
 static constexpr double HOVER_THRUST = MASS * 9.81;
-static const double R_CTRL_THR  = envOrQ("SZMUK_R_THR", 2.0);
-static const double R_CTRL_MOM  = envOrQ("SZMUK_R_MOM", 0.6);
-static const double W_TOUCH_VEL = envOrQ("SZMUK_W_TOUCH_VEL", 10.0);
-static const double TOUCH_ALT   = envOrQ("SZMUK_TOUCH_ALT", 0.25);
-static const double TOUCH_SCALE = envOrQ("SZMUK_TOUCH_SCALE", 0.25);
-static const double W_STAGE_TARGET_XY  = envOrQ("SZMUK_W_STAGE_TARGET_XY", 0.0);
-static const double W_STAGE_TARGET_Z   = envOrQ("SZMUK_W_STAGE_TARGET_Z", 0.0);
-static const double W_STAGE_TARGET_VEL = envOrQ("SZMUK_W_STAGE_TARGET_VEL", 0.0);
+static const double R_CTRL_THR  = envOrQ("SZMUK_LEGACY_R_THR", 2.0);
+static const double R_CTRL_MOM  = envOrQ("SZMUK_LEGACY_R_MOM", 0.6);
+static const double W_TOUCH_VEL = envOrQ("SZMUK_LEGACY_W_TOUCH_VEL", 10.0);
+static const double TOUCH_ALT   = envOrQ("SZMUK_LEGACY_TOUCH_ALT", 0.25);
+static const double TOUCH_SCALE = envOrQ("SZMUK_LEGACY_TOUCH_SCALE", 0.25);
+static const double W_STAGE_TARGET_XY  = envOrQ("SZMUK_LEGACY_W_STAGE_TARGET_XY", 0.0);
+static const double W_STAGE_TARGET_Z   = envOrQ("SZMUK_LEGACY_W_STAGE_TARGET_Z", 0.0);
+static const double W_STAGE_TARGET_VEL = envOrQ("SZMUK_LEGACY_W_STAGE_TARGET_VEL", 0.0);
 
 // ── CT-cSTC constraint bounds ─────────────────────────────────────────────────
-static const double THETA_PHASE0_DEG   = envOrQ("SZMUK_TILT_PHASE0_DEG", 11.0);
-static const double OMEGA_PHASE0_MAX   = envOrQ("SZMUK_OMEGA_PHASE0_MAX", 0.35);
-static const double SPD_PHASE0_MAX     = envOrQ("SZMUK_SPD_PHASE0_MAX", 3.0);
-static const double THETA_STC_DEG      = envOrQ("SZMUK_TILT_STC_DEG", 0.95);
-static const double ALPHA_THETA_STC    = envOrQ("SZMUK_ALPHA_THETA_STC", 1.0);
-static const double OMEGA_STC_MAX      = envOrQ("SZMUK_OMEGA_STC_MAX", 0.019);
-static const double GS_CONE_HALF_ANGLE_DEG = envOrQ("SZMUK_GS_CONE_DEG", 15.0);
+static const double THETA_PHASE0_DEG   = envOrQ("SZMUK_LEGACY_TILT_PHASE0_DEG", 15.0);
+static const double OMEGA_PHASE0_MAX   = envOrQ("SZMUK_LEGACY_OMEGA_PHASE0_MAX", 0.50);
+static const double SPD_PHASE0_MAX     = envOrQ("SZMUK_LEGACY_SPD_PHASE0_MAX", 3.0);
+static const double THETA_STC_DEG      = envOrQ("SZMUK_LEGACY_TILT_STC_DEG", 2.0);
+static const double ALPHA_THETA_STC    = envOrQ("SZMUK_LEGACY_ALPHA_THETA_STC", 1.0);
+static const double OMEGA_STC_MAX      = envOrQ("SZMUK_LEGACY_OMEGA_STC_MAX", 0.05);
+static const double GS_CONE_HALF_ANGLE_DEG = envOrQ("SZMUK_LEGACY_GS_CONE_DEG", 15.0);
 static const double GS_CONE_TAN            = std::tan(GS_CONE_HALF_ANGLE_DEG * M_PI / 180.0);
-static const double SPD_STC_MAX        = envOrQ("SZMUK_SPD_STC_MAX", 0.75);
-static const double W_LAND_SPEED       = envOrQ("SZMUK_W_LAND_SPEED", 1.0);
-static const double W_LAND_TILT        = envOrQ("SZMUK_W_LAND_TILT", 1.0e5);
-static const double W_LAND_OMEGA       = envOrQ("SZMUK_W_LAND_OMEGA", 100.0);
-static const double W_LAND_GS          = envOrQ("SZMUK_W_LAND_GS", 5000.0);
-static const double LOS_CONE_HALF_ANGLE_DEG = envOrQ("SZMUK_LOS_CONE_DEG", 30.0);
+static const double SPD_STC_MAX        = envOrQ("SZMUK_LEGACY_SPD_STC_MAX", 0.75);
+static const double W_LAND_SPEED       = envOrQ("SZMUK_LEGACY_W_LAND_SPEED", 1.0);
+static const double W_LAND_TILT        = envOrQ("SZMUK_LEGACY_W_LAND_TILT", 1.0e5);
+static const double W_LAND_OMEGA       = envOrQ("SZMUK_LEGACY_W_LAND_OMEGA", 100.0);
+static const double W_LAND_GS          = envOrQ("SZMUK_LEGACY_W_LAND_GS", 5000.0);
+static const double LOS_CONE_HALF_ANGLE_DEG = envOrQ("SZMUK_LEGACY_LOS_CONE_DEG", 30.0);
 static const double LOS_CONE_TAN            = std::tan(LOS_CONE_HALF_ANGLE_DEG * M_PI / 180.0);
-static const double W_STC_LOS               = envOrQ("SZMUK_W_STC_LOS", 50.0);
-static const double LOS_ALT_TRIG            = envOrQ("SZMUK_LOS_ALT_TRIG", 1.8);
-static const double LOS_TRIGGER_SCALE       = envOrQ("SZMUK_LOS_TRIGGER_SCALE", 0.25);
-static const double LOS_TRIGGER_FLOOR       = envOrQ("SZMUK_LOS_TRIGGER_FLOOR", 0.0);
+static const double W_STC_LOS               = envOrQ("SZMUK_LEGACY_W_STC_LOS", 50.0);
+static const double LOS_ALT_TRIG            = envOrQ("SZMUK_LEGACY_LOS_ALT_TRIG", 1.8);
+static const double LOS_TRIGGER_SCALE       = envOrQ("SZMUK_LEGACY_LOS_TRIGGER_SCALE", 0.25);
+static const double LOS_TRIGGER_FLOOR       = envOrQ("SZMUK_LEGACY_LOS_TRIGGER_FLOOR", 0.0);
+static constexpr double T_MIN_AFT          = 0.21;
+static constexpr double T_MAX_AFT          = 0.40;
+static constexpr double T_MIN_WIDE         = 0.12;
+static constexpr double T_MAX_WIDE         = 0.52;
+static constexpr double V_THRUST_TRIG          = 1.0;
+static constexpr double THETA_THRUST_TRIG_DEG  = 15.0;
 
 // ── Altitude trigger / lateral capture cost gate ─────────────────────────────
-static const double ALT_TRIG        = envOrQ("SZMUK_ALT_TRIG", 0.8);
+static const double ALT_TRIG        = envOrQ("SZMUK_LEGACY_ALT_TRIG", 0.8);
 static constexpr double CAP_COST_RADIUS = 0.50;
-static const double CAP_LAND_RADIUS = envOrQ("SZMUK_RH_CAP_LAND_RADIUS", 0.45);
+static const double CAP_LAND_RADIUS = envOrQ("SZMUK_LEGACY_RH_CAP_LAND_RADIUS", 0.45);
 static constexpr double K_CAP          = 20.0;
-static const double Z_STAGE            = envOrQ("SZMUK_Z_STAGE", 1.8);
-static const double STAGE_RADIUS       = envOrQ("SZMUK_STAGE_RADIUS", 1.10);
-static const double STAGE_TRIGGER_SCALE = envOrQ("SZMUK_STAGE_TRIGGER_SCALE", 0.25);
-static const double STAGE_TRIGGER_FLOOR = envOrQ("SZMUK_STAGE_TRIGGER_FLOOR", 0.0);
-static const double STAGE_SETTLE_TILT_DEG  = envOrQ("SZMUK_STAGE_SETTLE_TILT_DEG", 12.0);
-static const double STAGE_SETTLE_OMEGA_MAX = envOrQ("SZMUK_STAGE_SETTLE_OMEGA_MAX", 0.50);
-static const double W_STC_STAGE        = envOrQ("SZMUK_W_STC_STAGE", 10.0);
+static const double Z_STAGE            = envOrQ("SZMUK_LEGACY_Z_STAGE", 1.8);
+static const double STAGE_RADIUS       = envOrQ("SZMUK_LEGACY_STAGE_RADIUS", 0.55);
+static const double STAGE_TRIGGER_SCALE = envOrQ("SZMUK_LEGACY_STAGE_TRIGGER_SCALE", 0.11);
+static const double STAGE_TRIGGER_FLOOR = envOrQ("SZMUK_LEGACY_STAGE_TRIGGER_FLOOR", 0.0);
+static const double STAGE_SETTLE_TILT_DEG  = envOrQ("SZMUK_LEGACY_STAGE_SETTLE_TILT_DEG", 12.0);
+static const double STAGE_SETTLE_OMEGA_MAX = envOrQ("SZMUK_LEGACY_STAGE_SETTLE_OMEGA_MAX", 0.50);
+static const double W_STC_STAGE        = envOrQ("SZMUK_LEGACY_W_STC_STAGE", 10.0);
 static constexpr double CAP_DESC_RADIUS = 0.12;
 static constexpr double K_DESC          = 40.0;
 
 // ── Runtime toggles ───────────────────────────────────────────────────────────
 inline bool useTriggeredLandingStc() {
-    const char* env = std::getenv("SZMUK_QUAD_TRIG_STC");
+    const char* env = std::getenv("SZMUK_LEGACY_QUAD_TRIG_STC");
     return !(env && std::string(env) == "0");
 }
 
 inline std::string stageTriggerMode() {
-    const char* env = std::getenv("SZMUK_STAGE_TRIGGER");
+    const char* env = std::getenv("SZMUK_LEGACY_STAGE_TRIGGER");
     return env ? std::string(env) : std::string("radius");
 }
 
@@ -177,18 +197,12 @@ inline std::string stageTriggerMode() {
 // (SZMUK_CTCS_MODE is deliberately ignored; see file header).
 
 inline bool useRhFeedbackWarmStart() {
-    const char* env = std::getenv("SZMUK_RH_FEEDBACK_WARM_START");
+    const char* env = std::getenv("SZMUK_LEGACY_RH_FEEDBACK_WARM_START");
     return !(env && std::string(env) == "0");
 }
 
-// Faithful to quad_single_horizon_noaug_stc.cpp: the landing trigger is the
-// RAW altitude margin posPart(ALT_TRIG - z), alt-only — this is the trigger
-// the noaug_basin champion tuning (EPS/Y_SCALE) was found with. The RH-clean
-// normalized capture-AND form ((trig_alt/ALT_TRIG) * trig_cap/cap^2) is kept
-// behind an opt-in env for A/B only; it rescales the eps budget and zeroes
-// the landing block outside CAP_LAND_RADIUS, deviating from the benchmark.
-inline bool useRhCaptureLandingTrigger() {
-    const char* env = std::getenv("SZMUK_RH_CAPTURE_LANDING_TRIGGER");
+inline bool useRhAltOnlyLandingTrigger() {
+    const char* env = std::getenv("SZMUK_LEGACY_RH_ALT_ONLY_LANDING_TRIGGER");
     return env && std::string(env) != "0";
 }
 
@@ -198,10 +212,10 @@ inline bool useRhCaptureLandingTrigger() {
 // scaled units keep the noaug_basin (eps, yscale) tuning table applicable.
 // noaug_basin champion: EPS=1.6e-3, Y_SCALE=10.
 static const double CTCS_Y_SCALE = [] {
-    const double s = envOrQ("SZMUK_CTCS_Y_SCALE", 10.0);
+    const double s = envOrQ("SZMUK_LEGACY_CTCS_Y_SCALE", 10.0);
     return s > 0.0 ? s : 1.0;
 }();
-static const double CTCS_STEP_EPS = envOrQ("SZMUK_CTCS_STEP_EPS", 1.6e-3);
+static const double CTCS_STEP_EPS = envOrQ("SZMUK_LEGACY_CTCS_STEP_EPS", 1.6e-3);
 
 // ── Sigmoid helpers ───────────────────────────────────────────────────────────
 template<typename Scalar>
@@ -248,7 +262,7 @@ inline Scalar posPart(const Scalar& v) {
 template<typename Scalar>
 inline Scalar landingAltitudeTrigger(const Scalar& z, const Scalar& rxy2) {
     const Scalar trig_alt = posPart(Scalar(ALT_TRIG) - z);
-    if (!useRhCaptureLandingTrigger()) return trig_alt;  // benchmark default
+    if (useRhAltOnlyLandingTrigger()) return trig_alt;
     const Scalar cap2 = Scalar(CAP_LAND_RADIUS * CAP_LAND_RADIUS);
     const Scalar trig_cap = posPart(cap2 - rxy2) / cap2;
     return (trig_alt / Scalar(ALT_TRIG)) * trig_cap;
@@ -282,7 +296,7 @@ struct ConstantAccelPredictor {
     Eigen::Vector3d predictAccel(double dt) const { (void)dt; return a; }
 };
 
-struct StcLandingNoAugExtra {
+struct StcLandingNoAugLegacyExtra {
     std::shared_ptr<ConstantAccelPredictor> predictor;
 };
 
@@ -436,6 +450,7 @@ struct CtcsIntegrandTerms {
     Scalar a_stage            = Scalar(0);
     Scalar a_los              = Scalar(0);
     Scalar a_altitude_state   = Scalar(0);
+    Scalar a_thrust           = Scalar(0);
     Scalar loose_tilt         = Scalar(0);
     Scalar loose_omega        = Scalar(0);
     Scalar speed              = Scalar(0);
@@ -443,10 +458,16 @@ struct CtcsIntegrandTerms {
     Scalar omega              = Scalar(0);
     Scalar glideslope         = Scalar(0);
     Scalar los                = Scalar(0);
+    Scalar thrust_hi          = Scalar(0);
+    Scalar thrust_lo          = Scalar(0);
+    Scalar thrust_wide_hi     = Scalar(0);
+    Scalar thrust_wide_lo     = Scalar(0);
     Scalar path_value         = Scalar(0);
     Scalar staging_value      = Scalar(0);
     Scalar los_value          = Scalar(0);
     Scalar landing_value      = Scalar(0);
+    Scalar thrust_tight_value = Scalar(0);
+    Scalar thrust_wide_value  = Scalar(0);
     Scalar stc_value          = Scalar(0);
     Scalar value              = Scalar(0);
 };
@@ -463,12 +484,14 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
     const Scalar qperp2 = x(7)*x(7) + x(8)*x(8);
     const Scalar om2    = x.template segment<3>(10).squaredNorm();
     const Scalar rxy    = std::sqrt(rxy2 + Scalar(1e-12));
+    const Scalar v_spd  = std::sqrt(v2   + Scalar(1e-12));
     const Scalar stage_radius_margin =
         (rxy - Scalar(STAGE_RADIUS)) / Scalar(STAGE_TRIGGER_SCALE);
     const Scalar stage_radius_trig =
         (stage_radius_margin > Scalar(0))
             ? Scalar(STAGE_TRIGGER_FLOOR) + stage_radius_margin
             : Scalar(0);
+    const Scalar bounded_stage_trig = Scalar(1) - sigmaLandVal(rxy2);
     const Scalar stage_settle_tilt_lim =
         Scalar(std::pow(std::sin(0.5 * STAGE_SETTLE_TILT_DEG * M_PI / 180.0), 2));
     const Scalar stage_settle_tilt = posPart(qperp2 - stage_settle_tilt_lim);
@@ -477,8 +500,10 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
     const std::string stage_mode = stageTriggerMode();
     if (stage_mode == "settle") {
         out.a_stage = stage_settle_tilt + stage_settle_omega;
-    } else {
+    } else if (stage_mode == "radius") {
         out.a_stage = stage_radius_trig;
+    } else {
+        out.a_stage = bounded_stage_trig;
     }
 
     const Scalar loose_tilt_lim =
@@ -516,9 +541,21 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
             : Scalar(0);
     out.los = posPart(lateral - Scalar(LOS_CONE_TAN) * axial);
 
-    // NOTE: no thrust STC blocks — faithful to quad_single_horizon_noaug_stc,
-    // whose integrand carries only stage/LOS/landing. Thrust limits stay
-    // enforced as hard Fmin/Fmax stage constraints.
+    const Scalar tilt_trig_thresh =
+        Scalar(std::pow(std::sin(0.5 * THETA_THRUST_TRIG_DEG * M_PI / 180.0), 2));
+
+    const Scalar trig_slow    = posPart(Scalar(V_THRUST_TRIG) - v_spd);
+    const Scalar trig_upright = posPart(tilt_trig_thresh - qperp2);
+    out.a_thrust  = out.a_altitude_state * trig_slow * trig_upright;
+    out.thrust_hi = posPart(u(0) - Scalar(T_MAX_AFT));
+    out.thrust_lo = posPart(Scalar(T_MIN_AFT) - u(0));
+
+    const Scalar trig_fast        = posPart(v_spd  - Scalar(V_THRUST_TRIG));
+    const Scalar trig_tilted      = posPart(qperp2 - tilt_trig_thresh);
+    const Scalar wide_trigger_sum = trig_fast * trig_fast + trig_tilted * trig_tilted;
+    out.thrust_wide_hi = posPart(u(0) - Scalar(T_MAX_WIDE));
+    out.thrust_wide_lo = posPart(Scalar(T_MIN_WIDE) - u(0));
+
     const Scalar path_sum =
         out.loose_tilt  * out.loose_tilt  +
         out.loose_omega * out.loose_omega;
@@ -528,6 +565,14 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
         Scalar(W_LAND_TILT)  * out.tilt       * out.tilt       +
         Scalar(W_LAND_OMEGA) * out.omega      * out.omega      +
         Scalar(W_LAND_GS)    * out.glideslope * out.glideslope;
+
+    const Scalar thrust_tight_sum =
+        out.thrust_hi * out.thrust_hi +
+        out.thrust_lo * out.thrust_lo;
+
+    const Scalar thrust_wide_sum =
+        out.thrust_wide_hi * out.thrust_wide_hi +
+        out.thrust_wide_lo * out.thrust_wide_lo;
 
     out.path_value = path_sum;
 
@@ -545,12 +590,21 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
 
         out.landing_value =
             out.a_altitude_state * out.a_altitude_state * landing_sum;
+
+        out.thrust_tight_value =
+            out.a_thrust * out.a_thrust * thrust_tight_sum;
+
+        out.thrust_wide_value =
+            out.a_altitude_state * out.a_altitude_state *
+            wide_trigger_sum * thrust_wide_sum;
     }
 
     out.stc_value =
         out.staging_value      +
         out.los_value          +
-        out.landing_value;
+        out.landing_value      +
+        out.thrust_tight_value +
+        out.thrust_wide_value;
 
     out.value =
         out.path_value +
@@ -940,13 +994,13 @@ inline Eigen::VectorXd ensureNoAugStateSize(const Eigen::VectorXd& x) {
 inline Param getSolverParams() {
     Param p;
     p.reg1_min = 1e-3;
-    p.reg2_min = envOrQ("SZMUK_REG2_MIN", 0.1);
+    p.reg2_min = envOrQ("SZMUK_LEGACY_REG2_MIN", 0.1);
     p.mu_mul   = 0.1;
-    p.rho      = envOrQ("SZMUK_RHO", 5.0);
-    p.rhoT     = envOrQ("SZMUK_RHOT", 5.0);
-    p.rho_mul  = envOrQ("SZMUK_RHO_MUL", 10.0);
-    p.tolerance = envOrQ("SZMUK_TOL", 1e-6);
-    p.max_iter  = envOrInt("SZMUK_MAX_ITER", 180);
+    p.rho      = envOrQ("SZMUK_LEGACY_RHO", 5.0);
+    p.rhoT     = envOrQ("SZMUK_LEGACY_RHOT", 5.0);
+    p.rho_mul  = envOrQ("SZMUK_LEGACY_RHO_MUL", 10.0);
+    p.tolerance = envOrQ("SZMUK_LEGACY_TOL", 1e-6);
+    p.max_iter  = envOrInt("SZMUK_LEGACY_MAX_ITER", 180);
     p.is_quaternion_in_state = false;
     p.use_ddp_terms = false;
     return p;
@@ -1022,13 +1076,13 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
     auto cstep = std::make_shared<CtcsIntervalStepIneqCon<double>>(
         dyn, CTCS_STEP_EPS / CTCS_Y_SCALE);
 
-    const double eps_cost = envOrQ("SZMUK_W_EPS", 1.0);
+    const double eps_cost = envOrQ("SZMUK_LEGACY_W_EPS", 1.0);
     const Eigen::Vector3d r_follow(0.0, 0.0, Z_STAGE);
     auto stage_cost = std::make_shared<CTcSTCStageCost<double>>(
         eps_cost,
-        envOrQ("SZMUK_W_POS_XY", W_STAGE_TARGET_XY),
-        envOrQ("SZMUK_W_POS_Z", W_STAGE_TARGET_Z),
-        envOrQ("SZMUK_W_VEL", W_STAGE_TARGET_VEL),
+        envOrQ("SZMUK_LEGACY_W_POS_XY", W_STAGE_TARGET_XY),
+        envOrQ("SZMUK_LEGACY_W_POS_Z", W_STAGE_TARGET_Z),
+        envOrQ("SZMUK_LEGACY_W_VEL", W_STAGE_TARGET_VEL),
         r_follow);
 
     for (int k = 0; k < N; ++k) {
@@ -1097,7 +1151,7 @@ inline std::shared_ptr<OptimalControlProblem<double>> create(
                 }
                 Eigen::VectorXd du = Eigen::VectorXd::Zero(NU_SS);
                 if (feedback_dim_ok) du = u_fb - uk;
-                const double max_du = envOrQ("SZMUK_RH_MAX_FB_DU", 0.05);
+                const double max_du = envOrQ("SZMUK_LEGACY_RH_MAX_FB_DU", 0.05);
                 const bool wild_feedback =
                     !feedback_dim_ok ||
                     !u_fb.allFinite() ||
@@ -1198,7 +1252,7 @@ inline OCPDescriptor descriptor() {
         }
     };
     d.prepare_extra = [](const PlannerConfig&, double, const TargetSnapshot& tgt_snapshot) {
-        StcLandingNoAugExtra ex;
+        StcLandingNoAugLegacyExtra ex;
         ex.predictor = std::make_shared<ConstantAccelPredictor>();
         ex.predictor->setState(tgt_snapshot.position,
                                tgt_snapshot.velocity,
@@ -1216,9 +1270,9 @@ inline OCPDescriptor descriptor() {
     d.sanitize_warm_control = [](Eigen::VectorXd& u) { clampWarmControl(u); };
     d.getSolverParams = getSolverParams;
     d.create = [](const OCPCreateArgs& a) {
-        StcLandingNoAugExtra ex;
+        StcLandingNoAugLegacyExtra ex;
         if (a.extra.has_value()) {
-            try { ex = std::any_cast<StcLandingNoAugExtra>(a.extra); }
+            try { ex = std::any_cast<StcLandingNoAugLegacyExtra>(a.extra); }
             catch (const std::bad_any_cast&) {}
         }
         auto pred = ex.predictor;
@@ -1232,4 +1286,4 @@ inline OCPDescriptor descriptor() {
     return d;
 }
 
-}  // namespace StcLandingNoAugOCP
+}  // namespace StcLandingNoAugLegacyOCP

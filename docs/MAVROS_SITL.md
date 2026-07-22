@@ -185,6 +185,43 @@ defaults are the tuned SITL setting (noaug_basin champion
   weaken `max_constraint_error` if activation solves are rejected — fix the
   engagement geometry instead (same rule as `stc_landing`).
 
+#### Best SITL config (2026-07-23, "horizon-tuned")
+
+Run `logs/px4_drone_hover_open_loop_alipddp_20260723_025601/` (its
+`tuning.env` has the full recipe, results and the list of what failed).
+Export before `roslaunch`, then use the launch args below:
+
+```bash
+export SZMUK_RH_N=40 SZMUK_MAX_ITER=120 SZMUK_THH=0.16 SZMUK_W_LAND_GS=20000
+roslaunch comando_planner planner_launch.launch platform:=mavros \
+  drone_name:=px4_drone terminal_freeze_enter_vel:=0.30 \
+  stc_z_stage:=1.55 stc_los_alt_trig:=1.2
+```
+
+Engage from a TRUE world 1.8 m hover: the hover profile commands 2.05 (open
+loop settles ~0.25 m low) and you must wait for a real settle — `|vz|<0.05`
+and `1.75<z<1.9` for several consecutive samples — before applying the
+landing profile.
+
+Executed result (band `0.15<r_z<0.8`): glideslope 12.0° at `a_land`, tilt
+1.5°, `‖ω‖` 0.04, speed 0.53, touchdown 14 cm — tilt/rate/speed all inside
+the tight landing bounds, at or below the `stc_landing_noaug_sitl_circle`
+reference; solves 167 ms avg / 222 ms max, inside the RH replan budget.
+
+**Tuning rules learned the hard way** (details in that `tuning.env`):
+
+- At RH iteration counts, **horizon length beats iteration count**: `N=40`
+  with `MAX_ITER=120` solves *faster* than `N=30/180` and plans a far gentler
+  approach. Do not copy the single-horizon benchmark recipe verbatim — its
+  `RHO=500 / MAX_ITER=1200 / CTCS_STEP_EPS=1e-5` stretches solves past the
+  replan budget (445 ms → 138 rejects) and tightening `STEP_EPS` at RH
+  iteration counts makes the planned glideslope *worse*, not better.
+- Screen every candidate offline with `test/tools_gs_probe.cpp` and reject
+  anything whose `ms_max` exceeds ~250 ms before flying it.
+- `SZMUK_STAGE_RADIUS` is not a tuning knob: 0.80 wedges the descent
+  entirely, 0.45 overshoots the pad, >1.5 drifts worse. Keep the benchmark
+  1.10.
+
 ### Stopping after touchdown (`land_action`)
 
 By default (`land_action: none`) terminal freeze holds the last setpoint at

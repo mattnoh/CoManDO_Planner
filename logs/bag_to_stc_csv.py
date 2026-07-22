@@ -37,25 +37,27 @@ import rosbag
 # ── Constants mirrored from include/ocp/ocp_stc_landing.hpp ──────────────────
 # (env_name, default) — resolved the same way as envOrQ() so figures match a
 # run that used SZMUK_* tunables, provided you export them here too.
-# NOTE: z_stage and los_alt_trig defaults are 1.3 here (not the code's 1.8)
-# to match the <env> overrides planner_launch.launch applies to every flight;
-# keep the three places in sync.
+# NOTE: z_stage and los_alt_trig defaults mirror the planner_launch.launch
+# <env> overrides (currently 1.4 / 1.2), NOT the code's 1.8; the remaining
+# defaults mirror ocp_stc_landing_noaug.hpp's compiled-in benchmark values
+# (faithful-port restore, 2026-07-23). Keep the three places in sync, and
+# export the same SZMUK_* env when re-analyzing a flight that overrode them.
 _ENV_CONSTANTS = {
     "alt_trig":            ("SZMUK_ALT_TRIG", 0.8),
     "cap_radius":          ("SZMUK_RH_CAP_LAND_RADIUS", 0.45),
-    "z_stage":             ("SZMUK_Z_STAGE", 1.3),
-    "stage_radius":        ("SZMUK_STAGE_RADIUS", 0.55),
-    "stage_trigger_scale": ("SZMUK_STAGE_TRIGGER_SCALE", 0.11),
+    "z_stage":             ("SZMUK_Z_STAGE", 1.4),
+    "stage_radius":        ("SZMUK_STAGE_RADIUS", 1.10),
+    "stage_trigger_scale": ("SZMUK_STAGE_TRIGGER_SCALE", 0.25),
     "stage_trigger_floor": ("SZMUK_STAGE_TRIGGER_FLOOR", 0.0),
-    "los_alt_trig":        ("SZMUK_LOS_ALT_TRIG", 1.3),
+    "los_alt_trig":        ("SZMUK_LOS_ALT_TRIG", 1.2),
     "los_trigger_scale":   ("SZMUK_LOS_TRIGGER_SCALE", 0.25),
     "los_trigger_floor":   ("SZMUK_LOS_TRIGGER_FLOOR", 0.0),
     "los_cone_deg":        ("SZMUK_LOS_CONE_DEG", 30.0),
     "v_phase0_max":        ("SZMUK_SPD_PHASE0_MAX", 3.0),
     "v_land_stc_max":      ("SZMUK_SPD_STC_MAX", 0.75),
-    "omega_phase0_max":    ("SZMUK_OMEGA_PHASE0_MAX", 0.50),
-    "omega_land_stc_max":  ("SZMUK_OMEGA_STC_MAX", 0.05),
-    "tilt_phase0_deg":     ("SZMUK_TILT_PHASE0_DEG", 15.0),
+    "omega_phase0_max":    ("SZMUK_OMEGA_PHASE0_MAX", 0.35),
+    "omega_land_stc_max":  ("SZMUK_OMEGA_STC_MAX", 0.019),
+    "tilt_phase0_deg":     ("SZMUK_TILT_PHASE0_DEG", 11.0),
     "gs_cone_deg":         ("SZMUK_GS_CONE_DEG", 15.0),
 }
 _FIXED_CONSTANTS = {
