@@ -59,6 +59,58 @@ ros2 run comando_planner target_publisher --ros-args \
   -p drone_pose_topic:=/cf_1/pose
 ```
 
+## CrazySim SITL (validated stc_landing_noaug landing, 2026-07-22)
+
+CrazySim lives at `../../../CrazySim` (firmware SITL prebuilt in
+`crazyflie-firmware/sitl_make/build/cf2`). Full sequence:
+
+```bash
+# 1. firmware + gazebo (UDP 19950 firmware / 19850 cflib — matches crazyflies.yaml cf_1)
+cd <CrazySim>/crazyflie-firmware
+bash tools/crazyflie-simulation/simulator_files/gazebo/launch/sitl_singleagent.sh -m crazyflie -x 0 -y 0
+
+# 2. crazyswarm2 — cflib backend, NOT backend:=sim (that is the python
+#    integrator: no firmware, no /cf_1/pose)
+ros2 launch crazyflie launch.py backend:=cflib gui:=False mocap:=False
+
+# 3. planner — record_bag:=false is MANDATORY (bag recording OOM-kills the node)
+ros2 launch comando_planner planner_launch.py drone_name:=cf_1 platform:=crazyflie record_bag:=false
+
+# 4. target
+ros2 launch comando_planner target_launch.py target_mode:=gazebo_circle \
+  planning_frame:=world drone_odom_topic:=/cf_1/odom drone_pose_topic:=/cf_1/pose
+
+# 5. position with the crazyswarm2 high-level commander, NOT the hover OCP
+#    (planner_node relies on goto holding the drone until the first solve):
+ros2 service call /cf_1/arm crazyflie_interfaces/srv/Arm "{arm: true}"
+ros2 service call /cf_1/takeoff crazyflie_interfaces/srv/Takeoff "{height: 1.0, duration: {sec: 3}}"
+ros2 service call /cf_1/go_to crazyflie_interfaces/srv/GoTo \
+  "{relative: false, goal: {x: 2.0, y: 2.0, z: 1.8}, duration: {sec: 5}}"
+
+# 6. trigger the landing OCP (bump command_seq by +1 each trigger)
+ros2 launch comando_planner ocp_launch.py ocp_type:=stc_landing_noaug \
+  mode:=mpc n_replay:=7 command_seq:=1
+```
+
+Hard-won gotchas:
+
+- **`SZMUK_Z_STAGE=1.3` / `SZMUK_LOS_ALT_TRIG=1.3`** are required for the stc
+  landing OCPs to converge from the documented staging geometry; the compiled
+  defaults (1.8/1.8) stall the IPM (constraint ~30-60, "Outer Max/Min").
+  `planner_launch.py` injects them via `additional_env` (args `stc_z_stage`,
+  `stc_los_alt_trig`), mirroring the ROS1 `planner_launch.launch`. Any
+  standalone solve harness must export them too.
+- ROS1-style flat profile YAMLs do **not** load with `ros2 param load`
+  (needs `/comando_planner:\n  ros__parameters:`) and fail silently —
+  `command_seq` stays 0 and the OCP never starts. Use `ocp_launch.py`.
+- `test_stc_landing_noaug` validates against an **R=2.0 / v=0.8** target; the
+  SITL circle is R=1.0 / v=0.4. The unit test passing does not prove SITL
+  convergence — check offline with the real target values + launch env.
+- Known gaps vs the ROS1 arm: `land_action` is not a declared parameter (no
+  touchdown disarm — the drone holds the terminal setpoint on the ground),
+  and in the validated landing all post-activation replans were rejected
+  (the flight rode the activation plan; MAVROS re-accepts ~13 solves).
+
 ## Current Architecture
 
 The planner is split into:

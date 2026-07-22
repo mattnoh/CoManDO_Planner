@@ -43,6 +43,16 @@ def generate_launch_description():
 
         DeclareLaunchArgument('record_bag', default_value='true'),
         DeclareLaunchArgument('bag_output', default_value=''),
+
+        # stc_landing / stc_landing_noaug scenario tuning (SZMUK_* env, read
+        # once at node start). Values are TARGET-RELATIVE metres. 1.3 rel:
+        # staging floor below the hover start, LOS cone arms only during the
+        # final descent — matches the ROS1 planner_launch.launch defaults the
+        # SITL runs were validated with. Code defaults stay at the
+        # benchmark's 1.8, which does NOT converge from the documented
+        # staging geometry.
+        DeclareLaunchArgument('stc_z_stage', default_value='1.3'),
+        DeclareLaunchArgument('stc_los_alt_trig', default_value='1.3'),
     ]
 
     node = Node(
@@ -50,6 +60,10 @@ def generate_launch_description():
         executable='comando_planner',
         name='comando_planner',
         output='screen',
+        additional_env={
+            'SZMUK_Z_STAGE': LaunchConfiguration('stc_z_stage'),
+            'SZMUK_LOS_ALT_TRIG': LaunchConfiguration('stc_los_alt_trig'),
+        },
         parameters=[{
             'drone_name': LaunchConfiguration('drone_name'),
             'platform': LaunchConfiguration('platform'),

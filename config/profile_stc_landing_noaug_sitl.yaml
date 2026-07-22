@@ -1,0 +1,11 @@
+# stc_landing_noaug profile (ROS2 param-file format for `ros2 param load` /
+# scripts/apply_profile.sh). NOTE: unlike the ROS1 branch, `land_action` is not
+# a declared parameter on this node yet (no touchdown disarm) — do not add it
+# here or the load fails. Trigger via ocp_launch.py or apply_profile.sh.
+# Scenario tuning (SZMUK_Z_STAGE / SZMUK_LOS_ALT_TRIG = 1.3) is injected by
+# planner_launch.py, not by this profile.
+/comando_planner:
+  ros__parameters:
+    ocp_type: stc_landing_noaug
+    mode: mpc
+    n_replay: 7

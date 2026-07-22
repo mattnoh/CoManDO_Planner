@@ -169,6 +169,32 @@ target_link_libraries(test_stateswitch_predictor
   planner_core
 )
 
+add_executable(test_stc_landing
+  test/test_stc_landing.cpp
+  ${SHARED_SOURCES}
+)
+target_include_directories(test_stc_landing PRIVATE
+  ${EIGEN3_INCLUDE_DIR}
+  include
+  config
+)
+target_link_libraries(test_stc_landing
+  planner_core
+)
+
+add_executable(test_stc_landing_noaug
+  test/test_stc_landing_noaug.cpp
+  ${SHARED_SOURCES}
+)
+target_include_directories(test_stc_landing_noaug PRIVATE
+  ${EIGEN3_INCLUDE_DIR}
+  include
+  config
+)
+target_link_libraries(test_stc_landing_noaug
+  planner_core
+)
+
 if(BUILD_TESTING)
   add_test(NAME test_trajectory_replayer COMMAND test_trajectory_replayer)
   add_test(NAME test_planner_core COMMAND test_planner_core)
@@ -183,6 +209,8 @@ install(TARGETS
     test_target_frame_warm_start
     test_planner_core
     test_stateswitch_predictor
+    test_stc_landing
+    test_stc_landing_noaug
   DESTINATION lib/${PROJECT_NAME}
 )
 
