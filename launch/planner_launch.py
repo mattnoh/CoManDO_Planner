@@ -51,8 +51,8 @@ def generate_launch_description():
         # SITL runs were validated with. Code defaults stay at the
         # benchmark's 1.8, which does NOT converge from the documented
         # staging geometry.
-        DeclareLaunchArgument('stc_z_stage', default_value='1.3'),
-        DeclareLaunchArgument('stc_los_alt_trig', default_value='1.3'),
+        DeclareLaunchArgument('stc_z_stage', default_value='1.4'),
+        DeclareLaunchArgument('stc_los_alt_trig', default_value='1.2'),
     ]
 
     node = Node(
