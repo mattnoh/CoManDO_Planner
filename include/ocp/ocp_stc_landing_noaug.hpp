@@ -72,10 +72,16 @@ static constexpr double IXX     = 1.66e-5;
 static constexpr double IYY     = 1.66e-5;
 static constexpr double IZZ     = 2.92e-5;
 static constexpr double J_SCALE = 1.0 / IXX;
-static constexpr double FMIN    = 0.08;
-static constexpr double FMAX    = 0.6;
+// Benchmark split (quad_single_horizon_noaug_stc): the PLAN is bounded to
+// FMIN/FMAX with margin inside the ACTUATOR_F* physical limits; TAU_MAX
+// derives from the actuator limits, not the planning bounds.
+static constexpr double ACTUATOR_FMIN = 0.08;
+static constexpr double ACTUATOR_FMAX = 0.60;
+static constexpr double FMIN    = 0.12;
+static constexpr double FMAX    = 0.52;
 static constexpr double L_ARM   = 0.046;
-static const double TAU_MAX = L_ARM * (FMAX/4.0 - FMIN/4.0) * J_SCALE;
+static const double TAU_MAX =
+    L_ARM * (ACTUATOR_FMAX/4.0 - ACTUATOR_FMIN/4.0) * J_SCALE;
 
 static const Eigen::Matrix3d J_B = [](){
     Eigen::Matrix3d J; J.setZero();
@@ -140,12 +146,6 @@ static const double W_STC_LOS               = envOrQ("SZMUK_W_STC_LOS", 50.0);
 static const double LOS_ALT_TRIG            = envOrQ("SZMUK_LOS_ALT_TRIG", 1.8);
 static const double LOS_TRIGGER_SCALE       = envOrQ("SZMUK_LOS_TRIGGER_SCALE", 0.25);
 static const double LOS_TRIGGER_FLOOR       = envOrQ("SZMUK_LOS_TRIGGER_FLOOR", 0.0);
-static constexpr double T_MIN_AFT          = 0.21;
-static constexpr double T_MAX_AFT          = 0.40;
-static constexpr double T_MIN_WIDE         = 0.12;
-static constexpr double T_MAX_WIDE         = 0.52;
-static constexpr double V_THRUST_TRIG          = 1.0;
-static constexpr double THETA_THRUST_TRIG_DEG  = 15.0;
 
 // ── Altitude trigger / lateral capture cost gate ─────────────────────────────
 static const double ALT_TRIG        = envOrQ("SZMUK_ALT_TRIG", 0.8);
@@ -181,8 +181,14 @@ inline bool useRhFeedbackWarmStart() {
     return !(env && std::string(env) == "0");
 }
 
-inline bool useRhAltOnlyLandingTrigger() {
-    const char* env = std::getenv("SZMUK_RH_ALT_ONLY_LANDING_TRIGGER");
+// Faithful to quad_single_horizon_noaug_stc.cpp: the landing trigger is the
+// RAW altitude margin posPart(ALT_TRIG - z), alt-only — this is the trigger
+// the noaug_basin champion tuning (EPS/Y_SCALE) was found with. The RH-clean
+// normalized capture-AND form ((trig_alt/ALT_TRIG) * trig_cap/cap^2) is kept
+// behind an opt-in env for A/B only; it rescales the eps budget and zeroes
+// the landing block outside CAP_LAND_RADIUS, deviating from the benchmark.
+inline bool useRhCaptureLandingTrigger() {
+    const char* env = std::getenv("SZMUK_RH_CAPTURE_LANDING_TRIGGER");
     return env && std::string(env) != "0";
 }
 
@@ -242,7 +248,7 @@ inline Scalar posPart(const Scalar& v) {
 template<typename Scalar>
 inline Scalar landingAltitudeTrigger(const Scalar& z, const Scalar& rxy2) {
     const Scalar trig_alt = posPart(Scalar(ALT_TRIG) - z);
-    if (useRhAltOnlyLandingTrigger()) return trig_alt;
+    if (!useRhCaptureLandingTrigger()) return trig_alt;  // benchmark default
     const Scalar cap2 = Scalar(CAP_LAND_RADIUS * CAP_LAND_RADIUS);
     const Scalar trig_cap = posPart(cap2 - rxy2) / cap2;
     return (trig_alt / Scalar(ALT_TRIG)) * trig_cap;
@@ -430,7 +436,6 @@ struct CtcsIntegrandTerms {
     Scalar a_stage            = Scalar(0);
     Scalar a_los              = Scalar(0);
     Scalar a_altitude_state   = Scalar(0);
-    Scalar a_thrust           = Scalar(0);
     Scalar loose_tilt         = Scalar(0);
     Scalar loose_omega        = Scalar(0);
     Scalar speed              = Scalar(0);
@@ -438,16 +443,10 @@ struct CtcsIntegrandTerms {
     Scalar omega              = Scalar(0);
     Scalar glideslope         = Scalar(0);
     Scalar los                = Scalar(0);
-    Scalar thrust_hi          = Scalar(0);
-    Scalar thrust_lo          = Scalar(0);
-    Scalar thrust_wide_hi     = Scalar(0);
-    Scalar thrust_wide_lo     = Scalar(0);
     Scalar path_value         = Scalar(0);
     Scalar staging_value      = Scalar(0);
     Scalar los_value          = Scalar(0);
     Scalar landing_value      = Scalar(0);
-    Scalar thrust_tight_value = Scalar(0);
-    Scalar thrust_wide_value  = Scalar(0);
     Scalar stc_value          = Scalar(0);
     Scalar value              = Scalar(0);
 };
@@ -464,14 +463,12 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
     const Scalar qperp2 = x(7)*x(7) + x(8)*x(8);
     const Scalar om2    = x.template segment<3>(10).squaredNorm();
     const Scalar rxy    = std::sqrt(rxy2 + Scalar(1e-12));
-    const Scalar v_spd  = std::sqrt(v2   + Scalar(1e-12));
     const Scalar stage_radius_margin =
         (rxy - Scalar(STAGE_RADIUS)) / Scalar(STAGE_TRIGGER_SCALE);
     const Scalar stage_radius_trig =
         (stage_radius_margin > Scalar(0))
             ? Scalar(STAGE_TRIGGER_FLOOR) + stage_radius_margin
             : Scalar(0);
-    const Scalar bounded_stage_trig = Scalar(1) - sigmaLandVal(rxy2);
     const Scalar stage_settle_tilt_lim =
         Scalar(std::pow(std::sin(0.5 * STAGE_SETTLE_TILT_DEG * M_PI / 180.0), 2));
     const Scalar stage_settle_tilt = posPart(qperp2 - stage_settle_tilt_lim);
@@ -480,10 +477,8 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
     const std::string stage_mode = stageTriggerMode();
     if (stage_mode == "settle") {
         out.a_stage = stage_settle_tilt + stage_settle_omega;
-    } else if (stage_mode == "radius") {
-        out.a_stage = stage_radius_trig;
     } else {
-        out.a_stage = bounded_stage_trig;
+        out.a_stage = stage_radius_trig;
     }
 
     const Scalar loose_tilt_lim =
@@ -521,21 +516,9 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
             : Scalar(0);
     out.los = posPart(lateral - Scalar(LOS_CONE_TAN) * axial);
 
-    const Scalar tilt_trig_thresh =
-        Scalar(std::pow(std::sin(0.5 * THETA_THRUST_TRIG_DEG * M_PI / 180.0), 2));
-
-    const Scalar trig_slow    = posPart(Scalar(V_THRUST_TRIG) - v_spd);
-    const Scalar trig_upright = posPart(tilt_trig_thresh - qperp2);
-    out.a_thrust  = out.a_altitude_state * trig_slow * trig_upright;
-    out.thrust_hi = posPart(u(0) - Scalar(T_MAX_AFT));
-    out.thrust_lo = posPart(Scalar(T_MIN_AFT) - u(0));
-
-    const Scalar trig_fast        = posPart(v_spd  - Scalar(V_THRUST_TRIG));
-    const Scalar trig_tilted      = posPart(qperp2 - tilt_trig_thresh);
-    const Scalar wide_trigger_sum = trig_fast * trig_fast + trig_tilted * trig_tilted;
-    out.thrust_wide_hi = posPart(u(0) - Scalar(T_MAX_WIDE));
-    out.thrust_wide_lo = posPart(Scalar(T_MIN_WIDE) - u(0));
-
+    // NOTE: no thrust STC blocks — faithful to quad_single_horizon_noaug_stc,
+    // whose integrand carries only stage/LOS/landing. Thrust limits stay
+    // enforced as hard Fmin/Fmax stage constraints.
     const Scalar path_sum =
         out.loose_tilt  * out.loose_tilt  +
         out.loose_omega * out.loose_omega;
@@ -545,14 +528,6 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
         Scalar(W_LAND_TILT)  * out.tilt       * out.tilt       +
         Scalar(W_LAND_OMEGA) * out.omega      * out.omega      +
         Scalar(W_LAND_GS)    * out.glideslope * out.glideslope;
-
-    const Scalar thrust_tight_sum =
-        out.thrust_hi * out.thrust_hi +
-        out.thrust_lo * out.thrust_lo;
-
-    const Scalar thrust_wide_sum =
-        out.thrust_wide_hi * out.thrust_wide_hi +
-        out.thrust_wide_lo * out.thrust_wide_lo;
 
     out.path_value = path_sum;
 
@@ -570,21 +545,12 @@ inline CtcsIntegrandTerms<Scalar> evalCtcsIntegrandTerms(const Vector<Scalar>& x
 
         out.landing_value =
             out.a_altitude_state * out.a_altitude_state * landing_sum;
-
-        out.thrust_tight_value =
-            out.a_thrust * out.a_thrust * thrust_tight_sum;
-
-        out.thrust_wide_value =
-            out.a_altitude_state * out.a_altitude_state *
-            wide_trigger_sum * thrust_wide_sum;
     }
 
     out.stc_value =
         out.staging_value      +
         out.los_value          +
-        out.landing_value      +
-        out.thrust_tight_value +
-        out.thrust_wide_value;
+        out.landing_value;
 
     out.value =
         out.path_value +
