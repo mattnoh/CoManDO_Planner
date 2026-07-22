@@ -12,14 +12,22 @@
 ///   "mocap"          — Real target pose from a mocap4r2 rigid-bodies
 ///                      topic, selected by rigid_body_name.
 ///
+///   "trace_replay"   — Replay target state trace from CSV.
+///
 /// Publishes on:
 ///   /target/odom   (nav_msgs/msg/Odometry)
 ///   /target/accel  (geometry_msgs/msg/AccelStamped)
 ///   /target/true_odom, /target/true_accel in gazebo_* modes only
 ///
 /// Parameters:
-///   target_mode         — "gazebo_circle", "gazebo_figure8", or "mocap"
+///   target_mode         — "gazebo_circle", "gazebo_figure8", "mocap", or "trace_replay"
 ///                         default: "gazebo_circle"
+///   trace_csv_path      — trace CSV path for trace_replay         default: ""
+///   trace_loop          — loop trace at end                       default: false
+///   trace_hold_last     — hold last sample at end when not loop   default: true
+///   trace_time_scale    — replay speed multiplier                 default: 1.0
+///   trace_shifted_world — shift replay to start at local origin   default: false
+///   trace_offset_x/y/z  — additional replay world offset [m]      default: 0,0,0
 ///   center_x/y/z        — orbit center [m]                 default: 0, 0, 0.2
 ///   omega               — angular speed [rad/s]            default: 0.4
 ///   phi0                — initial phase, circle mode [rad] default: 0.0
@@ -52,6 +60,13 @@
 #include <cmath>
 #include <chrono>
 #include <mutex>
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
 
 namespace {
 constexpr double DEG2RAD = M_PI / 180.0;
@@ -60,7 +75,8 @@ std::string normalizeTargetMode(const std::string& requested)
 {
     if (requested == "gazebo_circle" ||
         requested == "gazebo_figure8" ||
-        requested == "mocap") {
+        requested == "mocap" ||
+        requested == "trace_replay") {
         return requested;
     }
     return "gazebo_circle";
@@ -98,6 +114,14 @@ public:
         target_yaw_rate_ = declare_parameter<double>("target_yaw_rate", 0.3);
         publish_hz_  = declare_parameter<double>("publish_hz", 100.0);
         frame_id_    = declare_parameter<std::string>("frame_id", "world");
+        trace_csv_path_ = declare_parameter<std::string>("trace_csv_path", "");
+        trace_loop_ = declare_parameter<bool>("trace_loop", false);
+        trace_hold_last_ = declare_parameter<bool>("trace_hold_last", true);
+        trace_time_scale_ = declare_parameter<double>("trace_time_scale", 1.0);
+        trace_shifted_world_ = declare_parameter<bool>("trace_shifted_world", false);
+        trace_offset_x_ = declare_parameter<double>("trace_offset_x", 0.0);
+        trace_offset_y_ = declare_parameter<double>("trace_offset_y", 0.0);
+        trace_offset_z_ = declare_parameter<double>("trace_offset_z", 0.0);
         rigid_body_name_  = declare_parameter<std::string>("rigid_body_name", "stmini");
         drone_odom_topic_     = declare_parameter<std::string>("drone_odom_topic", "/cf_1/odom");
         const std::string legacy_drone_odom_mode = declare_parameter<std::string>("drone_odom_mode", "");
@@ -115,6 +139,31 @@ public:
         body_relative_angular_unit_ = declare_parameter<std::string>(
             "body_relative_input_angular_unit", "deg_s");
 
+        // ── Simulated relative sensing ───────────────────────────────────────
+        // Two stages that communicate only over relative_estimate_topic, so a
+        // real estimator can replace stage 1 without touching stage 2.
+        target_source_ = declare_parameter<std::string>("target_source", "ground_truth");
+        sim_relative_estimate_ = declare_parameter<bool>("sim_relative_estimate", false);
+        pad_z_ = declare_parameter<double>("pad_z", 0.0);
+        relative_estimate_topic_ = declare_parameter<std::string>(
+            "relative_estimate_topic", "/drone/relative_target_estimate");
+        publish_gt_debug_ = declare_parameter<bool>("publish_ground_truth_debug", true);
+        drone_odom_twist_frame_ = declare_parameter<std::string>("drone_odom_twist_frame", "body");
+
+        if (target_source_ != "ground_truth" && target_source_ != "relative_estimate") {
+            RCLCPP_WARN(get_logger(),
+                "[TargetPublisher] unknown target_source='%s', falling back to ground_truth",
+                target_source_.c_str());
+            target_source_ = "ground_truth";
+        }
+        if (drone_odom_twist_frame_ != "body" && drone_odom_twist_frame_ != "world") {
+            RCLCPP_WARN(get_logger(),
+                "[TargetPublisher] unknown drone_odom_twist_frame='%s', falling back to body",
+                drone_odom_twist_frame_.c_str());
+            drone_odom_twist_frame_ = "body";
+        }
+        synthesize_from_estimate_ = (target_source_ == "relative_estimate");
+
         // Filter gains for target pose measurements.
         filter_alpha_   = declare_parameter<double>("filter_alpha",   0.8);
         filter_beta_    = declare_parameter<double>("filter_beta",    0.4);
@@ -126,6 +175,11 @@ public:
             RCLCPP_WARN(get_logger(),
                 "[TargetPublisher] Unknown target_mode='%s'; using gazebo_circle.",
                 requested_target_mode.c_str());
+        }
+        if (trace_time_scale_ <= 0.0) {
+            RCLCPP_WARN(get_logger(),
+                "[TargetPublisher] trace_time_scale must be > 0; using 1.0.");
+            trace_time_scale_ = 1.0;
         }
         if (drone_odom_mode_ != "world" && drone_odom_mode_ != "shifted" &&
             drone_odom_mode_ != "target_frame" && drone_odom_mode_ != "body_frame") {
@@ -153,6 +207,24 @@ public:
         true_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/target/true_odom", 10);
         true_accel_pub_ = create_publisher<geometry_msgs::msg::AccelStamped>("/target/true_accel", 10);
 
+        // In relative-estimate mode /target/odom carries the synthesized target,
+        // so generator truth is diverted to _gt topics for round-trip checks.
+        if (synthesize_from_estimate_ && publish_gt_debug_) {
+            gt_odom_pub_  = create_publisher<nav_msgs::msg::Odometry>("/target/odom_gt", 10);
+            gt_accel_pub_ = create_publisher<geometry_msgs::msg::AccelStamped>("/target/accel_gt", 10);
+        }
+        if (sim_relative_estimate_) {
+            rel_estimate_pub_ =
+                create_publisher<nav_msgs::msg::Odometry>(relative_estimate_topic_, 10);
+        }
+        if (synthesize_from_estimate_) {
+            rel_estimate_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+                relative_estimate_topic_, 10,
+                [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+                    relativeEstimateCallback(msg);
+                });
+        }
+
         if (drone_odom_mode_ == "shifted") {
             abs_rel_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/relative_odometry", 10);
         } else if (drone_odom_mode_ == "body_frame") {
@@ -160,7 +232,7 @@ public:
         } else if (drone_odom_mode_ == "target_frame") {
             target_frame_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/drone/target_frame_odom", 10);
         }
-        if (drone_odom_mode_ != "world") {
+        if (drone_odom_mode_ != "world" || sim_relative_estimate_ || synthesize_from_estimate_) {
             drone_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
                 drone_odom_topic_, 10,
                 [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -181,6 +253,10 @@ public:
 
         pos_filter_.configure(filter_alpha_, filter_beta_, filter_gamma_);
         angvel_filter_.configure(filter_alpha_w_, filter_beta_w_);
+
+        if (target_mode_ == "trace_replay" && !loadTraceCsv(trace_csv_path_)) {
+            throw std::runtime_error("trace_replay mode requested but trace CSV failed to load");
+        }
 
         // ── Mocap rigid bodies subscriber (mocap mode only) ─────────────────
 #ifdef HAS_MOCAP4R2_MSGS
@@ -211,6 +287,15 @@ public:
                 rigid_body_name_.c_str(),
                 filter_alpha_, filter_beta_, filter_gamma_,
                 filter_alpha_w_, filter_beta_w_);
+        } else if (target_mode_ == "trace_replay") {
+            RCLCPP_INFO(get_logger(),
+                "[TargetPublisher] mode=trace_replay  csv=%s  samples=%zu  duration=%.3f s  loop=%s  hold_last=%s  time_scale=%.2f  shifted_world=%s  pos_shift=(%.3f,%.3f,%.3f)",
+                trace_csv_path_.c_str(), trace_samples_.size(), trace_duration_s_,
+                trace_loop_ ? "true" : "false",
+                trace_hold_last_ ? "true" : "false",
+                trace_time_scale_,
+                trace_shifted_world_ ? "true" : "false",
+                trace_pos_shift_.x(), trace_pos_shift_.y(), trace_pos_shift_.z());
         } else {
             RCLCPP_INFO(get_logger(),
                 "[TargetPublisher] mode=%s synthetic pose measurements  circle_center=(%.2f,%.2f,%.2f)  "
@@ -220,12 +305,23 @@ public:
                 circle_model_.R, circle_model_.omega, publish_hz_);
         }
 #else
-        RCLCPP_INFO(get_logger(),
-            "[TargetPublisher] mode=%s synthetic pose measurements  circle_center=(%.2f,%.2f,%.2f)  "
-            "circle_R=%.2f  circle_omega=%.2f rad/s  %.0f Hz",
-            target_mode_.c_str(),
-            circle_model_.center.x(), circle_model_.center.y(), circle_model_.center.z(),
-            circle_model_.R, circle_model_.omega, publish_hz_);
+        if (target_mode_ == "trace_replay") {
+            RCLCPP_INFO(get_logger(),
+                "[TargetPublisher] mode=trace_replay  csv=%s  samples=%zu  duration=%.3f s  loop=%s  hold_last=%s  time_scale=%.2f  shifted_world=%s  pos_shift=(%.3f,%.3f,%.3f)",
+                trace_csv_path_.c_str(), trace_samples_.size(), trace_duration_s_,
+                trace_loop_ ? "true" : "false",
+                trace_hold_last_ ? "true" : "false",
+                trace_time_scale_,
+                trace_shifted_world_ ? "true" : "false",
+                trace_pos_shift_.x(), trace_pos_shift_.y(), trace_pos_shift_.z());
+        } else {
+            RCLCPP_INFO(get_logger(),
+                "[TargetPublisher] mode=%s synthetic pose measurements  circle_center=(%.2f,%.2f,%.2f)  "
+                "circle_R=%.2f  circle_omega=%.2f rad/s  %.0f Hz",
+                target_mode_.c_str(),
+                circle_model_.center.x(), circle_model_.center.y(), circle_model_.center.z(),
+                circle_model_.R, circle_model_.omega, publish_hz_);
+        }
 #endif
 
         if (drone_odom_mode_ == "shifted") {
@@ -260,6 +356,12 @@ private:
         double wx, wy, wz;
         double alfx, alfy, alfz;
         Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
+    };
+    struct TraceSample {
+        double t = 0.0;
+        Eigen::Vector3d p = Eigen::Vector3d::Zero();
+        Eigen::Vector3d v = Eigen::Vector3d::Zero();
+        Eigen::Vector3d a = Eigen::Vector3d::Zero();
     };
 
     // Alpha-beta-gamma tracking filter: measurement = position, outputs p, v, a.
@@ -331,7 +433,18 @@ private:
         }
 
         Kinematics k{};
-        if (!readEstimatedTarget(k)) {
+        bool have_target = false;
+        if (target_mode_ == "trace_replay") {
+            const double trace_t = (t - t0_) * trace_time_scale_;
+            have_target = sampleTrace(trace_t, k);
+            if (!have_target) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "[TargetPublisher] trace_replay finished and trace_hold_last=false; no target output.");
+            }
+        } else {
+            have_target = readEstimatedTarget(k);
+        }
+        if (!have_target) {
             if (target_mode_ == "mocap") {
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                     "[TargetPublisher] Waiting for '%s' in /rigid_bodies ...",
@@ -365,7 +478,12 @@ private:
         // Record target quaternion for relative odom computations below.
         last_target_quat_ = k.q;
 
-        odom_pub_->publish(odom);
+        // Ground truth owns /target/odom unless the synthesized estimate does.
+        if (!synthesize_from_estimate_) {
+            odom_pub_->publish(odom);
+        } else if (publish_gt_debug_) {
+            gt_odom_pub_->publish(odom);
+        }
 
         // ── AccelStamped message ─────────────────────────────────────────────
         geometry_msgs::msg::AccelStamped accel;
@@ -374,12 +492,16 @@ private:
         accel.accel.linear.x  = k.ax;
         accel.accel.linear.y  = k.ay;
         accel.accel.linear.z  = k.az;
-        
+
         accel.accel.angular.x = k.alfx;
         accel.accel.angular.y = k.alfy;
         accel.accel.angular.z = k.alfz;
 
-        accel_pub_->publish(accel);
+        if (!synthesize_from_estimate_) {
+            accel_pub_->publish(accel);
+        } else if (publish_gt_debug_) {
+            gt_accel_pub_->publish(accel);
+        }
 
         // ── Relative odometry outputs ───────────────────────────────────────
         nav_msgs::msg::Odometry drone_odom_copy;
@@ -395,6 +517,47 @@ private:
             }
             if (have_drone_pose) {
                 drone_pose_copy = last_drone_pose_;
+            }
+        }
+
+        // Stage 1 — simulated body-frame relative measurement of the target.
+        // Uses the drone odom's own attitude (not drone_pose_topic) so stage 1
+        // and stage 2 always rotate with the same source.
+        if (sim_relative_estimate_) {
+            if (!have_drone_odom) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "[TargetPublisher] sim_relative_estimate: waiting for drone odom on '%s'",
+                    drone_odom_topic_.c_str());
+            } else if (odomAgeSec(drone_odom_copy, stamp) > kDroneOdomMaxAgeSec) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "[TargetPublisher] sim_relative_estimate: drone odom stale (%.2f s)",
+                    odomAgeSec(drone_odom_copy, stamp));
+            } else {
+                const Eigen::Matrix3d R = droneRotation(drone_odom_copy);
+                const Eigen::Vector3d p_d(drone_odom_copy.pose.pose.position.x,
+                                          drone_odom_copy.pose.pose.position.y,
+                                          drone_odom_copy.pose.pose.position.z);
+                const Eigen::Vector3d v_d = droneWorldVelocity(drone_odom_copy, R);
+                const Eigen::Vector3d p_t(k.px, k.py, k.pz);
+                const Eigen::Vector3d v_t(k.vx, k.vy, k.vz);
+                // Pure frame projection (no omega x r): matches de-rotated camera
+                // measurements and inverts exactly in stage 2.
+                const Eigen::Vector3d p_rel_b = R.transpose() * (p_t - p_d);
+                const Eigen::Vector3d v_rel_b = R.transpose() * (v_t - v_d);
+
+                nav_msgs::msg::Odometry est;
+                est.header.stamp    = stamp;
+                est.header.frame_id = "drone_body";
+                est.child_frame_id  = "target_in_drone_body";
+                est.pose.pose.position.x = p_rel_b.x();
+                est.pose.pose.position.y = p_rel_b.y();
+                est.pose.pose.position.z = p_rel_b.z();
+                est.pose.pose.orientation.w = 1.0;
+                est.pose.covariance[21] = -1.0;   // orientation unmeasured
+                est.twist.twist.linear.x = v_rel_b.x();
+                est.twist.twist.linear.y = v_rel_b.y();
+                est.twist.twist.linear.z = v_rel_b.z();
+                rel_estimate_pub_->publish(est);
             }
         }
 
@@ -579,6 +742,172 @@ private:
         return true;
     }
 
+    bool loadTraceCsv(const std::string& path)
+    {
+        if (path.empty()) {
+            RCLCPP_ERROR(get_logger(),
+                "[TargetPublisher] trace_csv_path is empty for trace_replay mode.");
+            return false;
+        }
+        std::ifstream ifs(path);
+        if (!ifs.is_open()) {
+            RCLCPP_ERROR(get_logger(),
+                "[TargetPublisher] Failed to open trace CSV: %s",
+                path.c_str());
+            return false;
+        }
+
+        trace_samples_.clear();
+        std::string line;
+        std::size_t line_no = 0;
+        while (std::getline(ifs, line)) {
+            ++line_no;
+            if (line.empty()) {
+                continue;
+            }
+            if (line_no == 1 &&
+                std::isalpha(static_cast<unsigned char>(line.front())) != 0) {
+                continue;  // header
+            }
+
+            std::stringstream ss(line);
+            std::array<double, 10> vals{};
+            std::string token;
+            for (std::size_t i = 0; i < vals.size(); ++i) {
+                if (!std::getline(ss, token, ',')) {
+                    RCLCPP_ERROR(get_logger(),
+                        "[TargetPublisher] Malformed trace CSV row %zu (expected 10 columns).",
+                        line_no);
+                    return false;
+                }
+                try {
+                    vals[i] = std::stod(token);
+                } catch (const std::exception&) {
+                    RCLCPP_ERROR(get_logger(),
+                        "[TargetPublisher] Invalid numeric value at row %zu.",
+                        line_no);
+                    return false;
+                }
+            }
+
+            TraceSample s;
+            s.t = vals[0];
+            s.p = Eigen::Vector3d(vals[1], vals[2], vals[3]);
+            s.v = Eigen::Vector3d(vals[4], vals[5], vals[6]);
+            s.a = Eigen::Vector3d(vals[7], vals[8], vals[9]);
+            trace_samples_.push_back(s);
+        }
+
+        if (trace_samples_.empty()) {
+            RCLCPP_ERROR(get_logger(),
+                "[TargetPublisher] Trace CSV has no samples: %s",
+                path.c_str());
+            return false;
+        }
+
+        std::sort(trace_samples_.begin(), trace_samples_.end(),
+                  [](const TraceSample& a, const TraceSample& b) { return a.t < b.t; });
+        const double t0 = trace_samples_.front().t;
+        for (auto& s : trace_samples_) {
+            s.t -= t0;
+        }
+        trace_pos_shift_.setZero();
+        trace_vel_shift_.setZero();
+        if (trace_shifted_world_) {
+            trace_pos_shift_ = -trace_samples_.front().p;
+            trace_vel_shift_ = -trace_samples_.front().v;
+        }
+        trace_pos_shift_.x() += trace_offset_x_;
+        trace_pos_shift_.y() += trace_offset_y_;
+        trace_pos_shift_.z() += trace_offset_z_;
+        trace_duration_s_ = trace_samples_.back().t;
+        return true;
+    }
+
+    bool fillKinematicsFromTraceSample(const TraceSample& s, Kinematics& k)
+    {
+        k.px = s.p.x(); k.py = s.p.y(); k.pz = s.p.z();
+        k.vx = s.v.x(); k.vy = s.v.y(); k.vz = s.v.z();
+        k.ax = s.a.x(); k.ay = s.a.y(); k.az = s.a.z();
+        k.px += trace_pos_shift_.x();
+        k.py += trace_pos_shift_.y();
+        k.pz += trace_pos_shift_.z();
+        k.vx += trace_vel_shift_.x();
+        k.vy += trace_vel_shift_.y();
+        k.vz += trace_vel_shift_.z();
+
+        k.wx = 0.0;
+        k.wy = 0.0;
+        k.alfx = 0.0;
+        k.alfy = 0.0;
+        k.alfz = 0.0;
+
+        const double vxy2 = k.vx * k.vx + k.vy * k.vy;
+        if (vxy2 > 1e-8) {
+            trace_last_yaw_ = std::atan2(k.vy, k.vx);
+            trace_yaw_initialized_ = true;
+            k.wz = (k.vx * k.ay - k.vy * k.ax) / vxy2;
+        } else {
+            if (!trace_yaw_initialized_) {
+                trace_last_yaw_ = 0.0;
+                trace_yaw_initialized_ = true;
+            }
+            k.wz = 0.0;
+        }
+        k.q = Eigen::Quaterniond(
+            std::cos(trace_last_yaw_ / 2.0), 0.0, 0.0, std::sin(trace_last_yaw_ / 2.0));
+        return true;
+    }
+
+    bool sampleTrace(double t_in, Kinematics& k)
+    {
+        if (trace_samples_.empty()) {
+            return false;
+        }
+        if (trace_duration_s_ <= 1e-9) {
+            return fillKinematicsFromTraceSample(trace_samples_.front(), k);
+        }
+
+        double t = t_in;
+        if (t < 0.0) {
+            t = 0.0;
+        }
+        if (t > trace_duration_s_) {
+            if (trace_loop_) {
+                t = std::fmod(t, trace_duration_s_);
+                if (t < 0.0) {
+                    t += trace_duration_s_;
+                }
+            } else if (trace_hold_last_) {
+                return fillKinematicsFromTraceSample(trace_samples_.back(), k);
+            } else {
+                return false;
+            }
+        }
+
+        const auto it = std::lower_bound(
+            trace_samples_.begin(), trace_samples_.end(), t,
+            [](const TraceSample& s, double value) { return s.t < value; });
+        if (it == trace_samples_.begin()) {
+            return fillKinematicsFromTraceSample(*it, k);
+        }
+        if (it == trace_samples_.end()) {
+            return fillKinematicsFromTraceSample(trace_samples_.back(), k);
+        }
+
+        const TraceSample& b = *it;
+        const TraceSample& a = *(it - 1);
+        const double dt = b.t - a.t;
+        const double alpha = (dt > 1e-9) ? ((t - a.t) / dt) : 0.0;
+
+        TraceSample s;
+        s.t = t;
+        s.p = (1.0 - alpha) * a.p + alpha * b.p;
+        s.v = (1.0 - alpha) * a.v + alpha * b.v;
+        s.a = (1.0 - alpha) * a.a + alpha * b.a;
+        return fillKinematicsFromTraceSample(s, k);
+    }
+
     Kinematics syntheticTargetTruth(double t) const
     {
         const double t_rel = t - t0_;
@@ -668,6 +997,20 @@ private:
     double target_yaw_rate_;
     double publish_hz_;
     std::string frame_id_;
+    std::string trace_csv_path_;
+    bool trace_loop_ = false;
+    bool trace_hold_last_ = true;
+    double trace_time_scale_ = 1.0;
+    bool trace_shifted_world_ = false;
+    double trace_offset_x_ = 0.0;
+    double trace_offset_y_ = 0.0;
+    double trace_offset_z_ = 0.0;
+    std::vector<TraceSample> trace_samples_;
+    double trace_duration_s_ = 0.0;
+    Eigen::Vector3d trace_pos_shift_ = Eigen::Vector3d::Zero();
+    Eigen::Vector3d trace_vel_shift_ = Eigen::Vector3d::Zero();
+    double trace_last_yaw_ = 0.0;
+    bool trace_yaw_initialized_ = false;
     target_models::CircularTarget circle_model_;  // circle model defaults live in circular_target.hpp
     target_models::Figure8Target figure8_model_;  // figure-8 model defaults live in figure8_target.hpp
     double t0_ = 0.0;  // wall-clock time at startup, for relative time in model source
@@ -680,7 +1023,110 @@ private:
     std::string body_relative_angular_unit_ = "deg_s";
     Eigen::Quaterniond last_target_quat_ = Eigen::Quaterniond::Identity();
 
+    // ── Simulated relative sensing ─────────────────────────────────────────
+    std::string target_source_ = "ground_truth";
+    bool        synthesize_from_estimate_ = false;
+    bool        sim_relative_estimate_ = false;
+    double      pad_z_ = 0.0;
+    std::string relative_estimate_topic_;
+    bool        publish_gt_debug_ = true;
+    std::string drone_odom_twist_frame_ = "body";
+    static constexpr double kDroneOdomMaxAgeSec = 0.5;
+
+    /// Stage 2 — synthesize a world-frame target from a body-frame relative
+    /// estimate. Exact inverse of stage 1 in x/y; z is pinned to pad_z.
+    void relativeEstimateCallback(const nav_msgs::msg::Odometry::SharedPtr est) {
+        rclcpp::Time stamp(est->header.stamp);
+        if (stamp.nanoseconds() == 0) stamp = now();
+
+        nav_msgs::msg::Odometry drone_odom_copy;
+        {
+            std::lock_guard<std::mutex> lk(drone_mutex_);
+            if (!has_drone_odom_) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "[TargetPublisher] relative_estimate: waiting for drone odom on '%s'",
+                    drone_odom_topic_.c_str());
+                return;
+            }
+            drone_odom_copy = last_drone_odom_;
+        }
+        const double age = odomAgeSec(drone_odom_copy, stamp);
+        if (age > kDroneOdomMaxAgeSec) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                "[TargetPublisher] relative_estimate: drone odom stale (%.2f s), skipping", age);
+            return;
+        }
+
+        const Eigen::Matrix3d R = droneRotation(drone_odom_copy);
+        const Eigen::Vector3d p_d(drone_odom_copy.pose.pose.position.x,
+                                  drone_odom_copy.pose.pose.position.y,
+                                  drone_odom_copy.pose.pose.position.z);
+        const Eigen::Vector3d v_d = droneWorldVelocity(drone_odom_copy, R);
+        const Eigen::Vector3d p_rel_b(est->pose.pose.position.x,
+                                      est->pose.pose.position.y,
+                                      est->pose.pose.position.z);
+        const Eigen::Vector3d v_rel_b(est->twist.twist.linear.x,
+                                      est->twist.twist.linear.y,
+                                      est->twist.twist.linear.z);
+        // Rotate all three components before overriding z, otherwise a tilted
+        // drone corrupts the world x/y.
+        Eigen::Vector3d p_t = p_d + R * p_rel_b;
+        Eigen::Vector3d v_t = v_d + R * v_rel_b;
+        p_t.z() = pad_z_;
+        v_t.z() = 0.0;
+
+        nav_msgs::msg::Odometry odom;
+        odom.header.stamp    = stamp;
+        odom.header.frame_id = frame_id_;
+        odom.child_frame_id  = "target";
+        odom.pose.pose.position.x = p_t.x();
+        odom.pose.pose.position.y = p_t.y();
+        odom.pose.pose.position.z = p_t.z();
+        odom.pose.pose.orientation.w = 1.0;  // target yaw not part of this contract
+        odom.twist.twist.linear.x = v_t.x();
+        odom.twist.twist.linear.y = v_t.y();
+        odom.twist.twist.linear.z = v_t.z();
+        odom_pub_->publish(odom);
+
+        // The tracker's freshness gate needs odom AND accel; the relative
+        // estimate carries no acceleration, so publish zeros at the same stamp.
+        geometry_msgs::msg::AccelStamped accel;
+        accel.header.stamp    = stamp;
+        accel.header.frame_id = frame_id_;
+        accel_pub_->publish(accel);
+    }
+
+    static double odomAgeSec(const nav_msgs::msg::Odometry& odom, const rclcpp::Time& ref) {
+        const rclcpp::Time t(odom.header.stamp);
+        if (t.nanoseconds() == 0) return 0.0;
+        if (t.get_clock_type() != ref.get_clock_type()) return 0.0;
+        return (ref - t).seconds();
+    }
+
+    static Eigen::Matrix3d droneRotation(const nav_msgs::msg::Odometry& odom) {
+        Eigen::Quaterniond q(odom.pose.pose.orientation.w, odom.pose.pose.orientation.x,
+                             odom.pose.pose.orientation.y, odom.pose.pose.orientation.z);
+        if (q.norm() < 1e-9) return Eigen::Matrix3d::Identity();
+        q.normalize();
+        return q.toRotationMatrix();
+    }
+
+    /// The drone odom twist is body-frame when child_frame_id is base_link (the
+    /// MAVROS/PX4 convention). Both stages use this helper, so the round trip is
+    /// exact regardless of the setting.
+    Eigen::Vector3d droneWorldVelocity(const nav_msgs::msg::Odometry& odom,
+                                       const Eigen::Matrix3d& R) const {
+        const Eigen::Vector3d twist(odom.twist.twist.linear.x,
+                                    odom.twist.twist.linear.y,
+                                    odom.twist.twist.linear.z);
+        return (drone_odom_twist_frame_ == "world") ? twist : (R * twist);
+    }
+
     // ── ROS handles ────────────────────────────────────────────────────────
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          gt_odom_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::AccelStamped>::SharedPtr gt_accel_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          rel_estimate_pub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr       rel_estimate_sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          odom_pub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          abs_rel_odom_pub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr          body_rel_odom_pub_;
