@@ -61,6 +61,10 @@ ros2 run comando_planner target_publisher --ros-args \
 
 ## CrazySim SITL (validated stc_landing_noaug landing, 2026-07-22)
 
+Canonical procedure with pass criteria and failure catalogue:
+**`docs/CRAZYSIM_SITL.md`**. Baseline run (17/17 accepts) archived at
+`logs/crazysim_stc_landing_noaug_baseline/`. Summary below.
+
 CrazySim lives at `../../../CrazySim` (firmware SITL prebuilt in
 `crazyflie-firmware/sitl_make/build/cf2`). Full sequence:
 
@@ -200,6 +204,7 @@ Primary docs:
 | File | Purpose |
 | --- | --- |
 | `README.md` | Quick start, OCP catalog, workflows |
+| `docs/CRAZYSIM_SITL.md` | CrazySim SITL bring-up + validated landing baseline (pass criteria, failure catalogue) |
 | `docs/COMANDO_PLANNER_INTERFACE.md` | Full ROS topics, parameters, registry, logging |
 | `docs/dynamic_target_hardware_integration.md` | External target estimator/predictor contract |
 | `docs/CoManDO_planner/` | Chapter-style architecture notes |
