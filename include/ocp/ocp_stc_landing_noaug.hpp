@@ -947,6 +947,9 @@ inline Param getSolverParams() {
     p.rho_mul  = envOrQ("SZMUK_RHO_MUL", 10.0);
     p.tolerance = envOrQ("SZMUK_TOL", 1e-6);
     p.max_iter  = envOrInt("SZMUK_MAX_ITER", 180);
+    // Console I/O perturbs solve timing in the real-time SITL/hardware loop.
+    // Opt back into the solver's iteration table when diagnosing convergence.
+    p.verbose = envOrInt("SZMUK_SOLVER_VERBOSE", 0) != 0;
     p.is_quaternion_in_state = false;
     p.use_ddp_terms = false;
     return p;
