@@ -7,6 +7,57 @@ circling target — **17/17 solves accepted, 0 rejected**, lateral error
 counterpart of the ROS 1 guide `docs/MAVROS_SITL.md` and its
 `logs/stc_landing_noaug_sitl_circle` reference run (13/13).
 
+Written to be executable by a human across five terminals **or by an agent
+from a single shell** — if you are an agent, read
+[Agent runbook (single shell)](#agent-runbook-single-shell) first and use the
+five-terminal section as the reference for what each stage means.
+
+## Agent runbook (single shell)
+
+Rules that make this work unattended; each was learned from an actual failure:
+
+1. **Shell**: run every ROS 2 command inside `bash -lc '...'` (interactive
+   shells here may be zsh, where `setup.bash` fails with
+   `no such file: .../setup.sh`). If you use `set -u`, wrap the two `source`
+   lines in `set +u` … `set -u` — ROS setup scripts are not nounset-clean.
+2. **One environment prelude** in every shell you spawn:
+   `export ROS_DOMAIN_ID=77; source /opt/ros/humble/setup.bash; source /home/lab/projects/cf/online/ros_ws/install/setup.bash`.
+3. **Background each stage, redirect its output to a log file you keep**, and
+   gate on a readiness condition — never on sleep alone:
+   - CrazySim ready: `pgrep -x cf2` returns a pid (≤30 s).
+   - crazyswarm2 ready: `/cf_1/pose` in `ros2 topic list` (≤40 s).
+   - planner ready: `comando_planner` in `ros2 node list` (≤30 s).
+   - target ready: `/target/odom` **and** `/target/accel` present (≤20 s).
+4. **Trigger with explicit param sets, not `ocp_launch.py`.** Its sequential
+   `ros2 param set` subprocesses can partially fail under slow DDS, bumping
+   `command_seq` while `ocp_type` is still empty — the planner then aborts
+   (`Unknown OCP type:`). Do instead:
+   ```bash
+   ros2 param set /comando_planner ocp_type stc_landing_noaug
+   ros2 param set /comando_planner mode mpc
+   ros2 param set /comando_planner n_replay 4
+   # VERIFY before bumping — refuse to trigger otherwise:
+   ros2 param get /comando_planner ocp_type      # must print stc_landing_noaug
+   ros2 param set /comando_planner command_seq 1 # strictly increasing per session
+   ```
+5. **Watch the descent ~24 s**, polling
+   `ros2 topic echo --once --field pose.position.z /cf_1/pose` (note: `--once`,
+   not `-n1`), and each poll also check the planner is still alive
+   (`pgrep -f "comando_planner --ros-args"`) — it dies silently on OOM.
+6. **Evaluate the pass criteria table below from the planner log/CSVs** before
+   claiming success. "The drone is on the floor" is NOT success — a run with
+   1 accept / 64 rejects also ends on the floor (open-loop ride +
+   uncommanded descent).
+7. **Clean up on every exit path**, including failure: kill `cf2`, the
+   CrazySim `gz sim` (`pgrep -f crazysim_default`), `crazyflie_server`,
+   `comando_planner`, `target_publisher`, **and their `ros2 launch` parents**
+   (they respawn children). Verify with
+   `pgrep -af "crazysim_default|comando_planner|crazyflie_server|cf2$"`.
+   Never kill other `gz sim` instances (e.g. a PX4 session may be running).
+8. On failure, jump to the [failure catalogue](#failure-catalogue-each-observed-each-individually-fatal)
+   — every known symptom is listed with its cause; do not re-tune the OCP
+   before checking it.
+
 ## Prerequisites
 
 | Component | Location | Notes |
@@ -140,6 +191,7 @@ counts are the test — not whether the drone ends up on the floor.
 | positioning via hover OCP | solves rejected / drone never moves; use arm→takeoff→go_to |
 | missing `SZMUK_*` env (launch defaults removed) | activation stalls, constraint 30–60, "Outer Max/Min" forever |
 | flat ROS 1 profile YAML via `ros2 param load` | silent no-op; `command_seq` stays 0; "the OCP is not starting" |
+| `ocp_launch.py` under slow DDS (automation) | partial param application — `command_seq` bumped with `ocp_type` empty → planner aborts `Unknown OCP type:`. Fine interactively; agents use explicit verified param sets (runbook rule 4). |
 | staging below the relative floor (e.g. world 1.8 with `Z_STAGE=1.8` rel) | activation rejected `constraint_error` ~58; raise staging or use the launch-arg floors |
 | MAVROS horizon tuning `THH=0.16` on CF | re-breaks n_replay=4 (4·0.16=0.64 s shift vs 0.23 s lead → 1 accept/91 reject). THH/RH_N are per-platform; CF stays on compiled defaults. |
 
