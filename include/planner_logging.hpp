@@ -67,6 +67,14 @@ struct SolverEventLogRow {
 
 class CsvLogger {
 public:
+    /// Set the directory run folders are created under. Call before
+    /// initialize(). Ported from ros1-noetic: without it the run folder is
+    /// created relative to the launch cwd, so flights leave no findable CSVs.
+    void setLogRoot(const std::string& dir) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!dir.empty()) log_root_ = dir;
+    }
+
     /// Initialize logger.
     /// @param state_names     Column names for raw OCP state vector (from descriptor().state_names)
     /// @param control_names   Column names for raw OCP control vector (from descriptor().control_names)
@@ -100,7 +108,7 @@ public:
         auto t = std::chrono::system_clock::to_time_t(now);
         std::stringstream ts;
         ts << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S");
-        std::string folder = "./logs/" + drone_name + "_" + ocp_type + "_" +
+        std::string folder = log_root_ + "/" + drone_name + "_" + ocp_type + "_" +
                              mode + "_" + solver_type + "_" + ts.str();
         std::filesystem::create_directories(folder);
         log_folder_ = folder;
@@ -317,6 +325,8 @@ private:
     }
 
     mutable std::mutex mutex_;
+
+    std::string log_root_ = "./logs";
     bool initialized_ = false;
     double mass_kg_ = 0.0282;
     int state_dim_ = 13;

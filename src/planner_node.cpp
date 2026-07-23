@@ -58,6 +58,17 @@ public:
         hover_thrust_param_ = float(this->get_parameter("hover_thrust").as_double());
         this->declare_parameter("skip_trajectory_validation", false);
         skip_trajectory_validation_ = this->get_parameter("skip_trajectory_validation").as_bool();
+        // Solve-acceptance gate. Was hardcoded here while planner_node.cpp on
+        // ros1-noetic read it as a parameter — the two branches must expose the
+        // SAME knobs or a ROS 2 run silently differs from the validated ROS 1
+        // one (that class of gap is what made the first CrazySim runs fail).
+        // Do not weaken it to "make it fly"; fix the engagement geometry.
+        this->declare_parameter("max_constraint_error", max_constraint_error_);
+        max_constraint_error_ = this->get_parameter("max_constraint_error").as_double();
+        // log_dir: without it the run folders land wherever the launch cwd is
+        // instead of the package logs/ dir, so flights produce no findable CSVs.
+        this->declare_parameter("log_dir", std::string{});
+        logger_.setLogRoot(this->get_parameter("log_dir").as_string());
         this->declare_parameter("max_first_solve_age_sec", 1.0);
         max_first_solve_age_sec_ = this->get_parameter("max_first_solve_age_sec").as_double();
         this->declare_parameter("max_relative_position_norm", 10.0);

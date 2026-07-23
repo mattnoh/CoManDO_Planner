@@ -53,6 +53,16 @@ def generate_launch_description():
         # staging geometry.
         DeclareLaunchArgument('stc_z_stage', default_value='1.4'),
         DeclareLaunchArgument('stc_los_alt_trig', default_value='1.2'),
+
+        # RH solve shaping (SZMUK_RH_N / MAX_ITER / THH / W_LAND_GS) is NOT a
+        # default here: THH=0.16 from the MAVROS horizon-tuned config inflates
+        # the per-node dt so the n_replay=4 warm-start shift (~0.64 s) outruns
+        # the ~0.23 s solve lead and re-breaks the CF replan loop (1/91). CF
+        # runs on the compiled defaults; MAVROS tuning is exported by hand.
+
+        # Solve-acceptance gate + log root — were ROS 1-only parameters.
+        DeclareLaunchArgument('max_constraint_error', default_value='1.0'),
+        DeclareLaunchArgument('log_dir', default_value=''),
     ]
 
     node = Node(
@@ -66,6 +76,8 @@ def generate_launch_description():
         },
         parameters=[{
             'drone_name': LaunchConfiguration('drone_name'),
+            'max_constraint_error': LaunchConfiguration('max_constraint_error'),
+            'log_dir': LaunchConfiguration('log_dir'),
             'platform': LaunchConfiguration('platform'),
             'solver': LaunchConfiguration('solver'),
             'enable_logging': LaunchConfiguration('enable_logging'),
