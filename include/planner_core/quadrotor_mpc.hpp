@@ -6,6 +6,7 @@
 #include <chrono>
 #include <string>
 #include <any>
+#include <algorithm>
 
 #include "optimal_control_problem.h"
 #include "alipddp/alipddp.h"
@@ -72,6 +73,7 @@ public:
     WarmStartSnapshot snapshotWarmStart() const;
     void restoreWarmStart(const WarmStartSnapshot& snapshot);
     void keepLatestAsUnexecutedWarmStart();
+    void setNextWarmStartShift(int shift) { next_warm_start_shift_ = std::max(0, shift); }
 
 private:
     void setupProblem(const OCPCreateArgs& args);
@@ -90,4 +92,5 @@ private:
     std::vector<Eigen::MatrixXd> prev_K_;
     Eigen::Vector3d              target_accel_ = Eigen::Vector3d::Zero();
     bool                         next_warm_start_unshifted_ = false;
+    int                          next_warm_start_shift_ = -1;
 };

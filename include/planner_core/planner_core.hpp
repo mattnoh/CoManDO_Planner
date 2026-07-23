@@ -97,6 +97,9 @@ public:
         x0 = selectInitialState(x0, input.target_snapshot, handoff,
                                 &out.handoff_pos_err, &out.handoff_vel_err,
                                 out.x0_source, out);
+        if (!handoff.first_plan && handoff.warm_start_shift > 0) {
+            mpc_->setNextWarmStartShift(handoff.warm_start_shift);
+        }
 
         const bool apply_registry_transform = (desc_.transform_state != nullptr);
         const double pos_err = apply_registry_transform && x0.size() >= 3
@@ -412,6 +415,7 @@ private:
         double active_elapsed_now = 0.0;
         double activation_elapsed = 0.0;
         double solve_lead_sec = 0.0;
+        int warm_start_shift = 0;
         Clock::time_point active_origin{};
         Clock::time_point activation_time{};
     };
@@ -477,8 +481,26 @@ private:
 
         handoff.active_origin = replayer_.activePlanOriginTime();
         handoff.active_elapsed_now = replayer_.activeElapsedAt(input.now);
-        handoff.activation_elapsed = last_replan_delay_sec_;
         handoff.solve_lead_sec = solveLeadSec();
+        // A short replay interval can be smaller than the solve latency
+        // (notably n_replay=1 for the variable-DT landing OCP).  Scheduling
+        // every successor at origin + replay_delay then leaves its origin in
+        // the past; repeating that choice makes active-plan age accumulate
+        // without bound and the predicted handoff x0 drifts away from the
+        // vehicle.  Always choose a still-future activation.  The replay
+        // delay remains the minimum amount of the active plan that must be
+        // consumed, while solve_lead reserves enough wall time for this solve.
+        const double earliest_activation = std::max(
+            last_replan_delay_sec_,
+            handoff.active_elapsed_now + handoff.solve_lead_sec);
+        handoff.activation_elapsed = earliest_activation;
+        // The warm start is shifted by whole trajectory nodes.  Activating an
+        // interpolated fraction of a variable-DT node while seeding from a
+        // different node creates an initial dynamics defect that compounds
+        // across replans. Snap the handoff to the same future node boundary.
+        (void)replayer_.activeNodeAtOrAfter(
+            earliest_activation, config_.ocp_dt,
+            &handoff.warm_start_shift, &handoff.activation_elapsed);
         handoff.activation_time =
             handoff.active_origin + std::chrono::duration_cast<Clock::duration>(
                 std::chrono::duration<double>(handoff.activation_elapsed));
@@ -489,21 +511,10 @@ private:
             std::chrono::duration<double>(handoff.activation_time.time_since_epoch()).count();
         out.solve_lead_sec = handoff.solve_lead_sec;
 
-        const double solve_start_elapsed =
-            std::max(0.0, handoff.activation_elapsed - handoff.solve_lead_sec);
-        if (handoff.active_elapsed_now + 1e-6 < solve_start_elapsed) {
-            reject(out, "waiting_for_handoff_time", "Active plan has not reached solve lead window");
-            if (!out.diagnostics.empty()) {
-                out.diagnostics.back().values = {
-                    {"active_elapsed_now", handoff.active_elapsed_now},
-                    {"activation_elapsed", handoff.activation_elapsed},
-                    {"activation_wall_time_sec", out.activation_wall_time_sec},
-                    {"solve_lead_sec", handoff.solve_lead_sec},
-                    {"solve_start_elapsed", solve_start_elapsed},
-                };
-            }
-            return false;
-        }
+        // Solve now. The replayer holds the result until activation_time.
+        // Waiting for activation-lead here is unstable without persisting the
+        // chosen boundary: every timer poll advances `active_elapsed_now`,
+        // selects the following node, and chases the boundary to horizon end.
         return true;
     }
 

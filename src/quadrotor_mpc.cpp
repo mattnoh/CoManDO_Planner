@@ -34,6 +34,7 @@ void QuadrotorMPC::restoreWarmStart(const WarmStartSnapshot& snapshot) {
     prev_K_ = snapshot.prev_K;
     last_solve_ms_ = snapshot.last_solve_ms;
     next_warm_start_unshifted_ = false;
+    next_warm_start_shift_ = -1;
 }
 
 void QuadrotorMPC::keepLatestAsUnexecutedWarmStart() {
@@ -138,7 +139,8 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
 
         if (!prev_U_.empty()) {
             auto desc = OCPRegistry::getDescriptor(config_.ocp_type);
-            const int warm_shift = next_warm_start_unshifted_ ? 0 : config_.n_shift;
+            const int warm_shift = next_warm_start_unshifted_ ? 0 :
+                (next_warm_start_shift_ >= 0 ? next_warm_start_shift_ : config_.n_shift);
             if (desc.warm_start == OCPDescriptor::WarmStart::Feedback) {
                 warm_u = makeUwarm(warm_shift);
                 warm_x = makeXshifted(warm_shift);
@@ -211,6 +213,7 @@ QuadrotorMPC::Result QuadrotorMPC::solve(const Eigen::VectorXd& current_state,
             prev_U_ = U_result;
             prev_K_ = K_result;
             next_warm_start_unshifted_ = false;
+            next_warm_start_shift_ = -1;
 
             std::cout << "[MPC] solve " << result.solve_time_ms
                       << "ms iters=" << result.solve_iters

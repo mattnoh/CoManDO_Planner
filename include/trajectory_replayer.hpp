@@ -152,6 +152,26 @@ public:
         return out->has_plan;
     }
 
+    /// Return the first active-trajectory node at or after `elapsed`.
+    /// Handoffs scheduled on this boundary can use the same integer shift for
+    /// both the predicted x0 and the solver warm start.
+    bool activeNodeAtOrAfter(double elapsed, double ocp_dt,
+                             int* node_index, double* node_time) const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (state_trajectory_.size() < 2) return false;
+        const int N = static_cast<int>(state_trajectory_.size()) - 1;
+        for (int k = 1; k <= N; ++k) {
+            const double tk =
+                nodeTimeFrom(state_trajectory_, has_variable_dt_, state_dim_, k, ocp_dt);
+            if (tk + 1e-9 >= elapsed) {
+                if (node_index) *node_index = k;
+                if (node_time) *node_time = tk;
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Sample the active trajectory at the current wall-clock time.
     /// Returns an interpolated setpoint between the bracketing nodes.
     ReplaySample sample(const std::chrono::steady_clock::time_point& now,

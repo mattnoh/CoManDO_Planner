@@ -102,7 +102,9 @@ def auto_trim_window(bag_path: Path):
         return None, None
     t_start = t_ocp if t_ocp is not None else t_sp0
     t0 = max(0.0, t_start - t_odom0 - 1.0) if t_start is not None else None
-    t1 = disarm_t - t_odom0 + 0.5 if disarm_t is not None else None
+    # Stop exactly when PX4 reports armed=false.  The old +0.5 s padding
+    # included post-flight estimator motion in the state figures.
+    t1 = disarm_t - t_odom0 if disarm_t is not None else None
     return t0, t1
 
 

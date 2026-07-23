@@ -239,7 +239,6 @@ private:
 
             resetForNewCommand();
             command_paused_.store(true);
-            last_command_seq_ = 0;
 
             ROS_INFO("Profile applied: ocp=%s mode=%s n_replay=%d target=[%.3f,%.3f,%.3f]",
                 ocp_type_.c_str(), mode_.c_str(), n_replay_,

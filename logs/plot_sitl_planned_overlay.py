@@ -213,7 +213,8 @@ def plot_overlay(args):
 
     handles = [
         Line2D([0], [0], color=EXECUTED, linewidth=2.2, label="Executed (SITL)"),
-        Line2D([0], [0], color=PLANNED, linewidth=1.5, label="Planned horizons"),
+        Line2D([0], [0], color=PLANNED, linewidth=1.5,
+               label="Full MPC predictions (first segment executed)"),
         Line2D([0], [0], color=TARGET, linewidth=1.25, linestyle="--", label="Target path"),
         Line2D([0], [0], marker="s", color="none", markerfacecolor=TARGET,
                markeredgecolor=TARGET, markersize=5, label="Target at touchdown"),

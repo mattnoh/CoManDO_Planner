@@ -7,15 +7,11 @@
 # Loaded into the comando_planner private namespace by scripts/apply_profile.sh.
 ocp_type: stc_landing_noaug
 mode: mpc
-# n_replay MUST be stated explicitly (params are sticky, and the descriptor
-# default NEX=7 is WRONG for the live loop). The warm start is shifted
-# n_replay nodes (~0.12 s each) while x0 is predicted only solve_lead (~0.3 s)
-# ahead; at 7 that is a ~0.6 s mismatch, the initial defect explodes
-# (constraint ~5e5) and the solver bails at 27 iters, so every replan is
-# rejected. The validated runs here worked at 4 only because
-# profile_hover_sitl.yaml leaked n_replay: 4 through the sticky rosparam
-# server. Verify with replan_delay_sec / theta == n_replay in solver_events.csv.
-n_replay: 4
+# n_replay MUST be explicit because ROS params are sticky.  One-node replay
+# is used by the 5 Hz profile.  PlannerCore schedules activation from the
+# current active-plan age plus measured solve lead, so a solve longer than one
+# node cannot accumulate an expired plan origin.
+n_replay: 1
 # land_action: on terminal freeze (touchdown), stop the OCP and hand the stop
 # to PX4. force_disarm = immediate motor cut at the freeze latch (right choice
 # for moving platforms — verified ~1 s from touchdown to motors-off). Always

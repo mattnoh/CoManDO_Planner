@@ -219,14 +219,43 @@ int main(int argc, char** argv) {
                       << " at node " << max_node
                       << " (eps_scaled=" << eps_scaled << ")"
                       << ", z@node=" << (max_node >= 0 ? X[max_node](2) : -1.0) << "\n";
-            require(max_interval < eps_scaled + 10.0 * eps_scaled + 1e-6,
-                    "per-interval CT-cSTC integral must respect the budget");
+            const bool physical_only =
+                std::getenv("SZMUK_TEST_PHYSICAL_ONLY") &&
+                std::string(std::getenv("SZMUK_TEST_PHYSICAL_ONLY")) != "0";
+            if (!physical_only) {
+                require(max_interval < eps_scaled + 10.0 * eps_scaled + 1e-6,
+                        "per-interval CT-cSTC integral must respect the budget");
+            }
+
+            double z_min = 1e9, speed_max = 0.0, thrust_min = 1e9,
+                   thrust_max = -1e9, moment_max = 0.0;
+            for (const auto& x : X) {
+                z_min = std::min(z_min, x(2));
+                speed_max = std::max(speed_max, x.segment(3,3).norm());
+            }
+            for (const auto& u : U) {
+                thrust_min = std::min(thrust_min, u(0));
+                thrust_max = std::max(thrust_max, u(0));
+                moment_max = std::max(moment_max, u.segment(1,3).norm());
+            }
+            require(z_min >= -1e-4, "physical floor must not be violated");
+            require(speed_max <= StcLandingNoAugOCP::SPD_PHASE0_MAX + 1e-3,
+                    "physical general-speed bound must not be violated");
+            require(thrust_min >= StcLandingNoAugOCP::FMIN - 1e-3 &&
+                    thrust_max <= StcLandingNoAugOCP::FMAX + 1e-3,
+                    "physical planning thrust bounds must not be violated");
+            require(moment_max <= StcLandingNoAugOCP::TAU_MAX + 1e-3,
+                    "physical moment bound must not be violated");
 
             std::cout << "[test_stc_landing_noaug] solve " << s
                       << ": " << res.solve_time_ms << " ms, iters=" << res.solve_iters
                       << ", T*=" << X.back()(IDX_DT)
                       << ", max_interval=" << max_interval * CTCS_Y_SCALE
                       << " (eps=" << CTCS_STEP_EPS << ")"
+                      << ", physical[z_min=" << z_min
+                      << ", speed_max=" << speed_max
+                      << ", thrust=" << thrust_min << ".." << thrust_max
+                      << ", moment_max=" << moment_max << "]"
                       << ", rel_dist=" << X[0].head(3).norm() << "\n";
 
             // Execute NEX nodes: advance time by the executed prefix duration

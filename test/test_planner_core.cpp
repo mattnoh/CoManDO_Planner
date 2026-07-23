@@ -193,10 +193,8 @@ int main() {
             auto early = inputAt(t0 + std::chrono::milliseconds(150));
             planner_core::PlannerCoreStepResult early_out;
             planner_core::PlannerCore::HandoffSchedule early_handoff;
-            require(!core.prepareHandoffSchedule(early, early_out, early_handoff),
-                    "solve should wait until lead window");
-            require(early_out.rejection_reason == "waiting_for_handoff_time",
-                    "wrong early solve rejection reason");
+            require(core.prepareHandoffSchedule(early, early_out, early_handoff),
+                    "future handoff should solve immediately and wait as a pending plan");
 
             auto handoff = inputAt(t0 + std::chrono::milliseconds(180));
             planner_core::PlannerCoreStepResult out;
@@ -211,6 +209,47 @@ int main() {
                     "lead-window solve should use predicted handoff state");
             require(x0.size() > 0 && std::abs(x0(0) - 2.0) < 1e-6,
                     "predicted handoff did not sample active plan at activation elapsed");
+        }
+
+        {
+            // Regression: when solve latency is longer than one replay step,
+            // the next origin must remain in the future instead of advancing
+            // by an already-expired n_replay interval on every solve.
+            planner_core::PlannerCore core;
+            auto cfg = hoverConfig();
+            cfg.n_replay = 1;             // 0.1 s replay interval
+            cfg.solve_lead_guard_sec = 0.02;
+            core.configure(cfg);
+
+            auto first = solved(t0, 0.0);
+            first.solve_time_ms = 180.0;  // 0.20 s lead, longer than replay
+            core.acceptSolvedResult(inputAt(t0), state(0.0), first);
+
+            auto next_input = inputAt(t0 + std::chrono::milliseconds(10));
+            planner_core::PlannerCoreStepResult next_out;
+            planner_core::PlannerCore::HandoffSchedule next_schedule;
+            require(core.prepareHandoffSchedule(next_input, next_out, next_schedule),
+                    "long solve should start immediately when lead spans the replay interval");
+            require(next_schedule.activation_elapsed > next_schedule.active_elapsed_now,
+                    "handoff activation was scheduled in the past");
+            require(next_schedule.activation_elapsed >= 0.19,
+                    "handoff did not reserve the measured solve lead");
+
+            auto second = solved(t0 + std::chrono::milliseconds(200), 1.0);
+            second.solve_time_ms = 180.0;
+            auto accepted = core.acceptSolvedResult(
+                next_input, state(0.0), second, next_out);
+            require(accepted.solve_accepted, "long-latency successor should be accepted");
+            core.sampleReplay(t0 + std::chrono::milliseconds(210),
+                              next_input.target_snapshot);
+
+            auto third_input = inputAt(t0 + std::chrono::milliseconds(220));
+            planner_core::PlannerCoreStepResult third_out;
+            planner_core::PlannerCore::HandoffSchedule third_schedule;
+            core.prepareHandoffSchedule(third_input, third_out, third_schedule);
+            require(third_schedule.activation_elapsed >
+                        third_schedule.active_elapsed_now,
+                    "successive handoff reused an expired origin");
         }
 
         {

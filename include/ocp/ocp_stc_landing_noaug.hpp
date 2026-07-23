@@ -939,6 +939,7 @@ inline Eigen::VectorXd ensureNoAugStateSize(const Eigen::VectorXd& x) {
 // ── Solver params ─────────────────────────────────────────────────────────────
 inline Param getSolverParams() {
     Param p;
+    p.verbose   = envOrInt("SZMUK_SOLVER_VERBOSE", 0) != 0;
     p.reg1_min = 1e-3;
     p.reg2_min = envOrQ("SZMUK_REG2_MIN", 0.1);
     p.mu_mul   = 0.1;
