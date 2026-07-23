@@ -68,6 +68,17 @@
   <arg name="stc_z_stage"                       default="1.4"/>
   <arg name="stc_los_alt_trig"                  default="1.2"/>
 
+  <!-- RH solve shaping (SZMUK_RH_N / SZMUK_MAX_ITER / SZMUK_THH /
+       SZMUK_W_LAND_GS) is deliberately NOT a launch default. The 2026-07-23
+       horizon-tuned MAVROS config (RH_N=40, MAX_ITER=120, THH=0.16,
+       W_LAND_GS=20000; docs/MAVROS_SITL.md) improves the MAVROS glideslope,
+       but THH=0.16 inflates the per-node dt so the n_replay=4 warm-start
+       shift (~0.64 s) outruns the ~0.23 s solve lead and re-breaks the CF
+       replan loop (1 accept / 91 reject). Export those SZMUK_* by hand for a
+       MAVROS tuning run; leave them at compiled defaults for the shared,
+       CF-safe baseline. -->
+
+
   <node pkg="comando_planner" type="comando_planner" name="comando_planner" output="screen">
     <env name="SZMUK_Z_STAGE"      value="$(arg stc_z_stage)"/>
     <env name="SZMUK_LOS_ALT_TRIG" value="$(arg stc_los_alt_trig)"/>
