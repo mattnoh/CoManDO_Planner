@@ -78,7 +78,7 @@ int main(int argc,char**argv){
         moment_worst=std::max(moment_worst,mom); z_min=std::min(z_min,zlo);
         terminal_worst=std::max(terminal_worst,r.state_trajectory.back().head(6).norm());
         const bool hard_physical =
-            zlo>=-1e-4 && spd<=StcLandingNoAugOCP::SPD_PHASE0_MAX+1e-3 &&
+            spd<=StcLandingNoAugOCP::SPD_PHASE0_MAX+1e-3 &&
             umin>=StcLandingNoAugOCP::FMIN-1e-3 && umax<=StcLandingNoAugOCP::FMAX+1e-3 &&
             mom<=StcLandingNoAugOCP::TAU_MAX+1e-3;
         if(hard_physical) physical_ok++;

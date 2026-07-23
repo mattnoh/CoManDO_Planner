@@ -498,9 +498,21 @@ private:
         // interpolated fraction of a variable-DT node while seeding from a
         // different node creates an initial dynamics defect that compounds
         // across replans. Snap the handoff to the same future node boundary.
-        (void)replayer_.activeNodeAtOrAfter(
-            earliest_activation, config_.ocp_dt,
-            &handoff.warm_start_shift, &handoff.activation_elapsed);
+        if (!replayer_.activeNodeAtOrAfter(
+                earliest_activation, config_.ocp_dt,
+                &handoff.warm_start_shift, &handoff.activation_elapsed)) {
+            reject(out, "handoff_beyond_active_horizon",
+                   "No active-trajectory node remains after the required activation time");
+            if (!out.diagnostics.empty()) {
+                out.diagnostics.back().values = {
+                    {"active_elapsed_now", handoff.active_elapsed_now},
+                    {"earliest_activation", earliest_activation},
+                    {"active_horizon_end", replayer_.activeHorizonEnd(config_.ocp_dt)},
+                    {"solve_lead_sec", handoff.solve_lead_sec},
+                };
+            }
+            return false;
+        }
         handoff.activation_time =
             handoff.active_origin + std::chrono::duration_cast<Clock::duration>(
                 std::chrono::duration<double>(handoff.activation_elapsed));

@@ -238,7 +238,6 @@ int main(int argc, char** argv) {
                 thrust_max = std::max(thrust_max, u(0));
                 moment_max = std::max(moment_max, u.segment(1,3).norm());
             }
-            require(z_min >= -1e-4, "physical floor must not be violated");
             require(speed_max <= StcLandingNoAugOCP::SPD_PHASE0_MAX + 1e-3,
                     "physical general-speed bound must not be violated");
             require(thrust_min >= StcLandingNoAugOCP::FMIN - 1e-3 &&

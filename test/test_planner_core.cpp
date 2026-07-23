@@ -222,7 +222,7 @@ int main() {
             core.configure(cfg);
 
             auto first = solved(t0, 0.0);
-            first.solve_time_ms = 180.0;  // 0.20 s lead, longer than replay
+            first.solve_time_ms = 170.0;  // 0.19 s lead, longer than replay
             core.acceptSolvedResult(inputAt(t0), state(0.0), first);
 
             auto next_input = inputAt(t0 + std::chrono::milliseconds(10));
@@ -236,7 +236,7 @@ int main() {
                     "handoff did not reserve the measured solve lead");
 
             auto second = solved(t0 + std::chrono::milliseconds(200), 1.0);
-            second.solve_time_ms = 180.0;
+            second.solve_time_ms = 170.0;
             auto accepted = core.acceptSolvedResult(
                 next_input, state(0.0), second, next_out);
             require(accepted.solve_accepted, "long-latency successor should be accepted");
@@ -250,6 +250,26 @@ int main() {
             require(third_schedule.activation_elapsed >
                         third_schedule.active_elapsed_now,
                     "successive handoff reused an expired origin");
+        }
+
+        {
+            // A required activation beyond the remaining active horizon must
+            // be visible to the caller; never silently fall back to an
+            // unaligned activation and mismatched warm-start shift.
+            planner_core::PlannerCore core;
+            auto cfg = hoverConfig();
+            core.configure(cfg);
+            auto first = solved(t0, 0.0);
+            first.solve_time_ms = 1000.0;
+            core.acceptSolvedResult(inputAt(t0), state(0.0), first);
+
+            planner_core::PlannerCoreStepResult out;
+            planner_core::PlannerCore::HandoffSchedule schedule;
+            require(!core.prepareHandoffSchedule(
+                        inputAt(t0 + std::chrono::milliseconds(10)), out, schedule),
+                    "handoff beyond the active horizon must be rejected");
+            require(out.rejection_reason == "handoff_beyond_active_horizon",
+                    "missing explicit beyond-horizon rejection reason");
         }
 
         {
